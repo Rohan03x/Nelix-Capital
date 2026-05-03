@@ -183,6 +183,25 @@ def test_get_dashboard_data_falls_through_when_provider_raises(monkeypatch) -> N
     assert data["company_name"] == fallback["company_name"]
 
 
+def test_get_dashboard_data_survives_enrichment_failures(monkeypatch) -> None:
+    monkeypatch.setattr(eodhd_client, "is_available", lambda: False)
+    monkeypatch.setattr(yfinance_client, "is_available", lambda: False)
+    monkeypatch.setattr(fmp_client, "is_available", lambda: False)
+    monkeypatch.setattr(samples_module, "score_confidence", lambda _data: (_ for _ in ()).throw(RuntimeError("conf")))
+    monkeypatch.setattr(samples_module, "generate_commentary", lambda _data: (_ for _ in ()).throw(RuntimeError("commentary")))
+    monkeypatch.setattr(samples_module, "_build_investment_memo", lambda _data: (_ for _ in ()).throw(RuntimeError("memo")))
+    monkeypatch.setattr(samples_module, "_build_market_expectations", lambda _data: (_ for _ in ()).throw(RuntimeError("expectations")))
+
+    data = samples_module.get_dashboard_data("NKE")
+
+    assert data["is_demo"] is True
+    assert data["confidence_score"] == 50
+    assert data["confidence_breakdown"]["label"] == "Low Confidence"
+    assert data["ai_commentary"] == {}
+    assert data["investment_memo"] is None
+    assert data["market_expectations"] is None
+
+
 def test_ebit_margin_target_respects_recent_profitable_regime_shift() -> None:
     target, source = _derive_ebit_margin_target(
         5.9,

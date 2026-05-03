@@ -844,25 +844,50 @@ def get_dashboard_data(ticker: str, overrides: dict | None = None) -> dict:
             _apply_overrides(data, overrides)
 
     # ── Enrich with computed fields ───────────────────────────────────────────
-    # Confidence score
-    conf = score_confidence(data)
-    data["confidence_score"] = conf.total
-    data["confidence_breakdown"] = conf.as_dict()
+    try:
+        conf = score_confidence(data)
+        data["confidence_score"] = conf.total
+        data["confidence_breakdown"] = conf.as_dict()
+    except Exception as exc:
+        logger.warning("Confidence scoring failed for %s: %s", ticker, exc)
+        data["confidence_score"] = 50
+        data["confidence_breakdown"] = {
+            "total": 50,
+            "grade": "C",
+            "label": "Low Confidence",
+            "color": "orange",
+            "dcf_suitable": True,
+            "suitability_note": "Confidence scoring temporarily unavailable.",
+            "warnings": ["Confidence scoring temporarily unavailable."],
+            "dimensions": [],
+        }
 
-    # Reverse DCF (only if we have the required inputs)
-    if data.get("pv_ufcfs") and data.get("pv_terminal") and data.get("diluted_shares"):
-        data["reverse_dcf"] = compute_reverse_dcf(data)
-    else:
+    try:
+        if data.get("pv_ufcfs") and data.get("pv_terminal") and data.get("diluted_shares"):
+            data["reverse_dcf"] = compute_reverse_dcf(data)
+        else:
+            data["reverse_dcf"] = None
+    except Exception as exc:
+        logger.warning("Reverse DCF failed for %s: %s", ticker, exc)
         data["reverse_dcf"] = None
 
-    # AI commentary (generated fresh so it reflects current data / overrides)
-    data["ai_commentary"] = generate_commentary(data)
+    try:
+        data["ai_commentary"] = generate_commentary(data)
+    except Exception as exc:
+        logger.warning("AI commentary failed for %s: %s", ticker, exc)
+        data["ai_commentary"] = {}
 
-    # Investment memo (generate from existing fields)
-    data["investment_memo"] = _build_investment_memo(data)
+    try:
+        data["investment_memo"] = _build_investment_memo(data)
+    except Exception as exc:
+        logger.warning("Investment memo failed for %s: %s", ticker, exc)
+        data["investment_memo"] = None
 
-    # Market expectations (derived from reverse DCF + analyst data)
-    data["market_expectations"] = _build_market_expectations(data)
+    try:
+        data["market_expectations"] = _build_market_expectations(data)
+    except Exception as exc:
+        logger.warning("Market expectations failed for %s: %s", ticker, exc)
+        data["market_expectations"] = None
 
     return data
 
