@@ -24,6 +24,8 @@ logs/
 public/
 webapp/data/cache/
 *.db
+auto_valuation/learning/ledger/
+auto_valuation/learning/db/
 
 # ── Local runtime / debug artifacts ───────────────────────────────────────────
 .pytest_cache/
