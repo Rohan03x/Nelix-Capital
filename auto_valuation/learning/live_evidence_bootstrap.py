@@ -445,11 +445,23 @@ def _resolve_bootstrap_tickers(
 
 
 def _load_supported_bootstrap_tickers() -> list[str]:
+    pool_limit = int(
+        LEARNING_CONFIG.get(
+            "background_runner_seed_pool_limit",
+            LEARNING_CONFIG.get("background_runner_seed_target_symbols", 1000),
+        )
+        or 0
+    )
     try:
-        from webapp.data.samples import SUPPORTED_TICKERS
+        from webapp.data.ticker_search import seedable_tickers
     except Exception:
-        return []
-    return [str(ticker or "").strip().upper() for ticker in SUPPORTED_TICKERS]
+        try:
+            from webapp.data.samples import SUPPORTED_TICKERS
+        except Exception:
+            return []
+        return [str(ticker or "").strip().upper() for ticker in SUPPORTED_TICKERS]
+    tickers = seedable_tickers(limit=pool_limit if pool_limit > 0 else None, common_stock_only=True)
+    return [str(ticker or "").strip().upper() for ticker in tickers]
 
 
 def _load_cached_bootstrap_tickers(limit: int) -> list[str]:

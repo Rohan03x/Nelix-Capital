@@ -978,8 +978,10 @@
   {% set analog_matches = analog_evidence.get('top_matches') or [] %}
   {% set global_brain = km_explain.get('global_brain') or km.get('global_learning') or {} %}
   {% set global_universe = km_explain.get('global_universe') or km.get('global_universe') or {} %}
+  {% set background_runner = global_universe.get('background_runner') or {} %}
   {% set learning_bootstrap = km_explain.get('learning_bootstrap') or km.get('learning_bootstrap') or {} %}
   {% set relationship_graph = km_explain.get('relationship_graph') or km.get('relationship_graph') or {} %}
+  {% set learned_peer_edges = relationship_graph.get('learned_peer_edges') or km_explain.get('learned_peer_edges') or [] %}
   {% set realized_evidence = km_explain.get('realized_evidence') or km.get('learning_backfill') or {} %}
   {% set maintenance_state = km_explain.get('maintenance') or km.get('learning_maintenance') or {} %}
   {% set snapshot_state = km_explain.get('current_snapshot') or km.get('learning_persistence') or {} %}
@@ -1091,6 +1093,36 @@
       {{ candidate.ticker }}{% if candidate.mode == 'ticker' %} ({{ candidate.direct_samples }} ticker postmortem{% if candidate.direct_samples != 1 %}s{% endif %}){% else %} ({{ candidate.cohort_samples }} cohort postmortem{% if candidate.cohort_samples != 1 %}s{% endif %}){% endif %}{% if not loop.last %}, {% endif %}
     {% endfor %}
     because recent forecast misses there offer the biggest calibration lift.
+  </div>
+  {% endif %}
+
+  {% if global_universe.get('background_seed_pool_size') %}
+  <div class="score-narrative" style="margin:-.15rem 0 1rem 0;">
+    Background learning is now rotating through {{ global_universe.get('background_seed_pool_size') }} locally seeded equities with a registry target of {{ global_universe.get('background_target_symbols', 0) }} and {{ global_universe.get('background_seed_prefix_per_cycle', 0) }} fresh discovery slot{% if global_universe.get('background_seed_prefix_per_cycle', 0) != 1 %}s{% endif %} per cycle.{% if background_runner.get('requested_exchanges') %} Latest autonomous sweep: {{ background_runner.get('requested_exchanges')|join(', ') }}.{% endif %}
+  </div>
+  {% endif %}
+
+  {% if background_runner.get('requested_tickers') or background_runner.get('requested_exchanges') %}
+  <div class="card" style="padding:1rem;margin-bottom:1rem;">
+    <div class="section-title" style="font-size:.82rem;margin-top:0;">Background Queue</div>
+    <div class="section-desc" style="margin-bottom:.55rem;">The latest autonomous cycle shows which exchanges were swept into the local seed pool and which tickers were queued for bootstrap learning.</div>
+    <div style="font-size:.74rem;color:var(--text-secondary);margin-bottom:.45rem;">
+      Last run {{ background_runner.get('last_run_at') or 'pending' }} · tracked {{ background_runner.get('tracked_symbols', global_universe.get('tracked_symbols', 0)) }} · seed pool {{ background_runner.get('seed_pool_size', global_universe.get('background_seed_pool_size', 0)) }}/{{ background_runner.get('seed_target_symbols', global_universe.get('background_target_symbols', 0)) }}
+    </div>
+    {% if background_runner.get('requested_exchanges') %}
+    <div style="font-size:.78rem;font-weight:700;color:var(--text-primary);margin-bottom:.2rem;">Exchange sweep</div>
+    <div style="font-size:.74rem;color:var(--text-secondary);margin-bottom:.45rem;">
+      {{ background_runner.get('requested_exchanges')|join(', ') }}{% if background_runner.get('fetched_exchanges') %} · fetched {{ background_runner.get('fetched_exchanges')|join(', ') }}{% endif %} · {{ background_runner.get('exchange_discovered_symbols', 0) }} discovered · {{ background_runner.get('exchange_enrolled_symbols', 0) }} enrolled
+    </div>
+    {% endif %}
+    {% if background_runner.get('requested_tickers') %}
+    <div style="font-size:.78rem;font-weight:700;color:var(--text-primary);margin-bottom:.2rem;">Bootstrap queue</div>
+    <div style="display:flex;flex-wrap:wrap;gap:.35rem;">
+      {% for symbol in background_runner.get('requested_tickers')[:12] %}
+      <span style="display:inline-flex;align-items:center;padding:.28rem .55rem;border-radius:999px;border:1px solid var(--border);background:var(--surface-alt);font-size:.72rem;color:var(--text-primary);font-weight:600;">{{ symbol }}</span>
+      {% endfor %}
+    </div>
+    {% endif %}
   </div>
   {% endif %}
 
@@ -1277,6 +1309,30 @@
           </div>
           <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.18rem;">{{ pathway.rationale }}</div>
           <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.12rem;">{{ pathway.impact }}</div>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+      {% if learned_peer_edges %}
+      <div style="font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);margin:1rem 0 .35rem;">Strongest learned peer edges</div>
+      <div style="display:grid;gap:.45rem;">
+        {% for edge in learned_peer_edges[:4] %}
+        <div style="padding:.55rem .65rem;border:1px solid var(--border);border-radius:10px;background:var(--bg-secondary);">
+          <div style="display:flex;justify-content:space-between;gap:.5rem;align-items:flex-start;">
+            <div>
+              <div style="font-size:.74rem;font-weight:700;color:var(--text-primary);">{{ edge.ticker }}{% if edge.company_name %} · {{ edge.company_name }}{% endif %}</div>
+              <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.18rem;">{{ edge.canonical_industry or edge.industry or 'Unclassified' }}{% if edge.industry_family %} · {{ edge.industry_family.replace('-', ' ')|title }}{% endif %}</div>
+            </div>
+            <div style="text-align:right;">
+              <div style="font-size:.78rem;font-weight:700;color:var(--text-primary);">{{ '%.2f'|format(edge.pair_strength_score or 0) }}</div>
+              <div style="font-size:.68rem;color:var(--text-muted);">Decayed edge</div>
+            </div>
+          </div>
+          <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.24rem;">Raw {{ '%.2f'|format(edge.pair_strength_score_raw or 0) }} · Decay x{{ '%.2f'|format(edge.pair_decay_multiplier or 0) }} · {{ '%.0f'|format(edge.pair_age_days or 0) }}d stale</div>
+          <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.12rem;">Auto {{ edge.pair_auto_peer_hits or 0 }} · Manual {{ edge.pair_manual_compare_hits or 0 }} · Seen {{ edge.last_seen_at or 'n/a' }}</div>
+          {% if edge.pair_last_source %}
+          <div class="assumption-source" style="margin-top:.18rem;">Last source: {{ edge.pair_last_source|replace('-', ' ')|title }}</div>
+          {% endif %}
         </div>
         {% endfor %}
       </div>

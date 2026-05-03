@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+from auto_valuation.config import LEARNING_CONFIG
 
 from .universe import SymbolUniverseStore
 
@@ -18,6 +21,33 @@ DISCOVERY_DB_PATH = PACKAGE_ROOT / "db" / "discovery.db"
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if value in (None, "", "None"):
+        return None
+    if isinstance(value, datetime):
+        dt_value = value
+    else:
+        try:
+            dt_value = datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+    if dt_value.tzinfo is None:
+        dt_value = dt_value.replace(tzinfo=timezone.utc)
+    return dt_value
+
+
+def _pair_decay_profile(last_seen_at: Any) -> tuple[float, float]:
+    seen_at = _parse_iso_datetime(last_seen_at)
+    if seen_at is None:
+        return 0.0, 1.0
+
+    age_days = max((datetime.now(timezone.utc) - seen_at).total_seconds() / 86_400.0, 0.0)
+    half_life_days = max(float(LEARNING_CONFIG.get("pair_relationship_half_life_days", 45.0) or 45.0), 1.0)
+    decay_floor = min(max(float(LEARNING_CONFIG.get("pair_relationship_decay_floor", 0.2) or 0.2), 0.0), 1.0)
+    multiplier = max(decay_floor, min(math.pow(0.5, age_days / half_life_days), 1.0))
+    return round(age_days, 2), round(multiplier, 4)
 
 
 def _clean_symbol_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
@@ -182,11 +212,14 @@ class DiscoveryStore:
         auto_peer_hits = int(payload.get("auto_peer_hits") or 0)
         manual_compare_hits = int(payload.get("manual_compare_hits") or 0)
         signal_points = float(payload.get("signal_points") or 0.0)
+        age_days, decay_multiplier = _pair_decay_profile(payload.get("last_seen_at"))
+        raw_strength = min(signal_points * 0.25 + manual_compare_hits * 1.75 + auto_peer_hits * 0.45, 12.0)
         payload["pair_hits"] = auto_peer_hits + manual_compare_hits
-        payload["pair_strength_score"] = round(
-            min(signal_points * 0.25 + manual_compare_hits * 1.75 + auto_peer_hits * 0.45, 12.0),
-            4,
-        )
+        payload["pair_strength_score_raw"] = round(raw_strength, 4)
+        payload["pair_age_days"] = age_days
+        payload["pair_decay_multiplier"] = decay_multiplier
+        payload["pair_strength_score"] = round(raw_strength * decay_multiplier, 4)
+        payload["pair_last_source"] = str((payload.get("payload") or {}).get("last_source") or "")
         return payload
 
     def _relationship_snapshot(self, cleaned_symbol: dict[str, Any], raw_payload: dict[str, Any] | None) -> dict[str, Any]:
@@ -220,6 +253,28 @@ class DiscoveryStore:
                 (subject_text, peer_text),
             ).fetchone()
         return self._row_to_peer_relationship(row)
+
+    def list_peer_relationships(self, *, subject_ticker: str | None = None, limit: int = 8) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM peer_relationships"
+        params: tuple[Any, ...] = ()
+        if subject_ticker:
+            sql += " WHERE subject_ticker = ?"
+            params = (str(subject_ticker or "").strip().upper(),)
+        sql += " ORDER BY last_seen_at DESC, subject_ticker ASC, peer_ticker ASC"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+
+        items = [relationship for row in rows if (relationship := self._row_to_peer_relationship(row)) is not None]
+        items.sort(
+            key=lambda item: (
+                -float(item.get("pair_strength_score") or 0.0),
+                -int(item.get("manual_compare_hits") or 0),
+                -int(item.get("auto_peer_hits") or 0),
+                str(item.get("last_seen_at") or ""),
+                str(item.get("peer_ticker") or ""),
+            )
+        )
+        return items[: max(int(limit or 8), 1)]
 
     def _upsert_peer_relationship(
         self,

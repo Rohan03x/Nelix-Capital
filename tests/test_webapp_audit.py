@@ -7,8 +7,10 @@ import io
 import pytest
 from openpyxl import load_workbook
 
+import auto_valuation.learning.background_runner as background_runner_module
 from auto_valuation.learning._layered_calibrator import CalibrationObservation
 from auto_valuation.learning.cross_industry import AnalogObservation
+from auto_valuation.learning.discovery import DiscoveryStore
 from auto_valuation.learning.feature_space import build_symbol_features
 from auto_valuation.learning.universe import SymbolUniverseStore
 from webapp.data import eodhd_client
@@ -1118,6 +1120,23 @@ def test_dashboard_renders_everything_knows_model_panel(monkeypatch):
             "pathways": [
                 {"ticker": "GRAPH", "score": 0.92, "rationale": "Analog pathway reinforcing margin durability.", "impact": "Growth +0.3pp, margin +0.2pp"},
             ],
+            "learned_peer_edges": [
+                {
+                    "ticker": "RMS.PA",
+                    "company_name": "Hermes Intl",
+                    "industry": "Luxury Goods",
+                    "canonical_industry": "Luxury Goods",
+                    "industry_family": "luxury-fashion",
+                    "pair_strength_score": 3.6,
+                    "pair_strength_score_raw": 5.2,
+                    "pair_decay_multiplier": 0.69,
+                    "pair_age_days": 24.0,
+                    "pair_auto_peer_hits": 3,
+                    "pair_manual_compare_hits": 1,
+                    "pair_last_source": "manual-compare",
+                    "last_seen_at": "2026-05-03T08:17:04+00:00",
+                }
+            ],
             "visualization": {
                 "width": 560,
                 "height": 340,
@@ -1152,6 +1171,20 @@ def test_dashboard_renders_everything_knows_model_panel(monkeypatch):
                 "sector_span": 5,
                 "exchange_span": 4,
                 "bootstrapped_symbols": 9,
+                "background_target_symbols": 1000,
+                "background_seed_prefix_per_cycle": 8,
+                "background_seed_pool_size": 298,
+                "background_runner": {
+                    "last_run_at": "2026-05-03T10:15:00+00:00",
+                    "tracked_symbols": 146,
+                    "seed_pool_size": 298,
+                    "seed_target_symbols": 1000,
+                    "requested_exchanges": ["US", "LSE"],
+                    "fetched_exchanges": ["US"],
+                    "exchange_discovered_symbols": 3,
+                    "exchange_enrolled_symbols": 3,
+                    "requested_tickers": ["GRAPH", "PAIR", "RMS.PA"],
+                },
                 "priority_candidates": ["GRAPH", "PAIR"],
                 "calibration_priority_candidates": [
                     {"ticker": "GRAPH", "mode": "ticker", "direct_samples": 3, "cohort_samples": 0},
@@ -1230,6 +1263,23 @@ def test_dashboard_renders_everything_knows_model_panel(monkeypatch):
                 ],
                 "pathways": [
                     {"ticker": "GRAPH", "score": 0.92, "rationale": "Analog pathway reinforcing margin durability.", "impact": "Growth +0.3pp, margin +0.2pp"},
+                ],
+                "learned_peer_edges": [
+                    {
+                        "ticker": "RMS.PA",
+                        "company_name": "Hermes Intl",
+                        "industry": "Luxury Goods",
+                        "canonical_industry": "Luxury Goods",
+                        "industry_family": "luxury-fashion",
+                        "pair_strength_score": 3.6,
+                        "pair_strength_score_raw": 5.2,
+                        "pair_decay_multiplier": 0.69,
+                        "pair_age_days": 24.0,
+                        "pair_auto_peer_hits": 3,
+                        "pair_manual_compare_hits": 1,
+                        "pair_last_source": "manual-compare",
+                        "last_seen_at": "2026-05-03T08:17:04+00:00",
+                    }
                 ],
                 "visualization": {
                     "width": 560,
@@ -1313,6 +1363,13 @@ def test_dashboard_renders_everything_knows_model_panel(monkeypatch):
     assert "Relationship Graph" in html
     assert 'id="relationship-graph-network"' in html
     assert "Live network map" in html
+    assert "Strongest learned peer edges" in html
+    assert "Background learning is now rotating through 298 locally seeded equities" in html
+    assert "Latest autonomous sweep: US, LSE" in html
+    assert "Background Queue" in html
+    assert "Exchange sweep" in html
+    assert "Bootstrap queue" in html
+    assert "RMS.PA" in html
     assert "Analog memory" in html
     assert "Realized peer" in html
     assert "Memory Hierarchy" in html
@@ -1320,6 +1377,40 @@ def test_dashboard_renders_everything_knows_model_panel(monkeypatch):
     assert "Assumption Confidence" in html
     assert "Expected Valuation Error" in html
     assert "Remaining Data Gaps" in html
+
+
+def test_top_learned_peer_edges_flattens_relationship_audit_payload(tmp_path):
+    universe = SymbolUniverseStore(tmp_path / "symbol-universe.db")
+    discovery = DiscoveryStore(tmp_path / "discovery.db", universe_store=universe)
+    discovery.record_manual_compare(
+        {
+            "ticker": "CDI.PA",
+            "company_name": "Christian Dior",
+            "exchange": "PA",
+            "sector": "Consumer Cyclical",
+            "industry": "Luxury Goods",
+        },
+        [
+            {
+                "ticker": "RMS.PA",
+                "company_name": "Hermes Intl",
+                "exchange": "PA",
+                "sector": "Consumer Cyclical",
+                "industry": "Luxury Goods",
+                "canonical_industry": "Luxury Goods",
+                "industry_family": "luxury-fashion",
+                "peer_learning_score": 7.1,
+                "base_peer_learning_score": 5.4,
+            }
+        ],
+    )
+
+    edges = eodhd_client._top_learned_peer_edges(discovery, "CDI.PA", limit=3)
+
+    assert edges[0]["ticker"] == "RMS.PA"
+    assert edges[0]["pair_manual_compare_hits"] == 1
+    assert edges[0]["pair_strength_score_raw"] >= edges[0]["pair_strength_score"]
+    assert edges[0]["pair_last_source"] == "manual-compare"
 
 
 def test_register_global_universe_symbols_tracks_current_and_related_tickers(tmp_path):
@@ -1382,6 +1473,26 @@ def test_register_global_universe_symbols_tracks_current_and_related_tickers(tmp
     assert peer["metadata"]["peer_candidate_hits"] == 1
     assert peer["metadata"]["canonical_industry"] == "Luxury Goods"
     assert summary["tracked_symbols"] >= 4
+
+
+def test_global_universe_summary_includes_background_runner_state(tmp_path, monkeypatch):
+    store = SymbolUniverseStore(tmp_path / "symbol-universe.db")
+    store.upsert_symbol("TEST", company_name="Test Co", exchange="NYSE", source="dashboard-live")
+    monkeypatch.setattr(
+        background_runner_module,
+        "read_background_runner_state",
+        lambda state_path=None: {
+            "last_run_at": "2026-05-03T10:15:00+00:00",
+            "requested_exchanges": ["US", "LSE"],
+            "requested_tickers": ["TEST", "PAIR"],
+            "exchange_discovered_symbols": 4,
+        },
+    )
+
+    summary = eodhd_client._global_universe_summary(store)
+
+    assert summary["background_runner"]["requested_exchanges"] == ["US", "LSE"]
+    assert summary["background_runner"]["requested_tickers"] == ["TEST", "PAIR"]
 
 
 def test_auto_bootstrap_current_ticker_skips_when_recent(tmp_path, monkeypatch):

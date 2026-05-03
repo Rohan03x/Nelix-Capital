@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, timedelta, timezone
 
+import auto_valuation.learning.background_runner as background_runner_module
 from auto_valuation.learning.background_runner import run_background_learning_cycle
 from auto_valuation.learning.ledger import LedgerReader, LedgerWriter
 from auto_valuation.learning.maintenance import run_scheduled_learning_maintenance
@@ -144,3 +145,95 @@ def test_background_cycle_runs_bootstrap_and_maintenance(monkeypatch):
     assert payload["enabled"] is True
     assert payload["bootstrap"]["ran"] is True
     assert payload["maintenance"]["ran"] is True
+
+
+def test_background_cycle_reserves_rotating_seed_slots(monkeypatch):
+    captured: list[dict[str, object]] = []
+
+    class _Result:
+        def __init__(self, **payload):
+            self._payload = payload
+
+        def to_dict(self):
+            return dict(self._payload)
+
+    monkeypatch.setitem(background_runner_module.LEARNING_CONFIG, "background_runner_bootstrap_max_tickers", 6)
+    monkeypatch.setitem(background_runner_module.LEARNING_CONFIG, "background_runner_seed_target_symbols", 1000)
+    monkeypatch.setitem(background_runner_module.LEARNING_CONFIG, "background_runner_seed_prefix_per_cycle", 2)
+    monkeypatch.setitem(background_runner_module.LEARNING_CONFIG, "background_runner_seed_pool_limit", 10)
+    monkeypatch.setitem(background_runner_module.LEARNING_CONFIG, "background_runner_maintenance_max_tickers", 2)
+    monkeypatch.setattr(background_runner_module, "_safe_tracked_symbol_count", lambda: 25)
+    monkeypatch.setattr(background_runner_module, "_load_background_seed_tickers", lambda limit: ["SEED1", "SEED2", "SEED3", "SEED4"])
+    monkeypatch.setattr(background_runner_module, "_load_universe_priority_tickers", lambda limit: ["PRI1", "PRI2", "PRI3", "PRI4"])
+    monkeypatch.setattr(background_runner_module, "_load_cached_bootstrap_tickers", lambda limit: ["CACHE1", "CACHE2"])
+    monkeypatch.setattr(background_runner_module, "_BACKGROUND_SEED_CURSOR", 0)
+    monkeypatch.setattr(
+        background_runner_module,
+        "run_live_evidence_bootstrap",
+        lambda **kwargs: (captured.append(kwargs), _Result(enabled=True, ran=True, reason=None))[1],
+    )
+    monkeypatch.setattr(
+        background_runner_module,
+        "run_scheduled_learning_maintenance",
+        lambda **kwargs: _Result(enabled=True, ran=True, reason=None),
+    )
+
+    first = run_background_learning_cycle(fundamentals_provider=lambda _ticker: {})
+    second = run_background_learning_cycle(fundamentals_provider=lambda _ticker: {})
+
+    assert captured[0]["tickers"][:4] == ["PRI1", "PRI2", "PRI3", "PRI4"]
+    assert captured[0]["tickers"][4:] == ["SEED1", "SEED2"]
+    assert captured[1]["tickers"][4:] == ["SEED3", "SEED4"]
+    assert first["bootstrap"]["requested_tickers"][4:] == ["SEED1", "SEED2"]
+    assert second["bootstrap"]["requested_tickers"][4:] == ["SEED3", "SEED4"]
+
+
+def test_background_cycle_persists_exchange_refresh_state(tmp_path, monkeypatch):
+    state_path = tmp_path / "background-runner.json"
+
+    class _Result:
+        def __init__(self, **payload):
+            self._payload = payload
+
+        def to_dict(self):
+            return dict(self._payload)
+
+    monkeypatch.setitem(background_runner_module.LEARNING_CONFIG, "background_runner_bootstrap_max_tickers", 4)
+    monkeypatch.setitem(background_runner_module.LEARNING_CONFIG, "background_runner_seed_pool_limit", 12)
+    monkeypatch.setattr(background_runner_module, "_safe_tracked_symbol_count", lambda: 42)
+    monkeypatch.setattr(background_runner_module, "_build_background_bootstrap_tickers", lambda limit: ["PRI1", "SEED1"])
+    monkeypatch.setattr(background_runner_module, "_load_background_seed_tickers", lambda limit: ["SEED1", "SEED2", "SEED3"])
+    monkeypatch.setattr(
+        background_runner_module,
+        "_refresh_background_seed_cache",
+        lambda: {
+            "enabled": True,
+            "configured_exchanges": ["US", "LSE", "PA"],
+            "requested_exchanges": ["US", "LSE"],
+            "fetched_exchanges": ["US"],
+            "counts": {"US": 2, "LSE": 1},
+            "total_items": 3,
+            "enrolled_symbols": 3,
+            "cursor": 2,
+        },
+    )
+    monkeypatch.setattr(
+        background_runner_module,
+        "run_live_evidence_bootstrap",
+        lambda **kwargs: _Result(enabled=True, ran=True, reason=None, requested_tickers=kwargs.get("tickers") or []),
+    )
+    monkeypatch.setattr(
+        background_runner_module,
+        "run_scheduled_learning_maintenance",
+        lambda **kwargs: _Result(enabled=True, ran=False, reason="throttled"),
+    )
+
+    payload = run_background_learning_cycle(fundamentals_provider=lambda _ticker: {}, state_path=state_path)
+    saved_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+    assert payload["seed_refresh"]["requested_exchanges"] == ["US", "LSE"]
+    assert payload["state"]["requested_tickers"] == ["PRI1", "SEED1"]
+    assert saved_state["requested_exchanges"] == ["US", "LSE"]
+    assert saved_state["exchange_discovered_symbols"] == 3
+    assert saved_state["exchange_enrolled_symbols"] == 3
+    assert saved_state["tracked_symbols"] == 42

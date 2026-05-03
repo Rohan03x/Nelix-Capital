@@ -858,6 +858,53 @@ def _merge_peer_learning_relationships(
         )
 
 
+def _top_learned_peer_edges(
+    discovery_store: Any | None,
+    ticker: str,
+    *,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    ticker_text = str(ticker or "").strip().upper()
+    if discovery_store is None or not ticker_text:
+        return []
+    try:
+        relationships = discovery_store.list_peer_relationships(subject_ticker=ticker_text, limit=limit)
+    except Exception:
+        return []
+
+    items: list[dict[str, Any]] = []
+    for relationship in relationships:
+        payload = dict(relationship.get("payload") or {})
+        peer = dict(payload.get("peer") or {})
+        peer_ticker = str(relationship.get("peer_ticker") or peer.get("ticker") or "").strip().upper()
+        if not peer_ticker:
+            continue
+        items.append(
+            {
+                "ticker": peer_ticker,
+                "company_name": str(peer.get("company_name") or peer.get("name") or "").strip(),
+                "exchange": str(peer.get("exchange") or "").strip().upper(),
+                "sector": str(peer.get("sector") or "").strip(),
+                "industry": str(peer.get("industry") or "").strip(),
+                "canonical_industry": str(peer.get("canonical_industry") or "").strip(),
+                "industry_family": str(peer.get("industry_family") or "").strip(),
+                "peer_rank": peer.get("peer_rank"),
+                "peer_learning_score": round(float(peer.get("peer_learning_score") or 0.0), 4),
+                "base_peer_learning_score": round(float(peer.get("base_peer_learning_score") or 0.0), 4),
+                "pair_strength_score": round(float(relationship.get("pair_strength_score") or 0.0), 4),
+                "pair_strength_score_raw": round(float(relationship.get("pair_strength_score_raw") or 0.0), 4),
+                "pair_decay_multiplier": round(float(relationship.get("pair_decay_multiplier") or 0.0), 4),
+                "pair_age_days": round(float(relationship.get("pair_age_days") or 0.0), 2),
+                "pair_hits": int(relationship.get("pair_hits") or 0),
+                "pair_auto_peer_hits": int(relationship.get("auto_peer_hits") or 0),
+                "pair_manual_compare_hits": int(relationship.get("manual_compare_hits") or 0),
+                "pair_last_source": str(relationship.get("pair_last_source") or "").strip(),
+                "last_seen_at": str(relationship.get("last_seen_at") or "").strip(),
+            }
+        )
+    return items
+
+
 def _register_global_universe_symbols(
     universe_store: Any | None,
     *,
@@ -948,6 +995,22 @@ def _register_global_universe_symbols(
 
 
 def _global_universe_summary(universe_store: Any | None) -> dict[str, Any]:
+    seed_target = int(LEARNING_CONFIG.get("background_runner_seed_target_symbols", 1000) or 0)
+    seed_prefix = int(LEARNING_CONFIG.get("background_runner_seed_prefix_per_cycle", 8) or 0)
+    seed_pool_limit = int(LEARNING_CONFIG.get("background_runner_seed_pool_limit", 1000) or 0)
+    try:
+        from auto_valuation.learning.background_runner import read_background_runner_state
+
+        background_runner_state = read_background_runner_state()
+    except Exception:
+        background_runner_state = {}
+    try:
+        from webapp.data.ticker_search import seedable_tickers
+
+        seed_pool_size = len(seedable_tickers(limit=seed_pool_limit if seed_pool_limit > 0 else None, common_stock_only=True))
+    except Exception:
+        seed_pool_size = 0
+
     if universe_store is None:
         return {
             "enabled": False,
@@ -960,6 +1023,10 @@ def _global_universe_summary(universe_store: Any | None) -> dict[str, Any]:
             "stale_bootstrap_symbols": 0,
             "priority_candidates": [],
             "top_sectors": [],
+            "background_target_symbols": seed_target,
+            "background_seed_prefix_per_cycle": seed_prefix,
+            "background_seed_pool_size": seed_pool_size,
+            "background_runner": background_runner_state,
         }
 
     try:
@@ -969,6 +1036,10 @@ def _global_universe_summary(universe_store: Any | None) -> dict[str, Any]:
                 stale_after_hours=int(LEARNING_CONFIG.get("symbol_universe_bootstrap_interval_hours", 18)),
                 recent_days=int(LEARNING_CONFIG.get("symbol_universe_recent_days", 21)),
             ),
+            "background_target_symbols": seed_target,
+            "background_seed_prefix_per_cycle": seed_prefix,
+            "background_seed_pool_size": seed_pool_size,
+            "background_runner": background_runner_state,
         }
     except Exception:
         return {
@@ -982,6 +1053,10 @@ def _global_universe_summary(universe_store: Any | None) -> dict[str, Any]:
             "stale_bootstrap_symbols": 0,
             "priority_candidates": [],
             "top_sectors": [],
+            "background_target_symbols": seed_target,
+            "background_seed_prefix_per_cycle": seed_prefix,
+            "background_seed_pool_size": seed_pool_size,
+            "background_runner": background_runner_state,
         }
 
 
@@ -1102,6 +1177,10 @@ def _augment_learning_explainability(knowledge_model: dict[str, Any]) -> None:
     persistence = dict(knowledge_model.get("learning_persistence") or {})
     global_universe = dict(knowledge_model.get("global_universe") or {})
     relationship_graph = dict(explainability.get("relationship_graph") or knowledge_model.get("relationship_graph") or {})
+    learned_peer_edges = list(knowledge_model.get("learned_peer_edges") or relationship_graph.get("learned_peer_edges") or [])
+    if learned_peer_edges:
+        relationship_graph["learned_peer_edges"] = learned_peer_edges[:5]
+        explainability["learned_peer_edges"] = learned_peer_edges[:5]
     if relationship_graph:
         explainability["relationship_graph"] = relationship_graph
     if global_universe:
@@ -2343,10 +2422,12 @@ def build_dashboard_data(ticker: str, overrides: dict | None = None) -> dict | N
         _merge_peer_learning_relationships(_peers, peer_relationships)
         learning_bootstrap = _auto_bootstrap_current_ticker(ticker, fund, universe_store)
         global_universe = _global_universe_summary(universe_store)
+        learned_peer_edges = _top_learned_peer_edges(discovery_store, ticker, limit=5)
 
         if knowledge_model_payload:
             knowledge_model_payload["learning_bootstrap"] = learning_bootstrap
             knowledge_model_payload["global_universe"] = global_universe
+            knowledge_model_payload["learned_peer_edges"] = learned_peer_edges
             knowledge_model_payload["learning_backfill"] = _backfill_learning_actuals(ticker, fund)
             knowledge_model_payload["learning_maintenance"] = _run_learning_maintenance(ticker, fund)
             knowledge_model_payload["learning_persistence"] = _persist_learning_snapshot(_result, knowledge_model_payload)

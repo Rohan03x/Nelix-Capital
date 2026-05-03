@@ -4,6 +4,7 @@ import json
 import re
 from functools import lru_cache
 from pathlib import Path
+from typing import Any, Iterable
 from urllib.parse import quote
 
 from webapp.data.samples import SUPPORTED_TICKERS
@@ -25,6 +26,8 @@ def _build_search_item(
     exchange: str,
     country: str,
     source: str,
+    instrument_type: str = "",
+    is_primary: bool = False,
 ) -> dict[str, object]:
     ticker_text = str(ticker or "").strip().upper()
     code_text = str(code or ticker_text.split(".")[0]).strip().upper()
@@ -47,7 +50,19 @@ def _build_search_item(
         "code_key": _normalise_search_text(code_text),
         "name_words": name_key.split(),
         "source": source,
+        "instrument_type": str(instrument_type or "").strip(),
+        "is_primary": bool(is_primary),
     }
+
+
+def _compose_ticker(code: str, exchange: str) -> str:
+    code_text = str(code or "").strip().upper()
+    exchange_text = str(exchange or "").strip().upper()
+    if not code_text:
+        return ""
+    if "." in code_text or not exchange_text:
+        return code_text
+    return f"{code_text}.{exchange_text}"
 
 
 def _build_index_item(payload_path: Path) -> dict[str, object] | None:
@@ -68,12 +83,9 @@ def _build_index_item(payload_path: Path) -> dict[str, object] | None:
     exchange = str(general.get("Exchange") or "").strip().upper()
     primary_ticker = str(general.get("PrimaryTicker") or "").strip().upper()
     if not primary_ticker:
-        if code and exchange:
-            primary_ticker = f"{code}.{exchange}"
-        elif code:
-            primary_ticker = code
-        else:
-            return None
+        primary_ticker = _compose_ticker(code, exchange)
+    if not primary_ticker:
+        return None
 
     return _build_search_item(
         ticker=primary_ticker,
@@ -82,22 +94,37 @@ def _build_index_item(payload_path: Path) -> dict[str, object] | None:
         exchange=exchange,
         country=str(general.get("CountryName") or general.get("CountryISO") or "").strip(),
         source="cache",
+        instrument_type="Common Stock",
+        is_primary=True,
     )
 
 
-def _compose_ticker(code: str, exchange: str) -> str:
-    code_text = str(code or "").strip().upper()
-    exchange_text = str(exchange or "").strip().upper()
-    if not code_text:
-        return ""
-    if "." in code_text or not exchange_text:
-        return code_text
-    return f"{code_text}.{exchange_text}"
+def _build_cached_search_item(row: dict[str, object], *, source: str = "search-cache") -> dict[str, object] | None:
+    code = str(row.get("Code") or "").strip().upper()
+    exchange = str(row.get("Exchange") or "").strip().upper()
+    ticker = _compose_ticker(code, exchange)
+    if not ticker:
+        return None
+    return _build_search_item(
+        ticker=ticker,
+        code=code or ticker.split(".")[0],
+        name=str(row.get("Name") or ticker).strip(),
+        exchange=exchange,
+        country=str(row.get("Country") or row.get("CountryName") or "").strip(),
+        source=source,
+        instrument_type=str(row.get("Type") or "").strip(),
+        is_primary=bool(row.get("isPrimary") or row.get("IsPrimary")),
+    )
 
 
 def _search_cache_key(query: str) -> str:
     slug = re.sub(r"[^A-Z0-9]+", "_", query.upper()).strip("_")
     return f"ticker_search_{slug or 'EMPTY'}"
+
+
+def _exchange_cache_key(exchange: str) -> str:
+    slug = re.sub(r"[^A-Z0-9]+", "_", str(exchange or "").upper()).strip("_")
+    return f"exchange_symbols_{slug or 'UNKNOWN'}"
 
 
 def _live_search_items(query: str) -> tuple[dict[str, object], ...]:
@@ -138,6 +165,8 @@ def _live_search_items(query: str) -> tuple[dict[str, object], ...]:
                 exchange=exchange,
                 country=str(row.get("Country") or row.get("CountryName") or "").strip(),
                 source="live",
+                instrument_type=str(row.get("Type") or "").strip(),
+                is_primary=bool(row.get("isPrimary") or row.get("IsPrimary")),
             )
         )
     return tuple(items)
@@ -152,6 +181,48 @@ def _search_candidates(query: str) -> list[dict[str, object]]:
     return list(candidates.values())
 
 
+def _iter_cached_search_items() -> tuple[dict[str, object], ...]:
+    items: list[dict[str, object]] = []
+    for payload_path in sorted(_CACHE_DIR.glob("eodhd_ticker_search_*.json")):
+        try:
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        rows = payload.get("data") if isinstance(payload, dict) else payload
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            item = _build_cached_search_item(row, source="search-cache")
+            if item is not None:
+                items.append(item)
+    return tuple(items)
+
+
+def _iter_exchange_cache_items() -> tuple[dict[str, object], ...]:
+    items: list[dict[str, object]] = []
+    for payload_path in sorted(_CACHE_DIR.glob("eodhd_exchange_symbols_*.json")):
+        try:
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        rows = payload.get("data") if isinstance(payload, dict) else payload
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            item = _build_cached_search_item(row, source="exchange-cache")
+            if item is not None:
+                items.append(item)
+    return tuple(items)
+
+
+def invalidate_ticker_search_index() -> None:
+    _ticker_search_index.cache_clear()
+
+
 @lru_cache(maxsize=1)
 def _ticker_search_index() -> tuple[dict[str, object], ...]:
     items: list[dict[str, object]] = []
@@ -159,13 +230,25 @@ def _ticker_search_index() -> tuple[dict[str, object], ...]:
 
     for payload_path in sorted(_CACHE_DIR.glob("eodhd_fund_*.json")):
         item = _build_index_item(payload_path)
-        if not item:
+        if item is None:
             continue
-
         ticker = str(item["ticker"])
         if ticker in seen_tickers:
             continue
+        seen_tickers.add(ticker)
+        items.append(item)
 
+    for item in _iter_cached_search_items():
+        ticker = str(item["ticker"])
+        if ticker in seen_tickers:
+            continue
+        seen_tickers.add(ticker)
+        items.append(item)
+
+    for item in _iter_exchange_cache_items():
+        ticker = str(item["ticker"])
+        if ticker in seen_tickers:
+            continue
         seen_tickers.add(ticker)
         items.append(item)
 
@@ -186,6 +269,130 @@ def _ticker_search_index() -> tuple[dict[str, object], ...]:
 
     items.sort(key=lambda item: (str(item["name"]).upper(), str(item["ticker"])))
     return tuple(items)
+
+
+def seedable_symbol_items(limit: int | None = None, *, common_stock_only: bool = True) -> list[dict[str, object]]:
+    allowed_types = {
+        "",
+        "common stock",
+        "common shares",
+        "ordinary shares",
+        "depositary receipt",
+        "adr",
+    }
+    source_priority = {"search-cache": 0, "exchange-cache": 1, "cache": 2, "supported": 3}
+    ranked_items = sorted(
+        _ticker_search_index(),
+        key=lambda item: (
+            source_priority.get(str(item.get("source") or ""), 9),
+            0 if bool(item.get("is_primary")) else 1,
+            str(item.get("name") or "").upper(),
+            str(item.get("ticker") or ""),
+        ),
+    )
+
+    selected: list[dict[str, object]] = []
+    seen: set[str] = set()
+    max_items = int(limit) if limit is not None and int(limit) > 0 else None
+    for item in ranked_items:
+        ticker = str(item.get("ticker") or "").strip().upper()
+        if not ticker or ticker in seen:
+            continue
+        instrument_type = str(item.get("instrument_type") or "").strip().lower()
+        if common_stock_only and instrument_type not in allowed_types:
+            continue
+        seen.add(ticker)
+        selected.append(dict(item))
+        if max_items is not None and len(selected) >= max_items:
+            break
+    return selected
+
+
+def seedable_tickers(limit: int | None = None, *, common_stock_only: bool = True) -> list[str]:
+    tickers: list[str] = []
+    for item in seedable_symbol_items(limit=limit, common_stock_only=common_stock_only):
+        ticker = str(item.get("ticker") or "").strip().upper()
+        if ticker:
+            tickers.append(ticker)
+    return tickers
+
+
+def refresh_exchange_symbol_cache(
+    exchanges: Iterable[str],
+    *,
+    per_exchange_limit: int = 250,
+    ttl_sec: int = 604_800,
+) -> dict[str, Any]:
+    requested_exchanges: list[str] = []
+    seen_exchanges: set[str] = set()
+    for raw_exchange in exchanges:
+        exchange = str(raw_exchange or "").strip().upper()
+        if not exchange or exchange in seen_exchanges:
+            continue
+        seen_exchanges.add(exchange)
+        requested_exchanges.append(exchange)
+
+    if not requested_exchanges:
+        return {"exchanges": [], "items": [], "fetched_exchanges": [], "total_items": 0}
+
+    try:
+        from webapp.data.eodhd_client import _cache_read, _cache_write, _get
+    except Exception:
+        return {
+            "exchanges": requested_exchanges,
+            "items": [],
+            "fetched_exchanges": [],
+            "total_items": 0,
+            "error": "eodhd-unavailable",
+        }
+
+    all_items: list[dict[str, object]] = []
+    fetched_exchanges: list[str] = []
+    counts: dict[str, int] = {}
+    cache_changed = False
+
+    for exchange in requested_exchanges:
+        cache_key = _exchange_cache_key(exchange)
+        cached = _cache_read(cache_key, ttl_sec)
+        rows = cached if isinstance(cached, list) else None
+
+        if rows is None:
+            payload = _get(f"exchange-symbol-list/{quote(exchange, safe='')}")
+            if isinstance(payload, dict):
+                payload_rows = payload.get("data")
+                rows = payload_rows if isinstance(payload_rows, list) else []
+            elif isinstance(payload, list):
+                rows = payload
+            else:
+                rows = []
+            _cache_write(cache_key, rows)
+            fetched_exchanges.append(exchange)
+            cache_changed = True
+
+        exchange_items: list[dict[str, object]] = []
+        max_items = max(int(per_exchange_limit or 0), 0)
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            item = _build_cached_search_item(row, source="exchange-cache")
+            if item is None:
+                continue
+            exchange_items.append(item)
+            if max_items and len(exchange_items) >= max_items:
+                break
+        counts[exchange] = len(exchange_items)
+        all_items.extend(exchange_items)
+
+    if cache_changed:
+        invalidate_ticker_search_index()
+
+    return {
+        "exchanges": requested_exchanges,
+        "items": all_items,
+        "fetched_exchanges": fetched_exchanges,
+        "counts": counts,
+        "total_items": len(all_items),
+    }
 
 
 def _match_score(query_key: str, item: dict[str, object]) -> tuple[int, int, str] | None:
