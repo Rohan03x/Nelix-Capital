@@ -89,6 +89,24 @@ class DiscoveryStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS peer_relationships (
+                    subject_ticker TEXT NOT NULL,
+                    peer_ticker TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    auto_peer_hits INTEGER NOT NULL DEFAULT 0,
+                    manual_compare_hits INTEGER NOT NULL DEFAULT 0,
+                    signal_points REAL NOT NULL DEFAULT 0,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY(subject_ticker, peer_ticker)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_peer_relationships_subject ON peer_relationships(subject_ticker, last_seen_at DESC)"
+            )
 
     def list_watchlist(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -155,6 +173,136 @@ class DiscoveryStore:
             metadata={"watchlist_active": False, "watchlist_removed_at": _utcnow_iso()},
         )
         return bool(rowcount)
+
+    def _row_to_peer_relationship(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        payload = dict(row)
+        payload["payload"] = json.loads(str(payload.pop("payload_json", "{}")) or "{}")
+        auto_peer_hits = int(payload.get("auto_peer_hits") or 0)
+        manual_compare_hits = int(payload.get("manual_compare_hits") or 0)
+        signal_points = float(payload.get("signal_points") or 0.0)
+        payload["pair_hits"] = auto_peer_hits + manual_compare_hits
+        payload["pair_strength_score"] = round(
+            min(signal_points * 0.25 + manual_compare_hits * 1.75 + auto_peer_hits * 0.45, 12.0),
+            4,
+        )
+        return payload
+
+    def _relationship_snapshot(self, cleaned_symbol: dict[str, Any], raw_payload: dict[str, Any] | None) -> dict[str, Any]:
+        snapshot = dict(cleaned_symbol)
+        raw = dict(raw_payload or {})
+        for key in ("canonical_industry", "industry_family"):
+            value = str(raw.get(key) or "").strip()
+            if value:
+                snapshot[key] = value
+        for key in ("peer_learning_score", "base_peer_learning_score", "industry_similarity", "pair_strength_score"):
+            try:
+                value = float(raw.get(key))
+            except (TypeError, ValueError):
+                continue
+            snapshot[key] = round(value, 4)
+        try:
+            if raw.get("peer_rank") is not None:
+                snapshot["peer_rank"] = int(raw.get("peer_rank"))
+        except (TypeError, ValueError):
+            pass
+        return snapshot
+
+    def get_peer_relationship(self, subject_ticker: str, peer_ticker: str) -> dict[str, Any] | None:
+        subject_text = str(subject_ticker or "").strip().upper()
+        peer_text = str(peer_ticker or "").strip().upper()
+        if not subject_text or not peer_text:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM peer_relationships WHERE subject_ticker = ? AND peer_ticker = ?",
+                (subject_text, peer_text),
+            ).fetchone()
+        return self._row_to_peer_relationship(row)
+
+    def _upsert_peer_relationship(
+        self,
+        *,
+        subject_item: dict[str, Any],
+        peer_item: dict[str, Any],
+        raw_peer: dict[str, Any] | None,
+        source: str,
+        seen_at: str,
+        signal_points: float,
+    ) -> dict[str, Any] | None:
+        current = self.get_peer_relationship(subject_item["ticker"], peer_item["ticker"]) or {}
+        payload = {
+            "subject_ticker": subject_item["ticker"],
+            "peer_ticker": peer_item["ticker"],
+            "first_seen_at": str(current.get("first_seen_at") or seen_at),
+            "last_seen_at": seen_at,
+            "auto_peer_hits": int(current.get("auto_peer_hits") or 0) + (1 if source == "auto-peer-basket" else 0),
+            "manual_compare_hits": int(current.get("manual_compare_hits") or 0) + (1 if source == "manual-compare" else 0),
+            "signal_points": round(float(current.get("signal_points") or 0.0) + max(float(signal_points or 0.0), 0.0), 4),
+            "payload_json": json.dumps(
+                {
+                    "subject": self._relationship_snapshot(subject_item, subject_item),
+                    "peer": self._relationship_snapshot(peer_item, raw_peer),
+                    "last_source": source,
+                },
+                ensure_ascii=False,
+            ),
+        }
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO peer_relationships(
+                    subject_ticker, peer_ticker, first_seen_at, last_seen_at,
+                    auto_peer_hits, manual_compare_hits, signal_points, payload_json
+                ) VALUES (
+                    :subject_ticker, :peer_ticker, :first_seen_at, :last_seen_at,
+                    :auto_peer_hits, :manual_compare_hits, :signal_points, :payload_json
+                )
+                """,
+                payload,
+            )
+        return self.get_peer_relationship(subject_item["ticker"], peer_item["ticker"])
+
+    def record_auto_peer_basket(
+        self,
+        subject: dict[str, Any],
+        peers: Iterable[dict[str, Any]],
+    ) -> dict[str, Any]:
+        subject_item = _clean_symbol_payload(subject)
+        raw_peer_items = [dict(item or {}) for item in peers]
+        paired_peer_items: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for raw_peer in raw_peer_items:
+            peer_item = _clean_symbol_payload(raw_peer)
+            if not peer_item["ticker"] or peer_item["ticker"] == subject_item["ticker"]:
+                continue
+            paired_peer_items.append((raw_peer, peer_item))
+
+        if not subject_item["ticker"] or not paired_peer_items:
+            return {"subject_ticker": subject_item["ticker"], "peer_count": 0, "items": []}
+
+        now_text = _utcnow_iso()
+        items: list[dict[str, Any]] = []
+        for raw_peer, peer_item in paired_peer_items:
+            relationship = self._upsert_peer_relationship(
+                subject_item=subject_item,
+                peer_item=peer_item,
+                raw_peer=raw_peer,
+                source="auto-peer-basket",
+                seen_at=now_text,
+                signal_points=max(
+                    float(raw_peer.get("base_peer_learning_score") or raw_peer.get("peer_learning_score") or 0.0),
+                    0.6,
+                ),
+            )
+            if relationship is not None:
+                items.append(relationship)
+
+        return {
+            "subject_ticker": subject_item["ticker"],
+            "peer_count": len(items),
+            "items": items,
+        }
 
     def record_search_impression(
         self,
@@ -230,8 +378,14 @@ class DiscoveryStore:
         peers: Iterable[dict[str, Any]],
     ) -> dict[str, Any]:
         subject_item = _clean_symbol_payload(subject)
-        peer_items = [_clean_symbol_payload(item) for item in peers]
-        peer_items = [item for item in peer_items if item["ticker"] and item["ticker"] != subject_item["ticker"]]
+        raw_peer_items = [dict(item or {}) for item in peers]
+        paired_peer_items: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for raw_peer in raw_peer_items:
+            peer_item = _clean_symbol_payload(raw_peer)
+            if not peer_item["ticker"] or peer_item["ticker"] == subject_item["ticker"]:
+                continue
+            paired_peer_items.append((raw_peer, peer_item))
+        peer_items = [peer_item for _, peer_item in paired_peer_items]
         if not subject_item["ticker"] or not peer_items:
             return {"subject_ticker": subject_item["ticker"], "peer_count": 0, "items": []}
 
@@ -263,6 +417,19 @@ class DiscoveryStore:
                         json.dumps({"subject": subject_item, "peer": peer}, ensure_ascii=False),
                     ),
                 )
+
+        for raw_peer, peer in paired_peer_items:
+            self._upsert_peer_relationship(
+                subject_item=subject_item,
+                peer_item=peer,
+                raw_peer=raw_peer,
+                source="manual-compare",
+                seen_at=now_text,
+                signal_points=max(
+                    float(raw_peer.get("peer_learning_score") or raw_peer.get("base_peer_learning_score") or 0.0) + 1.5,
+                    4.0,
+                ),
+            )
 
         self.universe_store.record_candidates(
             [

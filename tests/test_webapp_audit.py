@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import html
 import io
 
 import pytest
@@ -458,6 +459,22 @@ def test_eodhd_build_uses_prior_year_liquidity_and_share_inputs(monkeypatch):
     assert data["historical"]["shares"] == [1000.0, 1100.0]
 
 
+def test_eodhd_build_falls_back_to_balance_sheet_shares_when_share_stats_missing(monkeypatch):
+    fundamentals = copy.deepcopy(_mock_fundamentals())
+    fundamentals["SharesStats"] = {}
+
+    monkeypatch.setattr(eodhd_client, "_fetch_price", lambda _code: {"close": 100.0})
+    monkeypatch.setattr(eodhd_client, "_fetch_fundamentals", lambda _code: fundamentals)
+    monkeypatch.setattr(eodhd_client, "_get_risk_free_rate", lambda: 4.0)
+    monkeypatch.setattr(eodhd_client, "_PEERS_AVAILABLE", False)
+
+    data = eodhd_client.build_dashboard_data("TEST")
+
+    assert data is not None
+    assert data["diluted_shares"] == pytest.approx(1100.0)
+    assert data["historical"]["shares"] == [1000.0, 1100.0]
+
+
 def test_eodhd_build_surfaces_knowledge_model_payload(monkeypatch):
     monkeypatch.setattr(eodhd_client, "_fetch_price", lambda _code: {"close": 100.0})
     monkeypatch.setattr(eodhd_client, "_fetch_fundamentals", lambda _code: _mock_fundamentals())
@@ -879,6 +896,9 @@ def test_watchlist_and_manual_compare_routes_persist_discovery_state(tmp_path, m
     assert compare.status_code == 200
     assert watchlist.get_json()["items"][0]["ticker"] == "005930.KO"
     assert recent.get_json()["items"][0]["ticker"] == "AAPL"
+    relationship = discovery.get_peer_relationship("005930.KO", "AAPL")
+    assert relationship is not None
+    assert relationship["manual_compare_hits"] == 1
 
 
 def test_index_and_dashboard_render_discovery_controls(monkeypatch):
@@ -899,6 +919,56 @@ def test_index_and_dashboard_render_discovery_controls(monkeypatch):
     assert "Track In Global Brain" in dashboard_html
     assert "Compare + Learn" in dashboard_html
     assert "Manual Compare Feed" in dashboard_html
+    assert "Brain Fit" in dashboard_html
+
+
+def test_dashboard_peer_actions_use_peer_metadata(monkeypatch):
+    import webapp.app as webapp_module
+
+    data = copy.deepcopy(_sample_dashboard_data())
+    data["exchange"] = "NYSE"
+    data["sector"] = "Consumer Cyclical"
+    data["industry"] = "Footwear & Accessories"
+    data["peers"] = [
+        {
+            "ticker": "RMS.PA",
+            "name": "Hermes Intl",
+            "exchange": "PA",
+            "sector": "Consumer Cyclical",
+            "industry": "Luxury Goods",
+            "canonical_industry": "Luxury Goods",
+            "industry_family": "luxury-fashion",
+            "same_industry_cluster": False,
+            "same_industry_family": True,
+            "peer_rank": 0,
+            "peer_learning_score": 8.4,
+            "base_peer_learning_score": 6.9,
+            "pair_strength_score": 1.5,
+            "pair_auto_peer_hits": 2,
+            "pair_manual_compare_hits": 1,
+            "subject": False,
+            "ev_ebitda": 19.2,
+            "ev_ebit": 23.4,
+            "ev_rev": 6.1,
+            "pe": 28.5,
+            "p_fcf": 32.1,
+        }
+    ]
+    data["peer_median"] = {}
+
+    webapp_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
+    monkeypatch.setattr(webapp_module, "get_dashboard_data", lambda ticker: copy.deepcopy(data))
+
+    with webapp_module.app.test_client() as client:
+        response = client.get("/dashboard/NKE")
+
+    html_text = html.unescape(response.get_data(as_text=True))
+    assert response.status_code == 200
+    assert "Brain Fit" in html_text
+    assert '"ticker": "RMS.PA"' in html_text
+    assert '"exchange": "PA"' in html_text
+    assert '"industry": "Luxury Goods"' in html_text
+    assert '"peer_learning_score": 8.4' in html_text
 
 
 def test_index_renders_company_search_autocomplete():

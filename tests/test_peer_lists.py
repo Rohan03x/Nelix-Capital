@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import types
 
+from auto_valuation.learning.discovery import DiscoveryStore
 from auto_valuation.learning.universe import SymbolUniverseStore
 
 
@@ -22,6 +23,7 @@ def test_get_peers_for_luxury_goods_avoids_broad_sector_fallback():
     assert "RMS.PA" in peers
     assert "AMZN" not in peers
     assert "TSLA" not in peers
+    assert "NKE" not in peers[:6]
 
 
 def test_get_peers_prefers_cached_same_industry_before_sector(monkeypatch, tmp_path):
@@ -104,6 +106,62 @@ def test_get_peers_uses_universe_learning_signal_to_rank_candidates(tmp_path, mo
     assert ranked[0] == "RMS.PA"
 
 
+def test_rank_peer_tickers_uses_pair_relationship_memory(tmp_path, monkeypatch):
+    import webapp.data.peer_lists as peer_lists
+
+    universe = SymbolUniverseStore(tmp_path / "symbol-universe.db")
+    discovery = DiscoveryStore(tmp_path / "discovery.db", universe_store=universe)
+    discovery.record_auto_peer_basket(
+        {
+            "ticker": "CDI.PA",
+            "company_name": "Christian Dior",
+            "exchange": "PA",
+            "sector": "Consumer Cyclical",
+            "industry": "Luxury Goods",
+        },
+        [
+            {
+                "ticker": "RMS.PA",
+                "company_name": "Hermes",
+                "exchange": "PA",
+                "sector": "Consumer Cyclical",
+                "industry": "Luxury Goods",
+                "base_peer_learning_score": 5.5,
+            }
+        ],
+    )
+    discovery.record_manual_compare(
+        {
+            "ticker": "CDI.PA",
+            "company_name": "Christian Dior",
+            "exchange": "PA",
+            "sector": "Consumer Cyclical",
+            "industry": "Luxury Goods",
+        },
+        [
+            {
+                "ticker": "RMS.PA",
+                "company_name": "Hermes",
+                "exchange": "PA",
+                "sector": "Consumer Cyclical",
+                "industry": "Luxury Goods",
+            }
+        ],
+    )
+
+    monkeypatch.setattr(peer_lists, "_safe_universe_store", lambda: universe)
+    monkeypatch.setattr(peer_lists, "_safe_discovery_store", lambda: discovery)
+
+    ranked = peer_lists._rank_peer_tickers(
+        ["MC.PA", "RMS.PA", "KER.PA"],
+        subject_ticker="CDI.PA",
+        sector="Consumer Cyclical",
+        industry="Luxury Goods",
+    )
+
+    assert ranked[0] == "RMS.PA"
+
+
 def test_fetch_peer_metrics_preserves_ranked_input_order_from_cache(monkeypatch):
     import webapp.data.peer_lists as peer_lists
 
@@ -133,3 +191,30 @@ def test_fetch_peer_metrics_preserves_ranked_input_order_from_cache(monkeypatch)
     assert peers[0]["industry_similarity"] == 1.0
     assert peers[0]["peer_learning_score"] >= 5.0
     assert peer_median["ev_rev"] is None
+
+
+def test_fetch_peer_metrics_backfills_curated_industry_when_live_metadata_missing(monkeypatch):
+    import webapp.data.peer_lists as peer_lists
+
+    monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace())
+    monkeypatch.setattr(
+        peer_lists,
+        "_load_cache",
+        lambda key: [
+            {"ticker": "MC.PA", "name": "LVMH", "market_cap": 380000, "subject": False, "industry": "", "sector": ""},
+        ],
+    )
+    monkeypatch.setattr(peer_lists, "_load_cached_peer_profiles", lambda: [])
+    monkeypatch.setattr(peer_lists, "_safe_universe_store", lambda: None)
+    monkeypatch.setattr(peer_lists, "_safe_discovery_store", lambda: None)
+
+    peers, _ = peer_lists.fetch_peer_metrics(
+        ["MC.PA"],
+        "CDI.PA",
+        target_sector="Consumer Cyclical",
+        target_industry="Luxury Goods",
+    )
+
+    assert peers[0]["canonical_industry"] == "Luxury Goods"
+    assert peers[0]["industry_family"] == "luxury-fashion"
+    assert peers[0]["sector"] == "Consumer Cyclical"

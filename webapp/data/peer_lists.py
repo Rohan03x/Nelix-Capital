@@ -336,6 +336,7 @@ def _discover_cached_peers(
     industry: str,
     *,
     max_peers: int = 12,
+    include_related: bool = False,
 ) -> list[str]:
     profiles = _load_cached_peer_profiles()
     if not profiles:
@@ -349,6 +350,8 @@ def _discover_cached_peers(
     subject_market_cap = float((subject_profile or {}).get("market_cap_mln") or 0.0)
     subject_exchange = str((subject_profile or {}).get("exchange") or "")
     subject_sector = _normalize_label(sector)
+    subject_taxonomy = resolve_industry_taxonomy(industry, sector)
+    subject_related_industries = set(subject_taxonomy.get("related_industries") or [])
 
     scored: list[tuple[float, str]] = []
     for profile in profiles:
@@ -361,14 +364,28 @@ def _discover_cached_peers(
             continue
 
         candidate_industry = str(profile.get("industry") or "")
+        candidate_sector = str(profile.get("sector") or "")
+        candidate_taxonomy = resolve_industry_taxonomy(candidate_industry, candidate_sector)
         similarity = industry_similarity(
             industry,
             candidate_industry,
             subject_sector=sector,
-            candidate_sector=str(profile.get("sector") or ""),
+            candidate_sector=candidate_sector,
         )
-        same_canonical = similarity >= 0.99
-        if not same_canonical and similarity < 0.45:
+        same_canonical = bool(
+            subject_taxonomy.get("canonical_industry")
+            and subject_taxonomy.get("canonical_industry") == candidate_taxonomy.get("canonical_industry")
+        )
+        related_match = bool(
+            candidate_taxonomy.get("canonical_industry") in subject_related_industries
+            or subject_taxonomy.get("canonical_industry") in set(candidate_taxonomy.get("related_industries") or [])
+            or (
+                include_related
+                and subject_taxonomy.get("family")
+                and subject_taxonomy.get("family") == candidate_taxonomy.get("family")
+            )
+        )
+        if not same_canonical and (not include_related or not related_match or similarity < 0.45):
             continue
 
         score = 100.0 if same_canonical else similarity * 60.0
@@ -386,11 +403,18 @@ def _discover_cached_peers(
     return _dedupe_preserve([ticker for _, ticker in scored], exclude=subject_variants, limit=max_peers)
 
 
-def _industry_peers(industry: str) -> list[str]:
-    peer_lists: list[str] = []
-    for key in related_industries(industry):
-        peer_lists.extend(list(INDUSTRY_PEER_MAP.get(key) or []))
-    if peer_lists:
+def _industry_peers(industry: str, *, include_related: bool = False) -> list[str]:
+    canonical_industry = str(resolve_industry_taxonomy(industry).get("canonical_industry") or "").strip()
+    if canonical_industry and canonical_industry in INDUSTRY_PEER_MAP:
+        canonical_peers = list(INDUSTRY_PEER_MAP.get(canonical_industry) or [])
+        if not include_related:
+            return canonical_peers
+
+        peer_lists: list[str] = list(canonical_peers)
+        for key in related_industries(industry):
+            if key == canonical_industry:
+                continue
+            peer_lists.extend(list(INDUSTRY_PEER_MAP.get(key) or []))
         return _dedupe_preserve(peer_lists)
 
     key = _match_industry_key(industry)
@@ -399,11 +423,31 @@ def _industry_peers(industry: str) -> list[str]:
     return []
 
 
+@lru_cache(maxsize=256)
+def _curated_industry_for_ticker(ticker: str) -> str:
+    ticker_text = str(ticker or "").strip().upper()
+    if not ticker_text:
+        return ""
+    for industry_name, peers in INDUSTRY_PEER_MAP.items():
+        if ticker_text in {str(peer or "").strip().upper() for peer in peers}:
+            return str(industry_name)
+    return ""
+
+
 def _safe_universe_store() -> Any | None:
     try:
         from auto_valuation.learning.universe import SymbolUniverseStore
 
         return SymbolUniverseStore()
+    except Exception:
+        return None
+
+
+def _safe_discovery_store() -> Any | None:
+    try:
+        from auto_valuation.learning.discovery import DiscoveryStore
+
+        return DiscoveryStore()
     except Exception:
         return None
 
@@ -421,6 +465,31 @@ def _peer_learning_bonus(symbol: dict[str, Any] | None) -> float:
     if symbol.get("fundamentals_cached"):
         bonus += 0.3
     return bonus
+
+
+def _pair_relationship_context(subject_ticker: str, peer_ticker: str, discovery_store: Any | None) -> dict[str, Any]:
+    default = {
+        "pair_strength_score": 0.0,
+        "pair_hits": 0,
+        "pair_auto_peer_hits": 0,
+        "pair_manual_compare_hits": 0,
+        "pair_last_seen_at": "",
+    }
+    if discovery_store is None:
+        return default
+    try:
+        relationship = discovery_store.get_peer_relationship(subject_ticker, peer_ticker)
+    except Exception:
+        relationship = None
+    if not relationship:
+        return default
+    return {
+        "pair_strength_score": round(float(relationship.get("pair_strength_score") or 0.0), 4),
+        "pair_hits": int(relationship.get("pair_hits") or 0),
+        "pair_auto_peer_hits": int(relationship.get("auto_peer_hits") or 0),
+        "pair_manual_compare_hits": int(relationship.get("manual_compare_hits") or 0),
+        "pair_last_seen_at": str(relationship.get("last_seen_at") or ""),
+    }
 
 
 def _rank_peer_tickers(
@@ -442,6 +511,7 @@ def _rank_peer_tickers(
     subject_market_cap = float((subject_profile or {}).get("market_cap_mln") or 0.0)
     subject_exchange = str((subject_profile or {}).get("exchange") or "")
     universe_store = _safe_universe_store()
+    discovery_store = _safe_discovery_store()
 
     scored: list[tuple[float, int, str]] = []
     for index, ticker in enumerate(peer_tickers):
@@ -469,6 +539,9 @@ def _rank_peer_tickers(
         if universe_store is not None:
             score += _peer_learning_bonus(universe_store.get_symbol(candidate))
 
+        pair_context = _pair_relationship_context(subject_ticker, candidate, discovery_store)
+        score += min(float(pair_context["pair_strength_score"]) * 4.0, 18.0)
+
         scored.append((round(score, 4), index, candidate))
 
     scored.sort(key=lambda item: (-item[0], item[1], item[2]))
@@ -480,6 +553,8 @@ def _enrich_peer_rows(
     *,
     target_ticker: str,
     peer_tickers: list[str],
+    target_sector: str = "",
+    target_industry: str = "",
 ) -> list[dict]:
     if not peers:
         return []
@@ -490,36 +565,60 @@ def _enrich_peer_rows(
         (profile for profile in profiles.values() if target_variants & set(profile.get("variants") or set())),
         None,
     )
-    target_sector = str((target_profile or {}).get("sector") or "")
-    target_industry = str((target_profile or {}).get("industry") or "")
+    resolved_target_sector = str(target_sector or (target_profile or {}).get("sector") or "")
+    resolved_target_industry = str(target_industry or (target_profile or {}).get("industry") or "")
+    target_taxonomy = resolve_industry_taxonomy(resolved_target_industry, resolved_target_sector)
     order_map = {str(ticker or "").upper(): index for index, ticker in enumerate(peer_tickers)}
     universe_store = _safe_universe_store()
+    discovery_store = _safe_discovery_store()
 
     enriched: list[dict] = []
     for peer in peers:
         row = dict(peer)
         ticker = str(row.get("ticker") or row.get("symbol") or "").upper()
         profile = profiles.get(ticker) or {}
+        curated_industry = _curated_industry_for_ticker(ticker)
         row["ticker"] = ticker
         row["exchange"] = str(row.get("exchange") or profile.get("exchange") or "")
         row["sector"] = str(row.get("sector") or profile.get("sector") or "")
-        row["industry"] = str(row.get("industry") or profile.get("industry") or "")
+        row["industry"] = str(row.get("industry") or profile.get("industry") or curated_industry or "")
+        if not row["sector"] and row["industry"]:
+            row["sector"] = str(resolve_industry_taxonomy(row["industry"], resolved_target_sector).get("canonical_sector") or "")
+        taxonomy = resolve_industry_taxonomy(row["industry"], row["sector"])
         row["industry_similarity"] = round(
             industry_similarity(
-                target_industry,
+                resolved_target_industry,
                 row["industry"],
-                subject_sector=target_sector,
+                subject_sector=resolved_target_sector,
                 candidate_sector=row["sector"],
             )
-            if target_industry and row["industry"]
+            if resolved_target_industry and row["industry"]
             else 0.0,
             4,
         )
-        row["peer_learning_score"] = round(
-            (row["industry_similarity"] * 5.0)
-            + (_peer_learning_bonus(universe_store.get_symbol(ticker)) if universe_store is not None else 0.0),
-            4,
+        global_peer_score = _peer_learning_bonus(universe_store.get_symbol(ticker)) if universe_store is not None else 0.0
+        pair_context = _pair_relationship_context(target_ticker, ticker, discovery_store)
+        row["canonical_industry"] = str(taxonomy.get("canonical_industry") or row["industry"] or "")
+        row["industry_family"] = str(taxonomy.get("family") or "")
+        row["same_industry_cluster"] = bool(
+            target_taxonomy.get("cluster_id")
+            and target_taxonomy.get("cluster_id") == taxonomy.get("cluster_id")
+            and str(taxonomy.get("cluster_id") or "").strip()
         )
+        row["same_industry_family"] = bool(
+            target_taxonomy.get("family")
+            and target_taxonomy.get("family") == taxonomy.get("family")
+            and str(taxonomy.get("family") or "").strip()
+        )
+        row["industry_fit_score"] = round(row["industry_similarity"] * 5.0, 4)
+        row["global_peer_score"] = round(global_peer_score, 4)
+        row["pair_strength_score"] = round(float(pair_context["pair_strength_score"]), 4)
+        row["pair_hits"] = int(pair_context["pair_hits"])
+        row["pair_auto_peer_hits"] = int(pair_context["pair_auto_peer_hits"])
+        row["pair_manual_compare_hits"] = int(pair_context["pair_manual_compare_hits"])
+        row["pair_last_seen_at"] = str(pair_context["pair_last_seen_at"])
+        row["base_peer_learning_score"] = round(row["industry_fit_score"] + row["global_peer_score"], 4)
+        row["peer_learning_score"] = round(row["base_peer_learning_score"] + row["pair_strength_score"], 4)
         row["peer_rank"] = int(order_map.get(ticker, len(order_map)))
         enriched.append(row)
 
@@ -567,10 +666,20 @@ def get_peers_for_ticker(
         return peers[:12]
 
     # 2. Cached same-industry discovery + curated industry map.
-    cached_industry_peers = _discover_cached_peers(ticker, sector, industry, max_peers=12)
-    curated_industry_peers = _industry_peers(industry)
+    cached_industry_peers = _discover_cached_peers(ticker, sector, industry, max_peers=12, include_related=False)
+    curated_industry_peers = _industry_peers(industry, include_related=False)
     industry_peers = _dedupe_preserve(
         cached_industry_peers + curated_industry_peers,
+        exclude=_ticker_variants(ticker),
+        limit=10,
+    )
+    if len(industry_peers) >= 6:
+        return _rank_peer_tickers(industry_peers, subject_ticker=ticker, sector=sector, industry=industry)
+
+    related_cached_peers = _discover_cached_peers(ticker, sector, industry, max_peers=12, include_related=True)
+    related_curated_peers = _industry_peers(industry, include_related=True)
+    industry_peers = _dedupe_preserve(
+        industry_peers + related_cached_peers + related_curated_peers,
         exclude=_ticker_variants(ticker),
         limit=10,
     )
@@ -643,6 +752,8 @@ def fetch_peer_metrics(
     peer_tickers: list[str],
     target_ticker: str,
     timeout_per_peer: float = 6.0,
+    target_sector: str = "",
+    target_industry: str = "",
 ) -> tuple[list[dict], dict]:
     """Fetch basic valuation metrics for *peer_tickers* via yfinance.
 
@@ -661,7 +772,13 @@ def fetch_peer_metrics(
     cached = _load_cache(cache_key)
     if cached is not None:
         logger.debug("Using cached peer data for %s", cache_key)
-        peers = _enrich_peer_rows(list(cached), target_ticker=target_ticker, peer_tickers=peer_tickers)
+        peers = _enrich_peer_rows(
+            list(cached),
+            target_ticker=target_ticker,
+            peer_tickers=peer_tickers,
+            target_sector=target_sector,
+            target_industry=target_industry,
+        )
         peer_median = _compute_median(peers, target_ticker)
         return peers, peer_median
 
@@ -711,7 +828,13 @@ def fetch_peer_metrics(
                 "pe": None, "p_fcf": None, "subject": (tk.upper() == target_ticker),
             })
 
-    peers = _enrich_peer_rows(peers, target_ticker=target_ticker, peer_tickers=peer_tickers)
+    peers = _enrich_peer_rows(
+        peers,
+        target_ticker=target_ticker,
+        peer_tickers=peer_tickers,
+        target_sector=target_sector,
+        target_industry=target_industry,
+    )
     _save_cache(cache_key, peers)
 
     peer_median = _compute_median(peers, target_ticker)

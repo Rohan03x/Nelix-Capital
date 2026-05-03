@@ -768,6 +768,76 @@ def _safe_symbol_universe_store() -> Any | None:
         return None
 
 
+def _safe_discovery_store() -> Any | None:
+    if not _live_learning_feedback_enabled() or not LEARNING_CONFIG.get("symbol_universe_enabled", True):
+        return None
+    try:
+        from auto_valuation.learning.discovery import DiscoveryStore
+
+        return DiscoveryStore()
+    except Exception:
+        return None
+
+
+def _record_peer_learning_signals(
+    discovery_store: Any | None,
+    *,
+    ticker: str,
+    company_name: str,
+    exchange: str,
+    country: str,
+    sector: str,
+    industry: str,
+    peer_items: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    if discovery_store is None or not peer_items:
+        return {}
+    try:
+        result = discovery_store.record_auto_peer_basket(
+            {
+                "ticker": ticker,
+                "company_name": company_name,
+                "exchange": exchange,
+                "country": country,
+                "sector": sector,
+                "industry": industry,
+            },
+            peer_items,
+        )
+    except Exception:
+        return {}
+    relationships = list((result or {}).get("items") or [])
+    return {
+        str(item.get("peer_ticker") or "").strip().upper(): item
+        for item in relationships
+        if str(item.get("peer_ticker") or "").strip()
+    }
+
+
+def _merge_peer_learning_relationships(
+    peers: list[dict[str, Any]],
+    relationships: dict[str, dict[str, Any]],
+) -> None:
+    if not peers or not relationships:
+        return
+    for peer in peers:
+        ticker_text = str(peer.get("ticker") or peer.get("symbol") or "").strip().upper()
+        relationship = relationships.get(ticker_text)
+        if relationship is None:
+            continue
+        peer["pair_strength_score"] = round(float(relationship.get("pair_strength_score") or 0.0), 4)
+        peer["pair_hits"] = int(relationship.get("pair_hits") or 0)
+        peer["pair_auto_peer_hits"] = int(relationship.get("auto_peer_hits") or 0)
+        peer["pair_manual_compare_hits"] = int(relationship.get("manual_compare_hits") or 0)
+        peer["pair_last_seen_at"] = str(relationship.get("last_seen_at") or "")
+        peer["peer_learning_score"] = round(
+            float(peer.get("industry_fit_score") or 0.0)
+            + float(peer.get("global_peer_score") or 0.0)
+            + float(peer.get("pair_strength_score") or 0.0),
+            4,
+        )
+
+
 def _register_global_universe_symbols(
     universe_store: Any | None,
     *,
@@ -1215,6 +1285,15 @@ def build_dashboard_data(ticker: str, overrides: dict | None = None) -> dict | N
         if len(description) > 400:
             description = description[:397] + "..."
 
+        # ── Parse financial statements ────────────────────────────────────
+        is_sec = fins.get("Income_Statement", {})
+        bs_sec = fins.get("Balance_Sheet", {})
+        cf_sec = fins.get("Cash_Flow", {})
+
+        is_periods = _sorted_yearly(is_sec, 10)   # newest-first
+        bs_periods = _sorted_yearly(bs_sec, 10)
+        cf_periods = _sorted_yearly(cf_sec, 10)
+
         # ── Shares outstanding ────────────────────────────────────────────
         shares_raw = _shares_to_millions(
             share.get("SharesOutstanding")
@@ -1226,15 +1305,6 @@ def build_dashboard_data(ticker: str, overrides: dict | None = None) -> dict | N
         if diluted_shares < 1:
             logger.warning("EODHD: invalid shares for %s", ticker)
             return None
-
-        # ── Parse financial statements ────────────────────────────────────
-        is_sec = fins.get("Income_Statement", {})
-        bs_sec = fins.get("Balance_Sheet", {})
-        cf_sec = fins.get("Cash_Flow", {})
-
-        is_periods = _sorted_yearly(is_sec, 10)   # newest-first
-        bs_periods = _sorted_yearly(bs_sec, 10)
-        cf_periods = _sorted_yearly(cf_sec, 10)
 
         if not is_periods or not bs_periods or not cf_periods:
             logger.warning("EODHD: incomplete financials for %s", ticker)
@@ -2199,13 +2269,19 @@ def build_dashboard_data(ticker: str, overrides: dict | None = None) -> dict | N
         if _PEERS_AVAILABLE:
             try:
                 _peer_tickers = get_peers_for_ticker(ticker, sector, industry)
-                _peers, _peer_median = fetch_peer_metrics(_peer_tickers, ticker)
+                _peers, _peer_median = fetch_peer_metrics(
+                    _peer_tickers,
+                    ticker,
+                    target_sector=sector,
+                    target_industry=industry,
+                )
                 _result["peers"]       = _peers
                 _result["peer_median"] = _peer_median
             except Exception as _pe:
                 logger.debug("Peer fetch failed for %s: %s", ticker, _pe)
 
         universe_store = _safe_symbol_universe_store()
+        discovery_store = _safe_discovery_store()
         peer_candidates = [
             {
                 "ticker": peer.get("ticker") or peer.get("symbol"),
@@ -2213,8 +2289,12 @@ def build_dashboard_data(ticker: str, overrides: dict | None = None) -> dict | N
                 "exchange": str(peer.get("exchange") or ""),
                 "sector": str(peer.get("sector") or sector),
                 "industry": str(peer.get("industry") or industry),
-                "peer_learning_score": float(peer.get("peer_learning_score") or 0.0),
+                "canonical_industry": str(peer.get("canonical_industry") or ""),
+                "industry_family": str(peer.get("industry_family") or ""),
+                "peer_learning_score": float(peer.get("base_peer_learning_score") or peer.get("peer_learning_score") or 0.0),
+                "base_peer_learning_score": float(peer.get("base_peer_learning_score") or peer.get("peer_learning_score") or 0.0),
                 "industry_similarity": float(peer.get("industry_similarity") or 0.0),
+                "pair_strength_score": float(peer.get("pair_strength_score") or 0.0),
             }
             for peer in _peers
             if str(peer.get("ticker") or peer.get("symbol") or "").strip()
@@ -2230,6 +2310,17 @@ def build_dashboard_data(ticker: str, overrides: dict | None = None) -> dict | N
             knowledge_model=knowledge_model_payload,
             peer_items=peer_candidates,
         )
+        peer_relationships = _record_peer_learning_signals(
+            discovery_store,
+            ticker=ticker,
+            company_name=company_name,
+            exchange=exchange,
+            country=str(gen.get("CountryName") or gen.get("CountryISO") or ""),
+            sector=sector,
+            industry=industry,
+            peer_items=peer_candidates,
+        )
+        _merge_peer_learning_relationships(_peers, peer_relationships)
         learning_bootstrap = _auto_bootstrap_current_ticker(ticker, fund, universe_store)
         global_universe = _global_universe_summary(universe_store)
 

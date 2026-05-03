@@ -869,14 +869,43 @@ def build_dashboard_data(ticker: str) -> dict | None:  # noqa: C901
                     info.get("sector", ""),
                     info.get("industry", ""),
                 )
-                _peers, _peer_median = fetch_peer_metrics(_peer_tickers, ticker)
+                _peers, _peer_median = fetch_peer_metrics(
+                    _peer_tickers,
+                    ticker,
+                    target_sector=str(info.get("sector") or ""),
+                    target_industry=str(info.get("industry") or ""),
+                )
                 _result["peers"]       = _peers
                 _result["peer_median"] = _peer_median
 
                 try:
-                    from webapp.data.eodhd_client import _register_global_universe_symbols, _safe_symbol_universe_store
+                    from webapp.data.eodhd_client import (
+                        _merge_peer_learning_relationships,
+                        _record_peer_learning_signals,
+                        _register_global_universe_symbols,
+                        _safe_discovery_store,
+                        _safe_symbol_universe_store,
+                    )
 
                     universe_store = _safe_symbol_universe_store()
+                    discovery_store = _safe_discovery_store()
+                    peer_candidates = [
+                        {
+                            "ticker": peer.get("ticker") or peer.get("symbol"),
+                            "company_name": peer.get("name") or peer.get("company_name") or "",
+                            "exchange": str(peer.get("exchange") or ""),
+                            "sector": str(peer.get("sector") or info.get("sector") or ""),
+                            "industry": str(peer.get("industry") or info.get("industry") or ""),
+                            "canonical_industry": str(peer.get("canonical_industry") or ""),
+                            "industry_family": str(peer.get("industry_family") or ""),
+                            "peer_learning_score": float(peer.get("base_peer_learning_score") or peer.get("peer_learning_score") or 0.0),
+                            "base_peer_learning_score": float(peer.get("base_peer_learning_score") or peer.get("peer_learning_score") or 0.0),
+                            "industry_similarity": float(peer.get("industry_similarity") or 0.0),
+                            "pair_strength_score": float(peer.get("pair_strength_score") or 0.0),
+                        }
+                        for peer in _peers
+                        if str(peer.get("ticker") or peer.get("symbol") or "").strip()
+                    ]
                     _register_global_universe_symbols(
                         universe_store,
                         ticker=ticker,
@@ -886,20 +915,19 @@ def build_dashboard_data(ticker: str) -> dict | None:  # noqa: C901
                         sector=str(info.get("sector") or ""),
                         industry=str(info.get("industry") or ""),
                         knowledge_model=None,
-                        peer_items=[
-                            {
-                                "ticker": peer.get("ticker") or peer.get("symbol"),
-                                "company_name": peer.get("name") or peer.get("company_name") or "",
-                                "exchange": str(peer.get("exchange") or ""),
-                                "sector": str(peer.get("sector") or info.get("sector") or ""),
-                                "industry": str(peer.get("industry") or info.get("industry") or ""),
-                                "peer_learning_score": float(peer.get("peer_learning_score") or 0.0),
-                                "industry_similarity": float(peer.get("industry_similarity") or 0.0),
-                            }
-                            for peer in _peers
-                            if str(peer.get("ticker") or peer.get("symbol") or "").strip()
-                        ],
+                        peer_items=peer_candidates,
                     )
+                    peer_relationships = _record_peer_learning_signals(
+                        discovery_store,
+                        ticker=ticker,
+                        company_name=company_name,
+                        exchange=str(info.get("exchange") or info.get("fullExchangeName") or ""),
+                        country=str(info.get("country") or ""),
+                        sector=str(info.get("sector") or ""),
+                        industry=str(info.get("industry") or ""),
+                        peer_items=peer_candidates,
+                    )
+                    _merge_peer_learning_relationships(_peers, peer_relationships)
                 except Exception:
                     pass
             except Exception as _pe:
