@@ -3,6 +3,8 @@ webapp/app.py — Flask application for the DCF Valuation Dashboard.
 """
 
 from __future__ import annotations
+import copy
+import logging
 import os
 import sys
 import json
@@ -16,8 +18,11 @@ from flask import (
 # Allow imports from parent directory (auto_valuation package)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from webapp.data.samples import get_dashboard_data, SUPPORTED_TICKERS
+from webapp.data.samples import get_dashboard_data, REGISTRY, SUPPORTED_TICKERS
 from webapp.data.ticker_search import resolve_search_input, search_tickers
+
+
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -51,6 +56,28 @@ def _dashboard_api_payload(data: dict) -> dict:
     payload.setdefault("historical_fcf", historical.get("fcf", []))
     payload.setdefault("historical_roic", historical.get("roic", []))
     return payload
+
+
+def _fallback_dashboard_data(ticker: str, reason: str | None = None) -> dict:
+    fallback = copy.deepcopy(REGISTRY.get(ticker) or REGISTRY["NKE"])
+    fallback["is_demo"] = True
+    fallback["data_source"] = "demo-fallback"
+    fallback["requested_ticker"] = ticker
+    fallback["demo_note"] = (
+        f"Live dashboard data is temporarily unavailable for {ticker}. "
+        "Showing demo data while production recovers."
+    )
+    if reason:
+        fallback["runtime_warning"] = reason
+    return fallback
+
+
+def _safe_dashboard_data(ticker: str) -> dict:
+    try:
+        return get_dashboard_data(ticker)
+    except Exception as exc:
+        logger.exception("Dashboard data failed for %s", ticker)
+        return _fallback_dashboard_data(ticker, reason=str(exc))
 
 # ─── Landing page ────────────────────────────────────────────────────────────
 
@@ -100,7 +127,7 @@ def loading(ticker):
 @app.route("/dashboard/<ticker>")
 def dashboard(ticker):
     ticker = ticker.upper()
-    data   = get_dashboard_data(ticker)
+    data   = _safe_dashboard_data(ticker)
     return render_template("dashboard.html", data=data)
 
 
@@ -108,7 +135,7 @@ def dashboard(ticker):
 
 @app.route("/api/dashboard/<ticker>")
 def api_dashboard(ticker):
-    data = get_dashboard_data(ticker.upper())
+    data = _safe_dashboard_data(ticker.upper())
     return jsonify(_dashboard_api_payload(data))
 
 

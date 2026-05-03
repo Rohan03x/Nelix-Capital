@@ -1039,6 +1039,29 @@ def test_api_dashboard_exposes_learning_explainability_alias(monkeypatch):
     assert payload["historical_years"] == expected["historical"]["years"]
 
 
+def test_dashboard_and_api_fall_back_to_demo_when_dashboard_data_raises(monkeypatch):
+    import webapp.app as webapp_module
+
+    webapp_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
+    monkeypatch.setattr(
+        webapp_module,
+        "get_dashboard_data",
+        lambda _ticker: (_ for _ in ()).throw(RuntimeError("upstream boom")),
+    )
+
+    with webapp_module.app.test_client() as client:
+        dashboard_response = client.get("/dashboard/NKE")
+        api_response = client.get("/api/dashboard/NKE")
+
+    assert dashboard_response.status_code == 200
+    assert api_response.status_code == 200
+    payload = api_response.get_json()
+    assert payload["is_demo"] is True
+    assert payload["data_source"] == "demo-fallback"
+    assert "temporarily unavailable" in payload["demo_note"]
+    assert payload["runtime_warning"] == "upstream boom"
+
+
 def test_dashboard_renders_everything_knows_model_panel(monkeypatch):
     import webapp.app as webapp_module
 
