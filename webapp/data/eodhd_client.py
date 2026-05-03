@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import os
+import tempfile
 from statistics import median
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -38,8 +39,22 @@ _EODHD_KEY_DEFAULT = "691aca08424c26.36039280"
 _EODHD_BASE        = "https://eodhd.com/api"
 
 # ── Disk-cache directory ──────────────────────────────────────────────────────
-_CACHE_DIR = Path(__file__).parent / "cache"
-_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+def _resolve_cache_dir() -> Path | None:
+    candidates = [
+        Path(__file__).parent / "cache",
+        Path(tempfile.gettempdir()) / "nelix-capital-cache",
+    ]
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except OSError:
+            continue
+    logger.warning("EODHD disk cache disabled: no writable cache directory available.")
+    return None
+
+
+_CACHE_DIR = _resolve_cache_dir()
 
 # Cache TTLs
 _TTL_PRICE_SEC  = 300       # 5  minutes for real-time price
@@ -82,13 +97,15 @@ def _sf(val: Any, default: float = 0.0) -> float:
         return default
 
 
-def _cache_path(name: str) -> Path:
+def _cache_path(name: str) -> Path | None:
+    if _CACHE_DIR is None:
+        return None
     return _CACHE_DIR / f"eodhd_{name}.json"
 
 
 def _cache_read(name: str, ttl_sec: int) -> Any | None:
     p = _cache_path(name)
-    if not p.exists():
+    if p is None or not p.exists():
         return None
     try:
         with p.open(encoding="utf-8") as f:
@@ -104,8 +121,11 @@ def _cache_read(name: str, ttl_sec: int) -> Any | None:
 
 
 def _cache_write(name: str, data: Any) -> None:
+    p = _cache_path(name)
+    if p is None:
+        return
     try:
-        _cache_path(name).write_text(
+        p.write_text(
             json.dumps({"_ts": datetime.now(timezone.utc).isoformat(), "data": data},
                        ensure_ascii=False, default=str),
             encoding="utf-8",

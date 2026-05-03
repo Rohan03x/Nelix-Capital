@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import json
 import logging
+import tempfile
 from typing import Any
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -39,18 +40,34 @@ FRED_DGS10 = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10"
 # Simple in-memory cache: {cache_key: (timestamp, data)}
 _CACHE: dict[str, tuple[datetime, Any]] = {}
 _CACHE_TTL_MINUTES = 60
-_CACHE_DIR = Path(__file__).parent / "cache"
-_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+def _resolve_cache_dir() -> Path | None:
+    candidates = [
+        Path(__file__).parent / "cache",
+        Path(tempfile.gettempdir()) / "nelix-capital-cache",
+    ]
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except OSError:
+            continue
+    logger.warning("FMP disk cache disabled: no writable cache directory available.")
+    return None
 
 
-def _cache_path(key: str) -> Path:
+_CACHE_DIR = _resolve_cache_dir()
+
+
+def _cache_path(key: str) -> Path | None:
+    if _CACHE_DIR is None:
+        return None
     safe_key = key.replace(":", "_").replace("/", "_")
     return _CACHE_DIR / f"fmp_{safe_key}.json"
 
 
 def _load_disk_cache(key: str) -> Any | None:
     path = _cache_path(key)
-    if not path.exists():
+    if path is None or not path.exists():
         return None
     try:
         with path.open(encoding="utf-8") as fh:
@@ -66,8 +83,11 @@ def _load_disk_cache(key: str) -> Any | None:
 
 
 def _save_disk_cache(key: str, value: Any) -> None:
+    path = _cache_path(key)
+    if path is None:
+        return
     try:
-        with _cache_path(key).open("w", encoding="utf-8") as fh:
+        with path.open("w", encoding="utf-8") as fh:
             json.dump({"_ts": datetime.now(timezone.utc).isoformat(), "data": value}, fh)
     except Exception:
         logger.debug("FMP disk cache write failed for %s", key, exc_info=True)

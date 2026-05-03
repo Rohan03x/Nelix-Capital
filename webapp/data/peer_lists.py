@@ -19,6 +19,7 @@ import math
 import os
 from pathlib import Path
 import re
+import tempfile
 import time
 from typing import Any
 
@@ -702,18 +703,34 @@ def get_segment_peers(ticker: str) -> dict[str, list[str]]:
 
 # ─── Live metric fetching ─────────────────────────────────────────────────────
 
-_CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
+def _resolve_cache_dir() -> str | None:
+    candidates = [
+        Path(__file__).with_name("cache"),
+        Path(tempfile.gettempdir()) / "nelix-capital-cache",
+    ]
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return str(candidate)
+        except OSError:
+            continue
+    logger.warning("Peer disk cache disabled: no writable cache directory available.")
+    return None
+
+
+_CACHE_DIR = _resolve_cache_dir()
 _CACHE_TTL  = 86_400  # 24 hours
 
 
-def _cache_path(ticker: str) -> str:
-    os.makedirs(_CACHE_DIR, exist_ok=True)
+def _cache_path(ticker: str) -> str | None:
+    if not _CACHE_DIR:
+        return None
     return os.path.join(_CACHE_DIR, f"{ticker.upper()}_peers.json")
 
 
 def _load_cache(ticker: str) -> list | None:
     p = _cache_path(ticker)
-    if not os.path.exists(p):
+    if not p or not os.path.exists(p):
         return None
     age = time.time() - os.path.getmtime(p)
     if age > _CACHE_TTL:
@@ -726,8 +743,11 @@ def _load_cache(ticker: str) -> list | None:
 
 
 def _save_cache(ticker: str, data: list) -> None:
+    p = _cache_path(ticker)
+    if not p:
+        return
     try:
-        with open(_cache_path(ticker), "w") as f:
+        with open(p, "w") as f:
             json.dump(data, f)
     except Exception:
         pass
