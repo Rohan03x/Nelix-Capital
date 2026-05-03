@@ -11,11 +11,13 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from .storage_paths import learning_db_dir, learning_ledger_dir
+
 
 SCHEMA_VERSION = 2
 PACKAGE_ROOT = Path(__file__).resolve().parent
-DEFAULT_DB_DIR = PACKAGE_ROOT / "db"
-DEFAULT_EXPORT_DIR = PACKAGE_ROOT / "ledger"
+DEFAULT_DB_DIR = learning_db_dir()
+DEFAULT_EXPORT_DIR = learning_ledger_dir()
 DEFAULT_DB_PATH = DEFAULT_DB_DIR / "predictions.db"
 DEFAULT_FISCAL_YEAR_END_MONTH = 12
 DEFAULT_FISCAL_YEAR_END_DAY = 31

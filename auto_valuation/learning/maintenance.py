@@ -12,10 +12,11 @@ from auto_valuation.config import LEARNING_CONFIG
 
 from .ledger import LedgerReader, LedgerWriter, PredictionRecord, prediction_horizon_target_date
 from .postmortem import QuinquennialStore, run_5year_postmortem, run_annual_postmortem
+from .storage_paths import learning_db_dir
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
-MAINTENANCE_STATE_PATH = PACKAGE_ROOT / "db" / "maintenance_state.json"
+MAINTENANCE_STATE_PATH = learning_db_dir() / "maintenance_state.json"
 
 
 @dataclass(frozen=True)

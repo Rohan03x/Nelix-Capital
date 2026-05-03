@@ -13,13 +13,14 @@ from typing import Any, Iterable
 
 from auto_valuation.assumptions.engine import AssumptionSet
 from auto_valuation.learning.cross_industry import cosine_similarity
+from auto_valuation.learning.storage_paths import learning_db_dir
 
 try:
     from auto_valuation.config import LEARNING_CONFIG as _LEARNING_CONFIG
 except ImportError:
     _LEARNING_CONFIG = {"min_calibration_observations": 5}
 
-CALIBRATION_DB_PATH = Path(__file__).resolve().parent / "db" / "calibration.db"
+CALIBRATION_DB_PATH = learning_db_dir() / "calibration.db"
 
 
 @dataclass(frozen=True)

@@ -72,6 +72,70 @@ def test_get_peers_prefers_cached_same_industry_before_sector(monkeypatch, tmp_p
     assert "AMZN" not in peers[:4]
 
 
+def test_get_peers_for_known_industry_skips_broad_sector_fallback(monkeypatch):
+    import webapp.data.peer_lists as peer_lists
+
+    monkeypatch.setattr(peer_lists, "_discover_cached_peers", lambda *args, **kwargs: [])
+    monkeypatch.setattr(peer_lists, "_industry_peers", lambda *args, **kwargs: [])
+    monkeypatch.setattr(peer_lists, "_sector_peers", lambda _sector: ["RTX", "HON", "CAT"])
+
+    peers = peer_lists.get_peers_for_ticker("ADEN.SW", "Industrials", "Staffing & Employment Services")
+
+    assert peers == []
+
+
+def test_discover_cached_peers_rejects_same_family_only_matches(monkeypatch):
+    import webapp.data.peer_lists as peer_lists
+
+    monkeypatch.setattr(
+        peer_lists,
+        "_load_cached_peer_profiles",
+        lambda: (
+            {
+                "ticker": "ADEN.SW",
+                "variants": {"ADEN.SW", "ADEN"},
+                "exchange": "SW",
+                "sector": "Industrials",
+                "industry": "Staffing & Employment Services",
+                "market_cap_mln": 3000.0,
+            },
+            {
+                "ticker": "LIGHT.AS",
+                "variants": {"LIGHT.AS", "LIGHT"},
+                "exchange": "AS",
+                "sector": "Industrials",
+                "industry": "Electrical Equipment & Parts",
+                "market_cap_mln": 2500.0,
+            },
+        ),
+    )
+
+    def _fake_taxonomy(industry: str, sector: str = "") -> dict[str, object]:
+        if "Staffing" in industry:
+            return {
+                "canonical_industry": "Staffing & Employment Services",
+                "family": "industrials",
+                "related_industries": [],
+            }
+        return {
+            "canonical_industry": "Electrical Equipment & Parts",
+            "family": "industrials",
+            "related_industries": [],
+        }
+
+    monkeypatch.setattr(peer_lists, "resolve_industry_taxonomy", _fake_taxonomy)
+    monkeypatch.setattr(peer_lists, "industry_similarity", lambda *args, **kwargs: 0.6)
+
+    peers = peer_lists._discover_cached_peers(
+        "ADEN.SW",
+        "Industrials",
+        "Staffing & Employment Services",
+        include_related=True,
+    )
+
+    assert peers == []
+
+
 def test_peer_cache_key_changes_when_peer_basket_changes():
     from webapp.data.peer_lists import _peer_cache_key
 
@@ -218,3 +282,40 @@ def test_fetch_peer_metrics_backfills_curated_industry_when_live_metadata_missin
     assert peers[0]["canonical_industry"] == "Luxury Goods"
     assert peers[0]["industry_family"] == "luxury-fashion"
     assert peers[0]["sector"] == "Consumer Cyclical"
+
+
+def test_fetch_peer_metrics_normalizes_eodhd_suffixes_for_yfinance(monkeypatch):
+    import webapp.data.peer_lists as peer_lists
+
+    requested: list[str] = []
+
+    class _FakeTicker:
+        def __init__(self, symbol: str):
+            requested.append(symbol)
+            self.info = {
+                "shortName": symbol,
+                "marketCap": 1_000_000_000,
+                "totalRevenue": 500_000_000,
+                "ebitda": 100_000_000,
+                "ebit": 80_000_000,
+                "netIncomeToCommon": 50_000_000,
+                "freeCashflow": 40_000_000,
+                "totalDebt": 200_000_000,
+                "totalCash": 50_000_000,
+            }
+
+    monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(Ticker=_FakeTicker))
+    monkeypatch.setattr(peer_lists, "_load_cache", lambda _key: None)
+    monkeypatch.setattr(peer_lists, "_save_cache", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(peer_lists, "_load_cached_peer_profiles", lambda: ())
+    monkeypatch.setattr(peer_lists, "_safe_universe_store", lambda: None)
+    monkeypatch.setattr(peer_lists, "_safe_discovery_store", lambda: None)
+
+    peers, peer_median = peer_lists.fetch_peer_metrics(
+        ["G14.XETRA", "70GD.LSE", "JBGS.US"],
+        "ADEN.SW",
+    )
+
+    assert requested == ["G14.DE", "70GD.L", "JBGS"]
+    assert [peer["ticker"] for peer in peers] == ["G14.XETRA", "70GD.LSE", "JBGS.US"]
+    assert peer_median["ev_rev"] == 2.3

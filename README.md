@@ -156,13 +156,29 @@ This repository is now wired for deployment on Vercel Hobby, which is free for a
 	- `EODHD_API_KEY` — optional override; the app has a fallback key in code today
 	- `FMP_API_KEY` — optional, enables the FMP fallback client
 	- `FRED_API_KEY` — optional, enables live macro data
+	- `SUPABASE_DB_URL` — recommended for full server-side learning persistence through Supabase snapshot sync
+	- `LEARNING_CRON_SECRET` — recommended when using the scheduled learning sync endpoint on Vercel
+	- `SHARED_BRAIN_DATABASE_URL` — optional direct DB mode for discovery and symbol-universe only; not needed if you are using `SUPABASE_DB_URL`
 	- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` — only if you use email delivery features
 4. Deploy. Vercel will install `requirements.txt`, run `python build.py`, and publish the Flask app.
+
+### Supabase persistent learning setup
+
+The app now supports a Supabase-backed snapshot store for the full learning runtime that matters in production: ledger records, calibration priors, discovery state, symbol universe, quinquennial reports, background-runner state, and maintenance state.
+
+1. Create a free Supabase project.
+2. Open the project database settings and copy the Postgres connection string.
+3. Set `SUPABASE_DB_URL` in Vercel to that connection string.
+4. Set `LEARNING_CRON_SECRET` in Vercel to any long random secret.
+5. Redeploy. The app will create the remote snapshot table automatically and start syncing the learning runtime into Supabase.
 
 ### Notes
 
 - Static files are served from `public/static/` on Vercel, while templates continue to render normally from Flask.
+- Vercel Hobby only allows one cron run per day, so the bundled learning cron is scheduled once daily. More frequent background sync requires a paid Vercel plan or an external scheduler hitting the cron endpoint.
 - Runtime cache writes may not persist on serverless instances. The web app still works because cache writes already fail gracefully.
+- Without `SUPABASE_DB_URL`, serverless production still falls back to the seeded read-only shared brain for GET paths.
+- `SHARED_BRAIN_DATABASE_URL` is a narrower direct-storage mode for discovery and symbol-universe tables; `SUPABASE_DB_URL` is the path to use when you want broader server-side learning persistence.
 - The free Hobby tier is suitable for demos, internal sharing, and light usage. Heavy always-on production traffic should use a paid host.
 
 ---

@@ -1158,6 +1158,43 @@ def _margin_normalisation(ebit_margins: list[float], base_margin_pct: float, tar
     }
 
 
+def _declining_regime_guardrail(
+    *,
+    company_growth_pct: float,
+    revenue_growth_near: float,
+    ebit_margin_base_pct: float,
+    company_margin_target_pct: float,
+    wacc: float,
+    terminal_growth: float,
+    beta: float,
+    structural_break: dict[str, Any],
+) -> dict[str, Any]:
+    structural_break_score = float(structural_break.get("score") or 0.0)
+    structural_break_detected = bool(structural_break.get("detected"))
+    margin_headroom_pct = max(company_margin_target_pct, ebit_margin_base_pct) - ebit_margin_base_pct
+    shrinking_regime = company_growth_pct <= 0.0
+    applied = shrinking_regime and (structural_break_detected or margin_headroom_pct <= 1.0)
+    if not applied:
+        return {
+            "applied": False,
+            "note": None,
+        }
+
+    severe_decline = company_growth_pct <= -2.0 or structural_break_score >= 0.75
+    max_margin_target_pct = round(max(company_margin_target_pct, ebit_margin_base_pct), 1)
+    max_growth_pct = round(min(max(revenue_growth_near, company_growth_pct), 0.8 if not severe_decline else 0.0), 1)
+    return {
+        "applied": True,
+        "recent_revenue_cagr_pct": round(company_growth_pct, 1),
+        "max_margin_target_pct": max_margin_target_pct,
+        "max_growth_pct": max_growth_pct,
+        "min_wacc_pct": round(wacc, 1),
+        "max_terminal_growth_pct": round(terminal_growth, 1),
+        "min_beta": round(beta, 2),
+        "note": "Declining/structural-break safeguard applied: positive learned memory is capped until revenue momentum improves.",
+    }
+
+
 def _load_learning_cohort(limit: int | None = None) -> list[Any]:
     try:
         reader = LedgerReader()
@@ -1300,6 +1337,7 @@ def _global_cross_symbol_overlay(
     data_vintage_years: int,
     market_cap_regime: str,
     macro_regime: str,
+    subject_structural_break_like: bool = False,
 ) -> dict[str, Any]:
     if not observations:
         return {
@@ -1333,11 +1371,29 @@ def _global_cross_symbol_overlay(
 
     selected: list[Any] = []
     scope: str | None = None
+    matched_regime = False
     for candidate_scope, candidate_cohort, min_size, min_sector_span in (
         ("regime", regime_matches, 5, 2),
         ("market-cap", cap_matches, 6, 2),
         ("global", observations, 10, 3),
     ):
+        preferred_cohort = [
+            observation
+            for observation in candidate_cohort
+            if _structural_break_flag(observation) == subject_structural_break_like
+        ]
+        preferred_sector_span = len(
+            {
+                str(_obs_value(observation, "sector", "") or "")
+                for observation in preferred_cohort
+                if _obs_value(observation, "sector", None)
+            }
+        )
+        if len(preferred_cohort) >= min_size and preferred_sector_span >= min_sector_span:
+            selected = preferred_cohort
+            scope = candidate_scope
+            matched_regime = True
+            break
         sector_span = len(
             {
                 str(_obs_value(observation, "sector", "") or "")
@@ -1482,6 +1538,12 @@ def _global_cross_symbol_overlay(
         f"Global cross-symbol learning active: {scope} cohort of {len(selected)} realised records "
         f"across {sector_span} sectors."
     )
+    if matched_regime:
+        note = note[:-1] + (
+            " matched to structural-break histories."
+            if subject_structural_break_like
+            else " matched to stable histories."
+        )
 
     return {
         "enabled": True,
@@ -1489,6 +1551,7 @@ def _global_cross_symbol_overlay(
         "cohort_size": len(selected),
         "sector_span": sector_span,
         "confidence": round(confidence, 2),
+        "regime_filter": "matched" if matched_regime else "mixed",
         "revenue_growth_adj_pp": revenue_growth_adj_pp,
         "ebit_margin_adj_pp": ebit_margin_adj_pp,
         "wacc_adj_pp": wacc_adj_pp,
@@ -1565,6 +1628,13 @@ def refine_live_assumptions(
     dpo: float,
     observations: list[CalibrationObservation] | None = None,
 ) -> dict[str, Any]:
+    def _merge_guardrail_warn(base_warn: str | None) -> str | None:
+        if not regime_guardrail["applied"]:
+            return base_warn
+        if base_warn:
+            return f"{base_warn}; {regime_guardrail['note']}"
+        return str(regime_guardrail["note"])
+
     knowledge_sector = _knowledge_sector(sector)
     market_cap_regime = _market_cap_regime(market_cap)
     history_window_years = _history_window_years(revenues)
@@ -1639,12 +1709,6 @@ def refine_live_assumptions(
         base_beta=beta,
         calibration_store=_LIVE_CALIBRATION_STORE,
     )
-    fallback_global_learning = _global_cross_symbol_overlay(
-        observations,
-        data_vintage_years=len(revenues),
-        market_cap_regime=market_cap_regime,
-        macro_regime="neutral",
-    )
     max_analog_results = max(6, int(LEARNING_CONFIG.get("max_analogs_returned", 10)))
     graph_neighbor_limit = max(6, int(LEARNING_CONFIG.get("relationship_graph_max_neighbors", max_analog_results)))
 
@@ -1666,7 +1730,6 @@ def refine_live_assumptions(
         else _disabled_analog_set(ticker, symbol_features)
     )
     analog_learning = dict(analog_set.overlay or compute_global_overlay(analog_set))
-    global_learning = analog_learning if analog_learning.get("enabled") else fallback_global_learning
     relationship_graph = build_relationship_graph(
         ticker=ticker,
         subject_features=symbol_features,
@@ -1696,6 +1759,17 @@ def refine_live_assumptions(
     company_capex_pct = round(_trailing_ratio_pct(capexes, revenues, years=history_window_years, absolute=True), 1) or capex_pct
     company_sbc_pct = round(_trailing_ratio_pct(sbcs, revenues, years=history_window_years), 1) or sbc_pct
     company_margin_target_pct = margin_normalisation["target_anchor_pct"] if margin_normalisation["applied"] else ebit_margin_target
+    subject_structural_break_like = company_growth_pct <= 0.0 and (
+        bool(margin_normalisation.get("applied")) or ebit_margin_base_pct >= company_margin_target_pct - 0.5
+    )
+    fallback_global_learning = _global_cross_symbol_overlay(
+        observations,
+        data_vintage_years=len(revenues),
+        market_cap_regime=market_cap_regime,
+        macro_regime="neutral",
+        subject_structural_break_like=subject_structural_break_like,
+    )
+    global_learning = analog_learning if analog_learning.get("enabled") else fallback_global_learning
 
     growth_weights = _normalise_weights(
         _clamp(0.48 + 0.04 * history_window_years - 0.30 * min(revenue_volatility, 0.50), 0.38, 0.72),
@@ -1839,6 +1913,23 @@ def refine_live_assumptions(
     learned_metrics = dict(layered_learning.get("learned_metrics") or {})
     uncertainty = dict(layered_learning.get("uncertainty") or {})
     structural_break = dict(layered_learning.get("structural_break") or {})
+    regime_guardrail = _declining_regime_guardrail(
+        company_growth_pct=company_growth_pct,
+        revenue_growth_near=revenue_growth_near,
+        ebit_margin_base_pct=ebit_margin_base_pct,
+        company_margin_target_pct=company_margin_target_pct,
+        wacc=wacc,
+        terminal_growth=terminal_growth,
+        beta=beta,
+        structural_break=structural_break,
+    )
+    if regime_guardrail["applied"]:
+        refined_growth = min(refined_growth, float(regime_guardrail["max_growth_pct"]))
+        refined_margin_target = min(refined_margin_target, float(regime_guardrail["max_margin_target_pct"]))
+        refined_wacc = max(refined_wacc, float(regime_guardrail["min_wacc_pct"]))
+        refined_terminal_growth = min(refined_terminal_growth, float(regime_guardrail["max_terminal_growth_pct"]))
+        smoothed_beta = max(smoothed_beta, float(regime_guardrail["min_beta"]))
+    layered_learning["regime_guardrail"] = regime_guardrail
     learned_reinvestment_confidence = float(learned_metrics.get("reinvestment_confidence") or 0.0)
     if learned_reinvestment_confidence > 0:
         implied_capex_pct = float(learned_metrics.get("reinvestment_rate_pct") or 0.0) + refined_da_pct
@@ -1943,6 +2034,8 @@ def refine_live_assumptions(
         )
     elif uncertainty.get("weak_evidence"):
         uncertainty_text = " Realised evidence is still thin, so confidence stays conservative and scenario ranges remain wider than normal."
+    if regime_guardrail["applied"]:
+        uncertainty_text += f" {regime_guardrail['note']}"
     analog_text = ""
     if analog_set.analogs:
         analog_text = f" Nearest analogs: {', '.join(match.analog.ticker for match in analog_set.analogs[:3])}."
@@ -1962,7 +2055,7 @@ def refine_live_assumptions(
             "global_overlay_pp": global_growth_pp,
             "relationship_overlay_pp": relationship_growth_pp,
             "source": growth_source + global_growth_source + relationship_growth_source,
-            "warn": growth_warn,
+            "warn": _merge_guardrail_warn(growth_warn),
         },
         "terminal_growth": {
             **{key: round(value, 2) for key, value in risk_weights.items()},
@@ -1973,7 +2066,7 @@ def refine_live_assumptions(
             "global_overlay_pp": global_terminal_growth_pp,
             "relationship_overlay_pp": relationship_terminal_growth_pp,
             "source": risk_source + global_risk_source + relationship_risk_source,
-            "warn": risk_warn,
+            "warn": _merge_guardrail_warn(risk_warn),
         },
         "ebit_margin_target": {
             **{key: round(value, 2) for key, value in margin_weights.items()},
@@ -1983,8 +2076,8 @@ def refine_live_assumptions(
             "pattern_overlay_pp": margin_pattern_pp,
             "global_overlay_pp": global_margin_pp,
             "relationship_overlay_pp": relationship_margin_pp,
-            "source": margin_source + global_margin_source + relationship_margin_source + margin_normalisation["source_suffix"],
-            "warn": margin_normalisation["note"] or margin_warn,
+            "source": margin_source + global_margin_source + relationship_margin_source + margin_normalisation["source_suffix"] + ("; declining/structural-break safeguard applied" if regime_guardrail["applied"] else ""),
+            "warn": _merge_guardrail_warn(margin_normalisation["note"] or margin_warn),
         },
         "beta": {
             **{key: round(value, 2) for key, value in risk_weights.items()},
@@ -1995,7 +2088,7 @@ def refine_live_assumptions(
             "global_overlay": global_beta_adj,
             "relationship_overlay": relationship_beta_adj,
             "source": risk_source + global_risk_source + relationship_risk_source,
-            "warn": risk_warn,
+            "warn": _merge_guardrail_warn(risk_warn),
         },
         "wacc": {
             **{key: round(value, 2) for key, value in risk_weights.items()},
@@ -2006,7 +2099,7 @@ def refine_live_assumptions(
             "global_overlay_pp": global_wacc_pp,
             "relationship_overlay_pp": relationship_wacc_pp,
             "source": risk_source + global_risk_source + relationship_risk_source,
-            "warn": risk_warn,
+            "warn": _merge_guardrail_warn(risk_warn),
         },
         "tax_rate_pct": {
             "company_history": 0.75,
@@ -2115,6 +2208,8 @@ def refine_live_assumptions(
     )
     confidence_model = build_ranked_confidence_model(
         {
+            "sector": sector,
+            "industry": industry,
             "calibration_confidence": round(calibrated.calibration_confidence, 2),
             "learning_confidence": round(float(uncertainty.get("effective_confidence") or calibrated.calibration_confidence or 0.0), 2),
             "calibration_cohort_size": calibrated.calibration_cohort_size,
@@ -2169,6 +2264,8 @@ def refine_live_assumptions(
         "relationship_graph": relationship_graph,
         "layered_learning": layered_learning,
         "margin_normalisation": margin_normalisation,
+        "regime_guardrail": regime_guardrail,
+        "regime_guardrail": regime_guardrail,
         "scenario_width_multiplier": float(uncertainty.get("scenario_width_multiplier") or margin_normalisation["scenario_width_multiplier"]),
         "confidence_model": confidence_model,
         "calibration_diagnostics": calibrated.calibration_diagnostics.to_dict() if getattr(calibrated, "calibration_diagnostics", None) else {},

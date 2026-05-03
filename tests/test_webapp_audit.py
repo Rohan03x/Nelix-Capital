@@ -851,6 +851,31 @@ def test_api_ticker_search_returns_results(monkeypatch):
     assert calls[0][0] == "samsung"
 
 
+def test_api_ticker_search_persists_external_learning_state(monkeypatch):
+    import webapp.app as webapp_module
+
+    webapp_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
+    persisted: list[bool] = []
+
+    class _DiscoveryStore:
+        def record_search_impression(self, query, results, *, exchange="auto", selected_ticker=None):
+            return None
+
+    monkeypatch.setattr(
+        webapp_module,
+        "search_tickers",
+        lambda query, limit=12, exchange="auto": [{"ticker": "NKE", "name": "Nike Inc", "exchange": "US"}],
+    )
+    monkeypatch.setattr(webapp_module, "_safe_discovery_store", lambda: _DiscoveryStore())
+    monkeypatch.setattr(webapp_module, "_persist_external_learning_state", lambda force=False: persisted.append(force) or {"ok": True})
+
+    with webapp_module.app.test_client() as client:
+        response = client.get("/api/ticker-search?q=nike")
+
+    assert response.status_code == 200
+    assert persisted == [False]
+
+
 def test_watchlist_and_manual_compare_routes_persist_discovery_state(tmp_path, monkeypatch):
     import webapp.app as webapp_module
     from auto_valuation.learning.discovery import DiscoveryStore
@@ -901,6 +926,48 @@ def test_watchlist_and_manual_compare_routes_persist_discovery_state(tmp_path, m
     relationship = discovery.get_peer_relationship("005930.KO", "AAPL")
     assert relationship is not None
     assert relationship["manual_compare_hits"] == 1
+
+
+def test_manual_compare_route_is_idempotent_for_device_event_id(tmp_path, monkeypatch):
+    import webapp.app as webapp_module
+    from auto_valuation.learning.discovery import DiscoveryStore
+    from auto_valuation.learning.universe import SymbolUniverseStore
+
+    webapp_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
+    universe = SymbolUniverseStore(tmp_path / "symbol-universe.db")
+    discovery = DiscoveryStore(tmp_path / "discovery.db", universe_store=universe)
+    monkeypatch.setattr(webapp_module, "_safe_discovery_store", lambda: discovery)
+
+    payload = {
+        "event_id": "device:005930.KO:AAPL",
+        "subject": {
+            "ticker": "005930.KO",
+            "company_name": "Samsung Electronics Co Ltd",
+            "exchange": "KO",
+            "sector": "Technology",
+            "industry": "Consumer Electronics",
+        },
+        "peer": {
+            "ticker": "AAPL",
+            "company_name": "Apple Inc",
+            "exchange": "US",
+            "sector": "Technology",
+            "industry": "Consumer Electronics",
+        },
+    }
+
+    with webapp_module.app.test_client() as client:
+        first = client.post("/api/manual-compare", json=payload)
+        second = client.post("/api/manual-compare", json=payload)
+
+    relationship = discovery.get_peer_relationship("005930.KO", "AAPL")
+    recent = discovery.list_manual_compares(subject_ticker="005930.KO", limit=5)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert relationship is not None
+    assert relationship["manual_compare_hits"] == 1
+    assert recent[0]["event_id"] == "device:005930.KO:AAPL"
 
 
 def test_index_and_dashboard_render_discovery_controls(monkeypatch):

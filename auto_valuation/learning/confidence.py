@@ -8,6 +8,16 @@ from dataclasses import dataclass, field
 from statistics import mean, pstdev
 from typing import Any, Callable
 
+try:
+    from auto_valuation.model.sector import FINANCIAL, MINING, REIT, detect_sector_type
+except ImportError:
+    FINANCIAL = "financial"
+    MINING = "mining"
+    REIT = "reit"
+
+    def detect_sector_type(sector: str, industry: str = "") -> str:
+        return "standard"
+
 
 try:
     from auto_valuation.config import LEARNING_CONFIG as _LEARNING_CONFIG
@@ -127,6 +137,23 @@ def _grade_from_score(score_100: int) -> tuple[str, str, str]:
     if score_100 >= 35:
         return "D", "Fragile Confidence", "red"
     return "F", "Low Confidence", "red"
+
+
+def _dashboard_suitability(payload: dict[str, Any]) -> tuple[bool, str]:
+    sector = str(payload.get("sector") or "").strip()
+    industry = str(payload.get("industry") or "").strip()
+
+    if not sector or not industry:
+        return False, "Sector and industry metadata are incomplete, so this DCF should be treated as provisional."
+
+    sector_type = detect_sector_type(sector, industry)
+    if sector_type == FINANCIAL:
+        return False, "Financial companies are not a clean fit for UFCF DCF; use dividend or excess-return methods instead."
+    if sector_type == REIT:
+        return False, "Real estate and REIT-style businesses are better assessed with FFO/AFFO or NAV-based methods than a standard UFCF DCF."
+    if sector_type == MINING:
+        return False, "Mining and resource businesses are better assessed with NAV and reserve-life methods than a standard UFCF DCF."
+    return True, ""
 
 
 def _analog_dispersion(scores: list[float], analog_count: int) -> float:
@@ -442,6 +469,14 @@ def build_ranked_confidence_model(payload: dict[str, Any]) -> dict[str, Any]:
         f"about {expected_valuation_error_band['p50']:.1f}% at p50 and {expected_valuation_error_band['p90']:.1f}% at p90; "
         f"the biggest drag is {dominant_risk.lower()}."
     )
+    dcf_suitable, suitability_note = _dashboard_suitability(payload)
+    warnings = [
+        component["detail"]
+        for component in components
+        if component["score"] <= 45
+    ]
+    if suitability_note:
+        warnings.insert(0, suitability_note)
 
     return {
         "summary": summary,
@@ -465,13 +500,9 @@ def build_ranked_confidence_model(payload: dict[str, Any]) -> dict[str, Any]:
             "grade": _grade_from_score(valuation_score_100)[0],
             "label": _grade_from_score(valuation_score_100)[1],
             "color": _grade_from_score(valuation_score_100)[2],
-            "dcf_suitable": True,
-            "suitability_note": "",
-            "warnings": [
-                component["detail"]
-                for component in components
-                if component["score"] <= 45
-            ][:3],
+            "dcf_suitable": dcf_suitable,
+            "suitability_note": suitability_note,
+            "warnings": warnings[:3],
             "dimensions": [
                 {
                     "name": component["label"],

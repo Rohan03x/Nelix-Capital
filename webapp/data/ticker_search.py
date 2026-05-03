@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
@@ -9,7 +10,24 @@ from urllib.parse import quote
 
 from webapp.data.samples import SUPPORTED_TICKERS
 
-_CACHE_DIR = Path(__file__).with_name("cache")
+
+def _resolve_cache_dir() -> Path:
+    candidates = [
+        Path(__file__).with_name("cache"),
+        Path(tempfile.gettempdir()) / "nelix-capital-cache",
+    ]
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except OSError:
+            continue
+    fallback = Path(tempfile.gettempdir()) / "nelix-capital-cache"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+_CACHE_DIR = _resolve_cache_dir()
 _SPACE_RE = re.compile(r"[^A-Z0-9]+")
 _SEARCH_TTL_SEC = 43_200
 

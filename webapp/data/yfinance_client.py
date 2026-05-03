@@ -216,6 +216,39 @@ def is_available() -> bool:
     return _YF_AVAILABLE
 
 
+def _safe_last_price(ticker_obj: Any, info: dict[str, Any]) -> float:
+    fast_info = getattr(ticker_obj, "fast_info", None)
+    if fast_info is not None:
+        try:
+            price = float(getattr(fast_info, "last_price", 0) or 0)
+            if price > 0:
+                return price
+        except Exception:
+            pass
+
+    for key in ("currentPrice", "regularMarketPrice", "previousClose"):
+        try:
+            price = float((info or {}).get(key) or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if price > 0:
+            return price
+    return 0.0
+
+
+def _safe_fast_info_value(fast_info: Any, attribute: str, fallback: float = 0.0) -> float:
+    if fast_info is None:
+        return float(fallback)
+    try:
+        value = getattr(fast_info, attribute, None)
+        if value in (None, 0, 0.0):
+            return float(fallback)
+        numeric = float(value)
+        return numeric if numeric > 0 else float(fallback)
+    except Exception:
+        return float(fallback)
+
+
 # ─── Main builder ─────────────────────────────────────────────────────────────
 
 def build_dashboard_data(ticker: str) -> dict | None:  # noqa: C901
@@ -229,10 +262,10 @@ def build_dashboard_data(ticker: str) -> dict | None:  # noqa: C901
     try:
         t    = yf.Ticker(ticker)
         info = t.info or {}
-        fi   = t.fast_info
+        fast_info = getattr(t, "fast_info", None)
 
         # Must have a valid price
-        price = float(fi.last_price or info.get("currentPrice") or 0)
+        price = _safe_last_price(t, info)
         if price <= 0:
             logger.warning("yfinance: no price for %s", ticker)
             return None
@@ -344,7 +377,7 @@ def build_dashboard_data(ticker: str) -> dict | None:  # noqa: C901
         elif _stmt_shares > 10:
             diluted_shares = _stmt_shares
         else:
-            diluted_shares = float(fi.shares or 0) / 1e6 or 100.0
+            diluted_shares = _safe_fast_info_value(fast_info, "shares") / 1e6 or 100.0
 
         total_assets    = _v(l_bs, "Total Assets")      / 1e6
         total_debt      = _v(l_bs, "Total Debt")        / 1e6
@@ -371,7 +404,11 @@ def build_dashboard_data(ticker: str) -> dict | None:  # noqa: C901
         buyback_raw     = abs(_v(l_cf, "Repurchase Of Capital Stock")) / 1e6
 
         net_debt  = total_debt - cash
-        market_cap = float(fi.market_cap or info.get("marketCap", price * diluted_shares * 1e6)) / 1e6
+        market_cap = _safe_fast_info_value(
+            fast_info,
+            "market_cap",
+            float(info.get("marketCap") or price * diluted_shares * 1e6),
+        ) / 1e6
 
         # ── WACC ───────────────────────────────────────────────────────────
         beta     = float(info.get("beta") or 1.0)
@@ -498,8 +535,8 @@ def build_dashboard_data(ticker: str) -> dict | None:  # noqa: C901
 
         # ── 52-week range ─────────────────────────────────────────────────
         try:
-            year_high = float(fi.year_high or info.get("fiftyTwoWeekHigh", price * 1.2))
-            year_low  = float(fi.year_low  or info.get("fiftyTwoWeekLow",  price * 0.8))
+            year_high = _safe_fast_info_value(fast_info, "year_high", float(info.get("fiftyTwoWeekHigh") or price * 1.2))
+            year_low  = _safe_fast_info_value(fast_info, "year_low",  float(info.get("fiftyTwoWeekLow")  or price * 0.8))
         except Exception:
             year_high = price * 1.2
             year_low  = price * 0.8

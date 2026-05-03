@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from sqlalchemy import text
+
 from .calibration_priority import build_calibration_priority_index, calibration_priority_for_symbol
 from .industry_taxonomy import resolve_industry_taxonomy
+from .shared_db import resolve_shared_brain_backend
+from .storage_paths import learning_db_dir
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
-SYMBOL_UNIVERSE_DB_PATH = PACKAGE_ROOT / "db" / "symbol_universe.db"
+SYMBOL_UNIVERSE_DB_PATH = learning_db_dir() / "symbol_universe.db"
 
 
 def _utcnow() -> datetime:
@@ -58,50 +61,64 @@ def _decode_json(value: Any, default: Any) -> Any:
 
 class SymbolUniverseStore:
     def __init__(self, db_path: Path | str | None = None) -> None:
-        self.db_path = Path(db_path) if db_path else SYMBOL_UNIVERSE_DB_PATH
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._engine, self.storage_backend, self.db_path, self.database_url = resolve_shared_brain_backend(
+            db_path,
+            SYMBOL_UNIVERSE_DB_PATH,
+        )
         self._ensure_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _connect(self):
+        return self._engine.connect()
+
+    def _fetch_one(self, sql: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(text(sql), params or {}).mappings().first()
+        return dict(row) if row is not None else None
+
+    def _fetch_all(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(text(sql), params or {}).mappings().all()
+        return [dict(row) for row in rows]
+
+    def _execute(self, sql: str, params: dict[str, Any] | None = None) -> int:
+        with self._engine.begin() as conn:
+            result = conn.execute(text(sql), params or {})
+        return int(result.rowcount or 0)
 
     def _ensure_schema(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS symbol_universe (
-                    ticker TEXT PRIMARY KEY,
-                    company_name TEXT NOT NULL DEFAULT '',
-                    exchange TEXT NOT NULL DEFAULT '',
-                    country TEXT NOT NULL DEFAULT '',
-                    sector TEXT NOT NULL DEFAULT '',
-                    industry TEXT NOT NULL DEFAULT '',
-                    first_seen_at TEXT NOT NULL,
-                    last_seen_at TEXT NOT NULL,
-                    last_searched_at TEXT,
-                    last_valued_at TEXT,
-                    last_bootstrapped_at TEXT,
-                    last_bootstrap_status TEXT NOT NULL DEFAULT '',
-                    fundamentals_cached INTEGER NOT NULL DEFAULT 0,
-                    times_seen INTEGER NOT NULL DEFAULT 0,
-                    search_hits INTEGER NOT NULL DEFAULT 0,
-                    valuation_hits INTEGER NOT NULL DEFAULT 0,
-                    bootstrap_runs INTEGER NOT NULL DEFAULT 0,
-                    sources_json TEXT NOT NULL DEFAULT '[]',
-                    metadata_json TEXT NOT NULL DEFAULT '{}'
-                )
-                """
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS symbol_universe (
+                ticker TEXT PRIMARY KEY,
+                company_name TEXT NOT NULL DEFAULT '',
+                exchange TEXT NOT NULL DEFAULT '',
+                country TEXT NOT NULL DEFAULT '',
+                sector TEXT NOT NULL DEFAULT '',
+                industry TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                last_searched_at TEXT,
+                last_valued_at TEXT,
+                last_bootstrapped_at TEXT,
+                last_bootstrap_status TEXT NOT NULL DEFAULT '',
+                fundamentals_cached INTEGER NOT NULL DEFAULT 0,
+                times_seen INTEGER NOT NULL DEFAULT 0,
+                search_hits INTEGER NOT NULL DEFAULT 0,
+                valuation_hits INTEGER NOT NULL DEFAULT 0,
+                bootstrap_runs INTEGER NOT NULL DEFAULT 0,
+                sources_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}'
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_symbol_universe_last_valued ON symbol_universe(last_valued_at DESC)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_symbol_universe_last_bootstrapped ON symbol_universe(last_bootstrapped_at DESC)"
-            )
+            """
+        )
+        self._execute(
+            "CREATE INDEX IF NOT EXISTS idx_symbol_universe_last_valued ON symbol_universe(last_valued_at DESC)"
+        )
+        self._execute(
+            "CREATE INDEX IF NOT EXISTS idx_symbol_universe_last_bootstrapped ON symbol_universe(last_bootstrapped_at DESC)"
+        )
 
-    def _row_to_symbol(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+    def _row_to_symbol(self, row: dict[str, Any] | None) -> dict[str, Any] | None:
         if row is None:
             return None
         payload = dict(row)
@@ -114,11 +131,10 @@ class SymbolUniverseStore:
         ticker_text = str(ticker or "").strip().upper()
         if not ticker_text:
             return None
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM symbol_universe WHERE ticker = ?",
-                (ticker_text,),
-            ).fetchone()
+        row = self._fetch_one(
+            "SELECT * FROM symbol_universe WHERE ticker = :ticker",
+            {"ticker": ticker_text},
+        )
         return self._row_to_symbol(row)
 
     def list_symbols(self, limit: int | None = None) -> list[dict[str, Any]]:
@@ -126,12 +142,11 @@ class SymbolUniverseStore:
             "SELECT * FROM symbol_universe "
             "ORDER BY COALESCE(last_valued_at, last_seen_at) DESC, times_seen DESC, ticker ASC"
         )
-        params: tuple[Any, ...] = ()
+        params: dict[str, Any] = {}
         if limit is not None and int(limit) > 0:
-            query += " LIMIT ?"
-            params = (int(limit),)
-        with self._connect() as conn:
-            rows = conn.execute(query, params).fetchall()
+            query += " LIMIT :limit"
+            params["limit"] = int(limit)
+        rows = self._fetch_all(query, params)
         return [symbol for row in rows if (symbol := self._row_to_symbol(row)) is not None]
 
     def upsert_symbol(
@@ -233,25 +248,43 @@ class SymbolUniverseStore:
             "metadata_json": json.dumps(merged_metadata, ensure_ascii=False, default=str),
         }
 
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO symbol_universe (
-                    ticker, company_name, exchange, country, sector, industry,
-                    first_seen_at, last_seen_at, last_searched_at, last_valued_at,
-                    last_bootstrapped_at, last_bootstrap_status, fundamentals_cached,
-                    times_seen, search_hits, valuation_hits, bootstrap_runs,
-                    sources_json, metadata_json
-                ) VALUES (
-                    :ticker, :company_name, :exchange, :country, :sector, :industry,
-                    :first_seen_at, :last_seen_at, :last_searched_at, :last_valued_at,
-                    :last_bootstrapped_at, :last_bootstrap_status, :fundamentals_cached,
-                    :times_seen, :search_hits, :valuation_hits, :bootstrap_runs,
-                    :sources_json, :metadata_json
-                )
-                """,
-                payload,
+        self._execute(
+            """
+            INSERT INTO symbol_universe (
+                ticker, company_name, exchange, country, sector, industry,
+                first_seen_at, last_seen_at, last_searched_at, last_valued_at,
+                last_bootstrapped_at, last_bootstrap_status, fundamentals_cached,
+                times_seen, search_hits, valuation_hits, bootstrap_runs,
+                sources_json, metadata_json
+            ) VALUES (
+                :ticker, :company_name, :exchange, :country, :sector, :industry,
+                :first_seen_at, :last_seen_at, :last_searched_at, :last_valued_at,
+                :last_bootstrapped_at, :last_bootstrap_status, :fundamentals_cached,
+                :times_seen, :search_hits, :valuation_hits, :bootstrap_runs,
+                :sources_json, :metadata_json
             )
+            ON CONFLICT (ticker) DO UPDATE SET
+                company_name = EXCLUDED.company_name,
+                exchange = EXCLUDED.exchange,
+                country = EXCLUDED.country,
+                sector = EXCLUDED.sector,
+                industry = EXCLUDED.industry,
+                first_seen_at = EXCLUDED.first_seen_at,
+                last_seen_at = EXCLUDED.last_seen_at,
+                last_searched_at = EXCLUDED.last_searched_at,
+                last_valued_at = EXCLUDED.last_valued_at,
+                last_bootstrapped_at = EXCLUDED.last_bootstrapped_at,
+                last_bootstrap_status = EXCLUDED.last_bootstrap_status,
+                fundamentals_cached = EXCLUDED.fundamentals_cached,
+                times_seen = EXCLUDED.times_seen,
+                search_hits = EXCLUDED.search_hits,
+                valuation_hits = EXCLUDED.valuation_hits,
+                bootstrap_runs = EXCLUDED.bootstrap_runs,
+                sources_json = EXCLUDED.sources_json,
+                metadata_json = EXCLUDED.metadata_json
+            """,
+            payload,
+        )
         return self.get_symbol(ticker_text)
 
     def record_candidates(

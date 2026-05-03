@@ -4,19 +4,22 @@ from __future__ import annotations
 
 import json
 import math
-import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from sqlalchemy import text
+
 from auto_valuation.config import LEARNING_CONFIG
 
+from .shared_db import resolve_shared_brain_backend
+from .storage_paths import learning_db_dir
 from .universe import SymbolUniverseStore
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
-DISCOVERY_DB_PATH = PACKAGE_ROOT / "db" / "discovery.db"
+DISCOVERY_DB_PATH = learning_db_dir() / "discovery.db"
 
 
 def _utcnow_iso() -> str:
@@ -69,81 +72,94 @@ class DiscoveryStore:
         db_path: Path | str | None = None,
         universe_store: SymbolUniverseStore | None = None,
     ) -> None:
-        self.db_path = Path(db_path) if db_path else DISCOVERY_DB_PATH
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._engine, self.storage_backend, self.db_path, self.database_url = resolve_shared_brain_backend(
+            db_path,
+            DISCOVERY_DB_PATH,
+        )
         self.universe_store = universe_store or SymbolUniverseStore()
         self._ensure_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _connect(self):
+        return self._engine.connect()
+
+    def _fetch_one(self, sql: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(text(sql), params or {}).mappings().first()
+        return dict(row) if row is not None else None
+
+    def _fetch_all(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(text(sql), params or {}).mappings().all()
+        return [dict(row) for row in rows]
+
+    def _execute(self, sql: str, params: dict[str, Any] | None = None) -> int:
+        with self._engine.begin() as conn:
+            result = conn.execute(text(sql), params or {})
+        return int(result.rowcount or 0)
 
     def _ensure_schema(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS watchlist_items (
-                    ticker TEXT PRIMARY KEY,
-                    company_name TEXT NOT NULL DEFAULT '',
-                    exchange TEXT NOT NULL DEFAULT '',
-                    country TEXT NOT NULL DEFAULT '',
-                    sector TEXT NOT NULL DEFAULT '',
-                    industry TEXT NOT NULL DEFAULT '',
-                    added_at TEXT NOT NULL,
-                    last_touched_at TEXT NOT NULL,
-                    payload_json TEXT NOT NULL DEFAULT '{}'
-                )
-                """
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS watchlist_items (
+                ticker TEXT PRIMARY KEY,
+                company_name TEXT NOT NULL DEFAULT '',
+                exchange TEXT NOT NULL DEFAULT '',
+                country TEXT NOT NULL DEFAULT '',
+                sector TEXT NOT NULL DEFAULT '',
+                industry TEXT NOT NULL DEFAULT '',
+                added_at TEXT NOT NULL,
+                last_touched_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}'
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS search_impressions (
-                    impression_id TEXT PRIMARY KEY,
-                    query_text TEXT NOT NULL,
-                    exchange TEXT NOT NULL DEFAULT '',
-                    selected_ticker TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL,
-                    payload_json TEXT NOT NULL DEFAULT '{}'
-                )
-                """
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS search_impressions (
+                impression_id TEXT PRIMARY KEY,
+                query_text TEXT NOT NULL,
+                exchange TEXT NOT NULL DEFAULT '',
+                selected_ticker TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}'
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS manual_compare_events (
-                    compare_id TEXT PRIMARY KEY,
-                    subject_ticker TEXT NOT NULL,
-                    peer_ticker TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    payload_json TEXT NOT NULL DEFAULT '{}'
-                )
-                """
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS manual_compare_events (
+                compare_id TEXT PRIMARY KEY,
+                subject_ticker TEXT NOT NULL,
+                peer_ticker TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}'
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS peer_relationships (
-                    subject_ticker TEXT NOT NULL,
-                    peer_ticker TEXT NOT NULL,
-                    first_seen_at TEXT NOT NULL,
-                    last_seen_at TEXT NOT NULL,
-                    auto_peer_hits INTEGER NOT NULL DEFAULT 0,
-                    manual_compare_hits INTEGER NOT NULL DEFAULT 0,
-                    signal_points REAL NOT NULL DEFAULT 0,
-                    payload_json TEXT NOT NULL DEFAULT '{}',
-                    PRIMARY KEY(subject_ticker, peer_ticker)
-                )
-                """
+            """
+        )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS peer_relationships (
+                subject_ticker TEXT NOT NULL,
+                peer_ticker TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                auto_peer_hits INTEGER NOT NULL DEFAULT 0,
+                manual_compare_hits INTEGER NOT NULL DEFAULT 0,
+                signal_points REAL NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY(subject_ticker, peer_ticker)
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_peer_relationships_subject ON peer_relationships(subject_ticker, last_seen_at DESC)"
-            )
+            """
+        )
+        self._execute(
+            "CREATE INDEX IF NOT EXISTS idx_peer_relationships_subject ON peer_relationships(subject_ticker, last_seen_at DESC)"
+        )
 
     def list_watchlist(self, limit: int = 20) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM watchlist_items ORDER BY last_touched_at DESC, ticker ASC LIMIT ?",
-                (max(int(limit or 20), 1),),
-            ).fetchall()
+        rows = self._fetch_all(
+            "SELECT * FROM watchlist_items ORDER BY last_touched_at DESC, ticker ASC LIMIT :limit",
+            {"limit": max(int(limit or 20), 1)},
+        )
         items: list[dict[str, Any]] = []
         for row in rows:
             payload = dict(row)
@@ -156,6 +172,8 @@ class DiscoveryStore:
         if not symbol["ticker"]:
             return None
         now_text = _utcnow_iso()
+        sync_mode = str((item or {}).get("_device_sync_mode") or "").strip().lower()
+        is_device_replay = sync_mode == "client-replay"
         current = next((entry for entry in self.list_watchlist(limit=200) if entry.get("ticker") == symbol["ticker"]), None)
         added_at = str((current or {}).get("added_at") or now_text)
         payload = {
@@ -164,19 +182,27 @@ class DiscoveryStore:
             "last_touched_at": now_text,
             "payload_json": json.dumps(symbol, ensure_ascii=False),
         }
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO watchlist_items (
-                    ticker, company_name, exchange, country, sector, industry,
-                    added_at, last_touched_at, payload_json
-                ) VALUES (
-                    :ticker, :company_name, :exchange, :country, :sector, :industry,
-                    :added_at, :last_touched_at, :payload_json
-                )
-                """,
-                payload,
+        self._execute(
+            """
+            INSERT INTO watchlist_items (
+                ticker, company_name, exchange, country, sector, industry,
+                added_at, last_touched_at, payload_json
+            ) VALUES (
+                :ticker, :company_name, :exchange, :country, :sector, :industry,
+                :added_at, :last_touched_at, :payload_json
             )
+            ON CONFLICT (ticker) DO UPDATE SET
+                company_name = EXCLUDED.company_name,
+                exchange = EXCLUDED.exchange,
+                country = EXCLUDED.country,
+                sector = EXCLUDED.sector,
+                industry = EXCLUDED.industry,
+                added_at = EXCLUDED.added_at,
+                last_touched_at = EXCLUDED.last_touched_at,
+                payload_json = EXCLUDED.payload_json
+            """,
+            payload,
+        )
 
         self.universe_store.upsert_symbol(
             symbol["ticker"],
@@ -187,7 +213,7 @@ class DiscoveryStore:
             industry=symbol["industry"],
             source="watchlist",
             metadata={"watchlist_active": True, "watchlist_added_at": added_at},
-            metadata_increments={"watchlist_hits": 1},
+            metadata_increments={} if (current and is_device_replay) else {"watchlist_hits": 1},
         )
         return next((entry for entry in self.list_watchlist(limit=200) if entry.get("ticker") == symbol["ticker"]), None)
 
@@ -195,8 +221,10 @@ class DiscoveryStore:
         ticker_text = str(ticker or "").strip().upper()
         if not ticker_text:
             return False
-        with self._connect() as conn:
-            rowcount = conn.execute("DELETE FROM watchlist_items WHERE ticker = ?", (ticker_text,)).rowcount
+        rowcount = self._execute(
+            "DELETE FROM watchlist_items WHERE ticker = :ticker",
+            {"ticker": ticker_text},
+        )
         self.universe_store.upsert_symbol(
             ticker_text,
             source="watchlist-remove",
@@ -204,7 +232,7 @@ class DiscoveryStore:
         )
         return bool(rowcount)
 
-    def _row_to_peer_relationship(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+    def _row_to_peer_relationship(self, row: dict[str, Any] | None) -> dict[str, Any] | None:
         if row is None:
             return None
         payload = dict(row)
@@ -247,22 +275,21 @@ class DiscoveryStore:
         peer_text = str(peer_ticker or "").strip().upper()
         if not subject_text or not peer_text:
             return None
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM peer_relationships WHERE subject_ticker = ? AND peer_ticker = ?",
-                (subject_text, peer_text),
-            ).fetchone()
+        row = self._fetch_one(
+            "SELECT * FROM peer_relationships WHERE subject_ticker = :subject_ticker AND peer_ticker = :peer_ticker",
+            {"subject_ticker": subject_text, "peer_ticker": peer_text},
+        )
         return self._row_to_peer_relationship(row)
 
     def list_peer_relationships(self, *, subject_ticker: str | None = None, limit: int = 8) -> list[dict[str, Any]]:
         sql = "SELECT * FROM peer_relationships"
-        params: tuple[Any, ...] = ()
+        params: dict[str, Any] = {}
         if subject_ticker:
-            sql += " WHERE subject_ticker = ?"
-            params = (str(subject_ticker or "").strip().upper(),)
-        sql += " ORDER BY last_seen_at DESC, subject_ticker ASC, peer_ticker ASC"
-        with self._connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
+            sql += " WHERE subject_ticker = :subject_ticker"
+            params["subject_ticker"] = str(subject_ticker or "").strip().upper()
+        sql += " ORDER BY last_seen_at DESC, subject_ticker ASC, peer_ticker ASC LIMIT :limit"
+        params["limit"] = max(int(limit or 8), 1)
+        rows = self._fetch_all(sql, params)
 
         items = [relationship for row in rows if (relationship := self._row_to_peer_relationship(row)) is not None]
         items.sort(
@@ -304,19 +331,25 @@ class DiscoveryStore:
                 ensure_ascii=False,
             ),
         }
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO peer_relationships(
-                    subject_ticker, peer_ticker, first_seen_at, last_seen_at,
-                    auto_peer_hits, manual_compare_hits, signal_points, payload_json
-                ) VALUES (
-                    :subject_ticker, :peer_ticker, :first_seen_at, :last_seen_at,
-                    :auto_peer_hits, :manual_compare_hits, :signal_points, :payload_json
-                )
-                """,
-                payload,
+        self._execute(
+            """
+            INSERT INTO peer_relationships(
+                subject_ticker, peer_ticker, first_seen_at, last_seen_at,
+                auto_peer_hits, manual_compare_hits, signal_points, payload_json
+            ) VALUES (
+                :subject_ticker, :peer_ticker, :first_seen_at, :last_seen_at,
+                :auto_peer_hits, :manual_compare_hits, :signal_points, :payload_json
             )
+            ON CONFLICT (subject_ticker, peer_ticker) DO UPDATE SET
+                first_seen_at = EXCLUDED.first_seen_at,
+                last_seen_at = EXCLUDED.last_seen_at,
+                auto_peer_hits = EXCLUDED.auto_peer_hits,
+                manual_compare_hits = EXCLUDED.manual_compare_hits,
+                signal_points = EXCLUDED.signal_points,
+                payload_json = EXCLUDED.payload_json
+            """,
+            payload,
+        )
         return self.get_peer_relationship(subject_item["ticker"], peer_item["ticker"])
 
     def record_auto_peer_basket(
@@ -380,14 +413,13 @@ class DiscoveryStore:
             "impression_id": str(uuid.uuid4()),
         }
         if query_text or selected_text or cleaned_results:
-            with self._connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO search_impressions(impression_id, query_text, exchange, selected_ticker, created_at, payload_json)
-                    VALUES (:impression_id, :query_text, :exchange, :selected_ticker, :created_at, :payload_json)
-                    """,
-                    payload,
-                )
+            self._execute(
+                """
+                INSERT INTO search_impressions(impression_id, query_text, exchange, selected_ticker, created_at, payload_json)
+                VALUES (:impression_id, :query_text, :exchange, :selected_ticker, :created_at, :payload_json)
+                """,
+                payload,
+            )
 
         if cleaned_results:
             self.universe_store.record_candidates(
@@ -431,6 +463,8 @@ class DiscoveryStore:
         self,
         subject: dict[str, Any],
         peers: Iterable[dict[str, Any]],
+        *,
+        event_id: str | None = None,
     ) -> dict[str, Any]:
         subject_item = _clean_symbol_payload(subject)
         raw_peer_items = [dict(item or {}) for item in peers]
@@ -443,6 +477,19 @@ class DiscoveryStore:
         peer_items = [peer_item for _, peer_item in paired_peer_items]
         if not subject_item["ticker"] or not peer_items:
             return {"subject_ticker": subject_item["ticker"], "peer_count": 0, "items": []}
+
+        event_id_text = str(event_id or "").strip()
+        if event_id_text:
+            existing_event = self._fetch_one(
+                "SELECT compare_id FROM manual_compare_events WHERE compare_id = :compare_id",
+                {"compare_id": event_id_text},
+            )
+            if existing_event is not None:
+                return {
+                    "subject_ticker": subject_item["ticker"],
+                    "peer_count": len(peer_items),
+                    "items": self.list_manual_compares(subject_ticker=subject_item["ticker"], limit=8),
+                }
 
         now_text = _utcnow_iso()
         self.universe_store.upsert_symbol(
@@ -457,20 +504,22 @@ class DiscoveryStore:
             metadata_increments={"compare_subject_hits": 1},
         )
 
-        with self._connect() as conn:
-            for peer in peer_items:
+        with self._engine.begin() as conn:
+            for index, peer in enumerate(peer_items):
                 conn.execute(
-                    """
-                    INSERT INTO manual_compare_events(compare_id, subject_ticker, peer_ticker, created_at, payload_json)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        str(uuid.uuid4()),
-                        subject_item["ticker"],
-                        peer["ticker"],
-                        now_text,
-                        json.dumps({"subject": subject_item, "peer": peer}, ensure_ascii=False),
+                    text(
+                        """
+                        INSERT INTO manual_compare_events(compare_id, subject_ticker, peer_ticker, created_at, payload_json)
+                        VALUES (:compare_id, :subject_ticker, :peer_ticker, :created_at, :payload_json)
+                        """
                     ),
+                    {
+                        "compare_id": event_id_text if event_id_text and len(peer_items) == 1 else f"{event_id_text}:{index}" if event_id_text else str(uuid.uuid4()),
+                        "subject_ticker": subject_item["ticker"],
+                        "peer_ticker": peer["ticker"],
+                        "created_at": now_text,
+                        "payload_json": json.dumps({"subject": subject_item, "peer": peer}, ensure_ascii=False),
+                    },
                 )
 
         for raw_peer, peer in paired_peer_items:
@@ -510,32 +559,33 @@ class DiscoveryStore:
 
     def list_manual_compares(self, *, subject_ticker: str | None = None, limit: int = 8) -> list[dict[str, Any]]:
         sql = "SELECT * FROM manual_compare_events"
-        params: tuple[Any, ...] = ()
+        params: dict[str, Any] = {}
         if subject_ticker:
-            sql += " WHERE subject_ticker = ?"
-            params = (str(subject_ticker or "").strip().upper(),)
-        sql += " ORDER BY created_at DESC, compare_id DESC"
-        with self._connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
+            sql += " WHERE subject_ticker = :subject_ticker"
+            params["subject_ticker"] = str(subject_ticker or "").strip().upper()
+        sql += " ORDER BY created_at DESC, compare_id DESC LIMIT :limit"
+        params["limit"] = max(int(limit or 8), 1)
+        rows = self._fetch_all(sql, params)
 
         seen: set[str] = set()
         items: list[dict[str, Any]] = []
         for row in rows:
-            payload = json.loads(str(row["payload_json"] or "{}"))
+            payload = json.loads(str(row.get("payload_json") or "{}"))
             peer = dict(payload.get("peer") or {})
-            peer_ticker = str(peer.get("ticker") or row["peer_ticker"] or "").strip().upper()
+            peer_ticker = str(peer.get("ticker") or row.get("peer_ticker") or "").strip().upper()
             if not peer_ticker or peer_ticker in seen:
                 continue
             seen.add(peer_ticker)
             items.append(
                 {
+                    "event_id": str(row.get("compare_id") or ""),
                     "ticker": peer_ticker,
                     "company_name": str(peer.get("company_name") or peer.get("name") or ""),
                     "exchange": str(peer.get("exchange") or ""),
                     "sector": str(peer.get("sector") or ""),
                     "industry": str(peer.get("industry") or ""),
-                    "subject_ticker": str(row["subject_ticker"] or ""),
-                    "created_at": str(row["created_at"] or ""),
+                    "subject_ticker": str(row.get("subject_ticker") or ""),
+                    "created_at": str(row.get("created_at") or ""),
                 }
             )
             if len(items) >= max(int(limit or 8), 1):

@@ -202,10 +202,13 @@ def _derive_ebit_margin_target(
     ebit_margins: list[float],
     gross_margin_base_pct: float,
     industry: str,
+    *,
+    revenues: list[float] | None = None,
 ) -> tuple[float, str]:
     current_margin = float(ebit_margin_base_pct or 0.0)
     history = [float(value) for value in ebit_margins if value is not None]
     industry_lower = (industry or "").lower()
+    revenue_history = [float(value) for value in (revenues or []) if value is not None and float(value) > 0]
 
     if history:
         ordered = sorted(history)
@@ -215,6 +218,16 @@ def _derive_ebit_margin_target(
         historical_anchor = current_margin
 
     organic_expansion = round(min(6.0, max(0.0, current_margin) * 0.40), 1)
+    recent_revenue_cagr_pct = None
+    if len(revenue_history) >= 3 and revenue_history[0] > 0 and revenue_history[-1] > 0:
+        recent_revenues = revenue_history[-5:] if len(revenue_history) > 5 else revenue_history
+        periods = len(recent_revenues) - 1
+        if periods > 0 and recent_revenues[0] > 0:
+            recent_revenue_cagr_pct = ((recent_revenues[-1] / recent_revenues[0]) ** (1.0 / periods) - 1.0) * 100.0
+    if current_margin >= historical_anchor:
+        organic_expansion = min(organic_expansion, 1.0)
+    if recent_revenue_cagr_pct is not None and recent_revenue_cagr_pct <= 0:
+        organic_expansion = min(organic_expansion, 1.5 if recent_revenue_cagr_pct > -2.0 else 0.8)
     peak_based_target = round(
         min(
             current_margin + 5.0,
@@ -227,6 +240,8 @@ def _derive_ebit_margin_target(
     )
     target = max(peak_based_target, current_margin + organic_expansion)
     source = "Historical peak margin + organic expansion"
+    if organic_expansion <= 1.0 and current_margin >= historical_anchor:
+        source = "Historical peak margin + restrained expansion"
 
     recent_window = history[-5:]
     prior_window = history[:-5]
@@ -1204,7 +1219,12 @@ def _fiscal_year_end_components(data: dict[str, Any]) -> tuple[int, int]:
     return month, 31
 
 
-def _augment_learning_explainability(knowledge_model: dict[str, Any]) -> None:
+def _augment_learning_explainability(
+    knowledge_model: dict[str, Any],
+    *,
+    sector: str = "",
+    industry: str = "",
+) -> None:
     explainability = dict(knowledge_model.get("explainability") or {})
     if not explainability:
         return
@@ -1283,7 +1303,14 @@ def _augment_learning_explainability(knowledge_model: dict[str, Any]) -> None:
     explainability["data_gaps"] = data_gaps
 
     if knowledge_model.get("layered_learning"):
-        confidence_model = build_ranked_confidence_model({**knowledge_model, "explainability": explainability})
+        confidence_model = build_ranked_confidence_model(
+            {
+                **knowledge_model,
+                "explainability": explainability,
+                "sector": sector,
+                "industry": industry,
+            }
+        )
         explainability["confidence_decomposition"] = {
             "summary": confidence_model["summary"],
             "dominant_risk": confidence_model["dominant_risk"],
@@ -1745,6 +1772,7 @@ def build_dashboard_data(ticker: str, overrides: dict | None = None) -> dict | N
             ebit_margins,
             gross_margin_base_pct,
             industry,
+            revenues=revenues,
         )
 
         # Working-capital days
@@ -2469,7 +2497,7 @@ def build_dashboard_data(ticker: str, overrides: dict | None = None) -> dict | N
             knowledge_model_payload["learning_backfill"] = _backfill_learning_actuals(ticker, fund)
             knowledge_model_payload["learning_maintenance"] = _run_learning_maintenance(ticker, fund)
             knowledge_model_payload["learning_persistence"] = _persist_learning_snapshot(_result, knowledge_model_payload)
-            _augment_learning_explainability(knowledge_model_payload)
+            _augment_learning_explainability(knowledge_model_payload, sector=sector, industry=industry)
             confidence_model = dict(knowledge_model_payload.get("confidence_model") or {})
             dashboard_breakdown = dict(confidence_model.get("dashboard_breakdown") or {})
             if dashboard_breakdown:

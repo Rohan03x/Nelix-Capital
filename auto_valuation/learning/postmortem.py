@@ -19,9 +19,10 @@ from .ledger import (
     RealizedOutcomeRecord,
     prediction_horizon_target_date,
 )
+from .storage_paths import learning_db_dir
 
 
-POSTMORTEM_DB_PATH = Path(__file__).resolve().parent / "db" / "postmortems.db"
+POSTMORTEM_DB_PATH = learning_db_dir() / "postmortems.db"
 
 
 @dataclass(frozen=True)

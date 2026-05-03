@@ -660,6 +660,257 @@ function _dashboardSymbolPayload() {
   };
 }
 
+const _DEVICE_WATCHLIST_KEY = 'nelix-device-watchlist-v1';
+const _DEVICE_MANUAL_COMPARE_KEY = 'nelix-device-manual-compare-v1';
+const _DEVICE_WATCHLIST_LIMIT = 30;
+const _DEVICE_MANUAL_COMPARE_LIMIT = 48;
+
+function _storageAvailable() {
+  try {
+    localStorage.setItem('__nelix_probe__', '1');
+    localStorage.removeItem('__nelix_probe__');
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function _readDeviceStore(key, fallback) {
+  if (!_storageAvailable()) return fallback;
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(fallback) ? (Array.isArray(parsed) ? parsed : fallback) : (parsed || fallback);
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+function _writeDeviceStore(key, value) {
+  if (!_storageAvailable()) return false;
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function _nowIso() {
+  return new Date().toISOString();
+}
+
+function _tickerKey(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function _manualCompareEventId(subjectTicker, peerTicker) {
+  return `device:${_tickerKey(subjectTicker)}:${_tickerKey(peerTicker)}`;
+}
+
+function _normaliseWatchlistItem(item) {
+  const payload = item || {};
+  const ticker = _tickerKey(payload.ticker || payload.symbol || payload.code);
+  if (!ticker) return null;
+  const timestamp = String(payload.last_touched_at || payload.added_at || _nowIso());
+  return {
+    ticker,
+    company_name: String(payload.company_name || payload.name || '').trim(),
+    exchange: String(payload.exchange || '').trim().toUpperCase(),
+    country: String(payload.country || '').trim(),
+    sector: String(payload.sector || '').trim(),
+    industry: String(payload.industry || '').trim(),
+    added_at: String(payload.added_at || timestamp),
+    last_touched_at: timestamp,
+  };
+}
+
+function _deviceWatchlistItems() {
+  return _readDeviceStore(_DEVICE_WATCHLIST_KEY, [])
+    .map(_normaliseWatchlistItem)
+    .filter(Boolean)
+    .sort((left, right) => String(right.last_touched_at || '').localeCompare(String(left.last_touched_at || '')))
+    .slice(0, _DEVICE_WATCHLIST_LIMIT);
+}
+
+function _saveDeviceWatchlistItems(items) {
+  const byTicker = new Map();
+  (items || []).forEach(item => {
+    const normalised = _normaliseWatchlistItem(item);
+    if (!normalised) return;
+    const current = byTicker.get(normalised.ticker);
+    if (!current || String(normalised.last_touched_at || '').localeCompare(String(current.last_touched_at || '')) >= 0) {
+      byTicker.set(normalised.ticker, normalised);
+    }
+  });
+  const ordered = Array.from(byTicker.values())
+    .sort((left, right) => String(right.last_touched_at || '').localeCompare(String(left.last_touched_at || '')))
+    .slice(0, _DEVICE_WATCHLIST_LIMIT);
+  _writeDeviceStore(_DEVICE_WATCHLIST_KEY, ordered);
+  return ordered;
+}
+
+function _upsertDeviceWatchlistItem(item) {
+  const normalised = _normaliseWatchlistItem(item);
+  if (!normalised) return null;
+  const current = _deviceWatchlistItems();
+  const existing = current.find(entry => entry.ticker === normalised.ticker);
+  normalised.added_at = existing ? existing.added_at : (normalised.added_at || _nowIso());
+  normalised.last_touched_at = _nowIso();
+  _saveDeviceWatchlistItems([normalised, ...current.filter(entry => entry.ticker !== normalised.ticker)]);
+  return normalised;
+}
+
+function _removeDeviceWatchlistItem(ticker) {
+  const tickerText = _tickerKey(ticker);
+  _saveDeviceWatchlistItems(_deviceWatchlistItems().filter(item => item.ticker !== tickerText));
+}
+
+function _mergeWatchlistItems(serverItems, deviceItems) {
+  return _saveDeviceWatchlistItems([...(serverItems || []), ...(deviceItems || [])]);
+}
+
+function _normaliseManualCompareItem(item, subjectHint) {
+  const payload = item || {};
+  const ticker = _tickerKey(payload.ticker || payload.peer_ticker || payload.symbol || payload.code);
+  const subjectTicker = _tickerKey(payload.subject_ticker || subjectHint || (payload.subject || {}).ticker);
+  if (!ticker || !subjectTicker) return null;
+  const eventId = String(payload.event_id || _manualCompareEventId(subjectTicker, ticker)).trim();
+  return {
+    event_id: eventId,
+    ticker,
+    company_name: String(payload.company_name || payload.name || '').trim(),
+    exchange: String(payload.exchange || '').trim().toUpperCase(),
+    sector: String(payload.sector || '').trim(),
+    industry: String(payload.industry || '').trim(),
+    subject_ticker: subjectTicker,
+    subject_company_name: String(payload.subject_company_name || (payload.subject || {}).company_name || '').trim(),
+    subject_exchange: String(payload.subject_exchange || (payload.subject || {}).exchange || '').trim().toUpperCase(),
+    subject_sector: String(payload.subject_sector || (payload.subject || {}).sector || '').trim(),
+    subject_industry: String(payload.subject_industry || (payload.subject || {}).industry || '').trim(),
+    created_at: String(payload.created_at || _nowIso()),
+  };
+}
+
+function _deviceManualCompareItems() {
+  return _readDeviceStore(_DEVICE_MANUAL_COMPARE_KEY, [])
+    .map(item => _normaliseManualCompareItem(item))
+    .filter(Boolean)
+    .sort((left, right) => String(right.created_at || '').localeCompare(String(left.created_at || '')))
+    .slice(0, _DEVICE_MANUAL_COMPARE_LIMIT);
+}
+
+function _saveDeviceManualCompareItems(items) {
+  const byEvent = new Map();
+  (items || []).forEach(item => {
+    const normalised = _normaliseManualCompareItem(item);
+    if (!normalised) return;
+    const current = byEvent.get(normalised.event_id);
+    if (!current || String(normalised.created_at || '').localeCompare(String(current.created_at || '')) >= 0) {
+      byEvent.set(normalised.event_id, normalised);
+    }
+  });
+  const ordered = Array.from(byEvent.values())
+    .sort((left, right) => String(right.created_at || '').localeCompare(String(left.created_at || '')))
+    .slice(0, _DEVICE_MANUAL_COMPARE_LIMIT);
+  _writeDeviceStore(_DEVICE_MANUAL_COMPARE_KEY, ordered);
+  return ordered;
+}
+
+function _upsertDeviceManualCompareItem(subject, peer) {
+  const subjectTicker = _tickerKey((subject || {}).ticker);
+  const peerTicker = _tickerKey((peer || {}).ticker || (peer || {}).symbol || (peer || {}).code);
+  if (!subjectTicker || !peerTicker) return null;
+  const current = _deviceManualCompareItems();
+  const eventId = _manualCompareEventId(subjectTicker, peerTicker);
+  const normalised = _normaliseManualCompareItem({
+    event_id: eventId,
+    ticker: peerTicker,
+    company_name: (peer || {}).company_name || (peer || {}).name || '',
+    exchange: (peer || {}).exchange || '',
+    sector: (peer || {}).sector || '',
+    industry: (peer || {}).industry || '',
+    subject_ticker: subjectTicker,
+    subject_company_name: (subject || {}).company_name || '',
+    subject_exchange: (subject || {}).exchange || '',
+    subject_sector: (subject || {}).sector || '',
+    subject_industry: (subject || {}).industry || '',
+    created_at: _nowIso(),
+  });
+  if (!normalised) return null;
+  const remaining = current.filter(item => item.event_id !== normalised.event_id);
+  _saveDeviceManualCompareItems([normalised, ...remaining]);
+  return normalised;
+}
+
+function _manualComparesForSubject(subjectTicker) {
+  const subjectKey = _tickerKey(subjectTicker);
+  return _deviceManualCompareItems()
+    .filter(item => item.subject_ticker === subjectKey)
+    .sort((left, right) => String(right.created_at || '').localeCompare(String(left.created_at || '')));
+}
+
+function _mergeManualCompareItems(subjectTicker, serverItems, deviceItems) {
+  const subjectKey = _tickerKey(subjectTicker);
+  const saved = _saveDeviceManualCompareItems([...(serverItems || []).map(item => ({
+    ...item,
+    subject_ticker: item.subject_ticker || subjectKey,
+  })), ...(deviceItems || [])]);
+  return saved.filter(item => item.subject_ticker === subjectKey);
+}
+
+async function _fetchJson(url, options) {
+  try {
+    const response = await fetch(url, options);
+    const payload = await response.json();
+    return { ok: response.ok, payload };
+  } catch (_error) {
+    return { ok: false, payload: null };
+  }
+}
+
+async function _syncDeviceWatchlist(serverItems, deviceItems) {
+  const serverTickers = new Set((serverItems || []).map(item => _tickerKey(item.ticker)));
+  const missing = (deviceItems || []).filter(item => !serverTickers.has(_tickerKey(item.ticker)));
+  for (const item of missing) {
+    await _fetchJson('/api/watchlist', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...item, _device_sync_mode: 'client-replay' }),
+    });
+  }
+}
+
+async function _syncDeviceManualCompares(subjectTicker, serverItems, deviceItems) {
+  const subjectKey = _tickerKey(subjectTicker);
+  const serverEventIds = new Set((serverItems || []).map(item => String(item.event_id || '').trim()).filter(Boolean));
+  const missing = (deviceItems || []).filter(item => item.subject_ticker === subjectKey && !serverEventIds.has(String(item.event_id || '').trim()));
+  for (const item of missing) {
+    await _fetchJson('/api/manual-compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event_id: item.event_id,
+        subject: {
+          ticker: item.subject_ticker,
+          company_name: item.subject_company_name,
+          exchange: item.subject_exchange,
+          sector: item.subject_sector,
+          industry: item.subject_industry,
+        },
+        peer: {
+          ticker: item.ticker,
+          company_name: item.company_name,
+          exchange: item.exchange,
+          sector: item.sector,
+          industry: item.industry,
+        },
+      }),
+    });
+  }
+}
+
 function _watchlistPanelHtml(items) {
   if (!Array.isArray(items) || !items.length) {
     return '<div style="font-size:.74rem;color:var(--text-secondary);">No symbols pinned yet.</div>';
@@ -696,25 +947,32 @@ function _manualComparePanelHtml(items) {
 async function loadWatchlistPanels() {
   const panels = Array.from(document.querySelectorAll('[data-watchlist-panel]'));
   if (!panels.length) return;
-  const response = await fetch('/api/watchlist', { headers: { 'Accept': 'application/json' } });
-  const payload = await response.json();
-  const html = _watchlistPanelHtml(payload.items || []);
+  const deviceItems = _deviceWatchlistItems();
+  const response = await _fetchJson('/api/watchlist', { headers: { 'Accept': 'application/json' } });
+  const serverItems = Array.isArray((response.payload || {}).items) ? response.payload.items : [];
+  const mergedItems = _mergeWatchlistItems(serverItems, deviceItems);
+  const html = _watchlistPanelHtml(mergedItems || []);
   panels.forEach(panel => {
     panel.innerHTML = html;
   });
+  if (response.ok) {
+    _syncDeviceWatchlist(serverItems, mergedItems).catch(() => {});
+  }
 }
 
 async function addWatchlistFromButton(button) {
   if (!button) return;
   const payload = JSON.parse(button.dataset.watchlistItem || '{}');
+  const saved = _upsertDeviceWatchlistItem(payload);
+  if (!saved) return;
   button.disabled = true;
   const previous = button.textContent;
   button.textContent = 'Tracking…';
   try {
-    await fetch('/api/watchlist', {
+    await _fetchJson('/api/watchlist', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(saved),
     });
     button.textContent = 'Tracked';
     await loadWatchlistPanels();
@@ -726,7 +984,8 @@ async function addWatchlistFromButton(button) {
 }
 
 async function removeWatchlistItem(ticker) {
-  await fetch(`/api/watchlist/${encodeURIComponent(ticker)}`, { method: 'DELETE' });
+  _removeDeviceWatchlistItem(ticker);
+  await _fetchJson(`/api/watchlist/${encodeURIComponent(ticker)}`, { method: 'DELETE' });
   await loadWatchlistPanels();
 }
 
@@ -734,11 +993,16 @@ async function loadManualComparePanel() {
   const panel = document.querySelector('[data-manual-compare-panel]');
   const subject = _dashboardSymbolPayload();
   if (!panel || !subject || !subject.ticker) return;
-  const response = await fetch(`/api/manual-compare?subject=${encodeURIComponent(subject.ticker)}`, {
+  const deviceItems = _manualComparesForSubject(subject.ticker);
+  const response = await _fetchJson(`/api/manual-compare?subject=${encodeURIComponent(subject.ticker)}`, {
     headers: { 'Accept': 'application/json' },
   });
-  const payload = await response.json();
-  panel.innerHTML = _manualComparePanelHtml(payload.items || []);
+  const serverItems = Array.isArray((response.payload || {}).items) ? response.payload.items : [];
+  const mergedItems = _mergeManualCompareItems(subject.ticker, serverItems, deviceItems);
+  panel.innerHTML = _manualComparePanelHtml(mergedItems || []);
+  if (response.ok) {
+    _syncDeviceManualCompares(subject.ticker, serverItems, mergedItems).catch(() => {});
+  }
 }
 
 async function recordManualCompare(button) {
@@ -746,14 +1010,16 @@ async function recordManualCompare(button) {
   const subject = _dashboardSymbolPayload();
   if (!subject || !subject.ticker) return;
   const peer = JSON.parse(button.dataset.comparePeer || '{}');
+  const deviceItem = _upsertDeviceManualCompareItem(subject, peer);
+  if (!deviceItem) return;
   button.disabled = true;
   const previous = button.textContent;
   button.textContent = 'Learning…';
   try {
-    await fetch('/api/manual-compare', {
+    await _fetchJson('/api/manual-compare', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ subject, peer }),
+      body: JSON.stringify({ event_id: deviceItem.event_id, subject, peer }),
     });
     button.textContent = 'Queued';
     await loadManualComparePanel();

@@ -31,7 +31,40 @@ app.jinja_env.globals.update(enumerate=enumerate)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
 
+def _sync_external_learning_state(*, force: bool = False) -> dict[str, object]:
+    try:
+        from auto_valuation.learning.production_sync import hydrate_external_learning_state
+
+        return dict(hydrate_external_learning_state(force=force) or {})
+    except Exception as exc:
+        logger.debug("External learning hydrate skipped: %s", exc)
+        return {"enabled": False, "reason": str(exc)}
+
+
+def _persist_external_learning_state(*, force: bool = False) -> dict[str, object]:
+    try:
+        from auto_valuation.learning.production_sync import persist_external_learning_state
+
+        return dict(persist_external_learning_state(force=force) or {})
+    except Exception as exc:
+        logger.debug("External learning persist skipped: %s", exc)
+        return {"enabled": False, "reason": str(exc)}
+
+
+def _cron_authorized() -> tuple[bool, str | None]:
+    expected = str(os.environ.get("CRON_SECRET") or os.environ.get("LEARNING_CRON_SECRET") or "").strip()
+    auth_header = str(request.headers.get("Authorization") or "").strip()
+    if not expected:
+        if os.environ.get("VERCEL"):
+            return False, "cron-secret-missing"
+        return True, None
+    if auth_header == f"Bearer {expected}":
+        return True, None
+    return False, "unauthorized"
+
+
 def _safe_discovery_store():
+    _sync_external_learning_state()
     try:
         from auto_valuation.learning.discovery import DiscoveryStore
 
@@ -90,9 +123,20 @@ def _fallback_dashboard_data(ticker: str, reason: str | None = None) -> dict:
     return fallback
 
 
-def _safe_dashboard_data(ticker: str) -> dict:
+def _safe_dashboard_data(ticker: str, overrides: dict | None = None) -> dict:
+    _sync_external_learning_state()
     try:
-        return get_dashboard_data(ticker)
+        if overrides is None:
+            data = get_dashboard_data(ticker)
+        else:
+            try:
+                data = get_dashboard_data(ticker, overrides=overrides)
+            except TypeError as exc:
+                if "unexpected keyword argument 'overrides'" not in str(exc):
+                    raise
+                data = get_dashboard_data(ticker)
+        _persist_external_learning_state()
+        return data
     except Exception as exc:
         logger.exception("Dashboard data failed for %s", ticker)
         return _fallback_dashboard_data(ticker, reason=str(exc))
@@ -125,6 +169,7 @@ def valuate():
     discovery_store = _safe_discovery_store()
     if discovery_store is not None:
         discovery_store.record_search_impression(typed_ticker, [], exchange=exchange, selected_ticker=ticker)
+        _persist_external_learning_state()
 
     session["ticker"]   = ticker
     session["exchange"] = exchange
@@ -169,6 +214,7 @@ def api_ticker_search():
     discovery_store = _safe_discovery_store()
     if discovery_store is not None:
         discovery_store.record_search_impression(query, results, exchange=exchange)
+        _persist_external_learning_state()
     return jsonify({"results": results})
 
 
@@ -188,6 +234,7 @@ def api_watchlist():
     item = store.add_to_watchlist(payload)
     if item is None:
         return jsonify({"items": store.list_watchlist(limit=30), "ok": False, "reason": "invalid-symbol"}), 400
+    _persist_external_learning_state()
     return jsonify({"items": store.list_watchlist(limit=30), "item": item, "ok": True})
 
 
@@ -197,6 +244,7 @@ def api_watchlist_delete(ticker):
     if store is None:
         return jsonify({"items": [], "ok": False, "reason": "discovery-unavailable"}), 503
     removed = store.remove_from_watchlist(ticker)
+    _persist_external_learning_state()
     return jsonify({"items": store.list_watchlist(limit=30), "ok": removed})
 
 
@@ -217,8 +265,24 @@ def api_manual_compare():
     payload = request.get_json(force=True) or {}
     subject = payload.get("subject") or {}
     peers = payload.get("peers") or ([] if payload.get("peer") is None else [payload.get("peer")])
-    result = store.record_manual_compare(subject, peers)
+    result = store.record_manual_compare(subject, peers, event_id=payload.get("event_id"))
+    _persist_external_learning_state()
     return jsonify({"ok": True, **result})
+
+
+@app.route("/api/internal/learning/cron", methods=["GET", "POST"])
+def api_internal_learning_cron():
+    authorized, reason = _cron_authorized()
+    if not authorized:
+        status = 503 if reason == "cron-secret-missing" else 401
+        return jsonify({"ok": False, "reason": reason}), status
+
+    sync_in = _sync_external_learning_state(force=True)
+    from auto_valuation.learning.background_runner import run_background_learning_cycle
+
+    cycle = run_background_learning_cycle()
+    sync_out = _persist_external_learning_state(force=True)
+    return jsonify({"ok": True, "sync_in": sync_in, "cycle": cycle, "sync_out": sync_out})
 
 
 # ─── API: recompute with overrides ───────────────────────────────────────────
@@ -241,7 +305,7 @@ def api_recompute():
             except (ValueError, TypeError):
                 overrides.pop(k, None)
 
-    data = get_dashboard_data(ticker, overrides=overrides)
+    data = _safe_dashboard_data(ticker, overrides=overrides)
 
     return jsonify({
         "intrinsic_value":  data["intrinsic_value"],
@@ -269,7 +333,7 @@ def api_recompute():
 
 @app.route("/api/confidence/<ticker>")
 def api_confidence(ticker):
-    data = get_dashboard_data(ticker.upper())
+    data = _safe_dashboard_data(ticker.upper())
     return jsonify(data.get("confidence_breakdown") or {"score": data.get("confidence_score", 50)})
 
 
@@ -277,7 +341,7 @@ def api_confidence(ticker):
 
 @app.route("/api/reverse-dcf/<ticker>")
 def api_reverse_dcf(ticker):
-    data = get_dashboard_data(ticker.upper())
+    data = _safe_dashboard_data(ticker.upper())
     return jsonify(data.get("reverse_dcf") or {"error": "reverse_dcf not available"})
 
 
@@ -285,7 +349,7 @@ def api_reverse_dcf(ticker):
 
 @app.route("/api/memo/<ticker>")
 def api_memo(ticker):
-    data = get_dashboard_data(ticker.upper())
+    data = _safe_dashboard_data(ticker.upper())
     return jsonify(data.get("investment_memo") or {"error": "investment_memo not available"})
 
 
@@ -293,7 +357,7 @@ def api_memo(ticker):
 
 @app.route("/api/market-expectations/<ticker>")
 def api_market_expectations(ticker):
-    data = get_dashboard_data(ticker.upper())
+    data = _safe_dashboard_data(ticker.upper())
     return jsonify(data.get("market_expectations") or {"error": "market_expectations not available"})
 
 
@@ -301,7 +365,7 @@ def api_market_expectations(ticker):
 
 @app.route("/api/financial-scores/<ticker>")
 def api_financial_scores(ticker):
-    data = get_dashboard_data(ticker.upper())
+    data = _safe_dashboard_data(ticker.upper())
     return jsonify(data.get("financial_scores") or {"error": "financial_scores not available"})
 
 
@@ -309,7 +373,7 @@ def api_financial_scores(ticker):
 
 @app.route("/api/football-field/<ticker>")
 def api_football_field(ticker):
-    data = get_dashboard_data(ticker.upper())
+    data = _safe_dashboard_data(ticker.upper())
     ff = {
         "dcf_bear":       data.get("scenarios", {}).get("bear", {}).get("iv", 0),
         "dcf_base":       data.get("intrinsic_value", 0),
@@ -332,10 +396,8 @@ def api_export(ticker):
     import io as _io
     from flask import send_file
     from webapp.data.excel_export import build_excel_bytes
-    from webapp.data.samples import get_dashboard_data as _gdd
-
     ticker = ticker.upper().strip()
-    data   = _gdd(ticker)
+    data   = _safe_dashboard_data(ticker)
     xlsx   = build_excel_bytes(data)
     buf    = _io.BytesIO(xlsx)
     buf.seek(0)

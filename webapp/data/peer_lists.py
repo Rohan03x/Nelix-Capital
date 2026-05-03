@@ -290,7 +290,11 @@ def _to_yfinance_ticker(code: str, exchange: str) -> str | None:
     if not symbol:
         return None
     if "." in symbol:
-        return symbol
+        base, dotted_exchange = symbol.split(".", 1)
+        suffix = _YFINANCE_EXCHANGE_SUFFIX.get(dotted_exchange)
+        if suffix is None:
+            return symbol
+        return f"{base}{suffix}"
     suffix = _YFINANCE_EXCHANGE_SUFFIX.get(venue)
     if suffix is None:
         return symbol if venue in {"", "OTC", "PINK"} else None
@@ -380,14 +384,19 @@ def _discover_cached_peers(
         related_match = bool(
             candidate_taxonomy.get("canonical_industry") in subject_related_industries
             or subject_taxonomy.get("canonical_industry") in set(candidate_taxonomy.get("related_industries") or [])
-            or (
-                include_related
-                and subject_taxonomy.get("family")
-                and subject_taxonomy.get("family") == candidate_taxonomy.get("family")
-            )
         )
-        if not same_canonical and (not include_related or not related_match or similarity < 0.45):
-            continue
+        same_family = bool(
+            subject_taxonomy.get("family")
+            and subject_taxonomy.get("family") == candidate_taxonomy.get("family")
+        )
+        if not same_canonical:
+            if not include_related:
+                continue
+            if related_match:
+                if similarity < 0.45:
+                    continue
+            elif not same_family or similarity < 0.70:
+                continue
 
         score = 100.0 if same_canonical else similarity * 60.0
         if subject_exchange and str(profile.get("exchange") or "") == subject_exchange:
@@ -687,13 +696,15 @@ def get_peers_for_ticker(
     if industry_peers:
         return _rank_peer_tickers(industry_peers, subject_ticker=ticker, sector=sector, industry=industry)
 
+    if str(industry or "").strip():
+        return []
+
     # 3. Sector fallback.
     sector_peers = _dedupe_preserve(_sector_peers(sector), exclude=_ticker_variants(ticker), limit=8)
     if sector_peers:
         return _rank_peer_tickers(sector_peers, subject_ticker=ticker, sector=sector, industry=industry)
 
-    # 4. Generic tech fallback for any unrecognised ticker
-    return ["AAPL", "MSFT", "GOOGL", "META", "NVDA", "ORCL", "CRM"]
+    return []
 
 
 def get_segment_peers(ticker: str) -> dict[str, list[str]]:
@@ -802,10 +813,15 @@ def fetch_peer_metrics(
         peer_median = _compute_median(peers, target_ticker)
         return peers, peer_median
 
+    profiles = {str(profile.get("ticker") or ""): profile for profile in _load_cached_peer_profiles()}
     peers: list[dict] = []
     for tk in peer_tickers:
         try:
-            info = yf.Ticker(tk).info or {}
+            ticker_text = str(tk or "").upper()
+            profile = profiles.get(ticker_text) or {}
+            exchange = str(profile.get("exchange") or "")
+            yf_ticker = _to_yfinance_ticker(ticker_text, exchange) or ticker_text
+            info = yf.Ticker(yf_ticker).info or {}
             mkt = _safe_float(info.get("marketCap", 0)) / 1e6
             rev = _safe_float(info.get("totalRevenue", 0)) / 1e6
             ebitda = _safe_float(info.get("ebitda", 0)) / 1e6
@@ -822,8 +838,8 @@ def fetch_peer_metrics(
                 return None
 
             peers.append({
-                "ticker":    tk.upper(),
-                "name":      info.get("shortName") or info.get("longName") or tk,
+                "ticker":    ticker_text,
+                "name":      info.get("shortName") or info.get("longName") or ticker_text,
                 "market_cap": round(mkt),
                 "ev":         round(ev),
                 "revenue":    round(rev),
@@ -836,16 +852,16 @@ def fetch_peer_metrics(
                 "ev_ebit":    _mult(ev, ebit),
                 "pe":         _mult(mkt, ni),
                 "p_fcf":      _mult(mkt, fcf),
-                "subject":    (tk.upper() == target_ticker),
+                "subject":    (ticker_text == target_ticker),
             })
         except Exception as exc:
             logger.debug("Peer fetch failed for %s: %s", tk, exc)
             peers.append({
-                "ticker": tk.upper(), "name": tk, "market_cap": 0, "ev": 0,
+                "ticker": str(tk or "").upper(), "name": str(tk or "").upper(), "market_cap": 0, "ev": 0,
                 "revenue": None, "ebitda": None, "ebit": None,
                 "net_income": None, "fcf": None,
                 "ev_rev": None, "ev_ebitda": None, "ev_ebit": None,
-                "pe": None, "p_fcf": None, "subject": (tk.upper() == target_ticker),
+                "pe": None, "p_fcf": None, "subject": (str(tk or "").upper() == target_ticker),
             })
 
     peers = _enrich_peer_rows(

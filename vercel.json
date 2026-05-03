@@ -1,3 +1,9 @@
 {
-  "buildCommand": "python build.py"
+  "buildCommand": "python build.py",
+  "crons": [
+    {
+      "path": "/api/internal/learning/cron",
+      "schedule": "0 6 * * *"
+    }
+  ]
 }

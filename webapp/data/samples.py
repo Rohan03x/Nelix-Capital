@@ -845,9 +845,16 @@ def get_dashboard_data(ticker: str, overrides: dict | None = None) -> dict:
 
     # ── Enrich with computed fields ───────────────────────────────────────────
     try:
-        conf = score_confidence(data)
-        data["confidence_score"] = conf.total
-        data["confidence_breakdown"] = conf.as_dict()
+        knowledge_breakdown = dict(
+            (((data.get("knowledge_model") or {}).get("confidence_model") or {}).get("dashboard_breakdown") or {})
+        )
+        if knowledge_breakdown:
+            data["confidence_score"] = int(knowledge_breakdown.get("total") or data.get("confidence_score") or 0)
+            data["confidence_breakdown"] = knowledge_breakdown
+        else:
+            conf = score_confidence(data)
+            data["confidence_score"] = conf.total
+            data["confidence_breakdown"] = conf.as_dict()
     except Exception as exc:
         logger.warning("Confidence scoring failed for %s: %s", ticker, exc)
         data["confidence_score"] = 50

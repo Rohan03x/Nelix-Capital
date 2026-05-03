@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from auto_valuation.config import LEARNING_CONFIG
+from auto_valuation.learning.storage_paths import learning_db_dir
 
 from .live_evidence_bootstrap import (
     DEFAULT_BOOTSTRAP_TICKERS,
@@ -24,7 +25,7 @@ from .maintenance import run_scheduled_learning_maintenance
 logger = logging.getLogger(__name__)
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
-BACKGROUND_RUNNER_STATE_PATH = PACKAGE_ROOT / "db" / "background_runner_state.json"
+BACKGROUND_RUNNER_STATE_PATH = learning_db_dir() / "background_runner_state.json"
 
 _RUNNER_LOCK = threading.Lock()
 _RUNNER: "LearningBackgroundRunner | None" = None
