@@ -40,6 +40,24 @@ def _safe_discovery_store():
         return None
 
 
+def _seed_watchlist(limit: int = 30) -> list[dict]:
+    try:
+        from auto_valuation.learning.deployment_seed import watchlist_items
+
+        return watchlist_items(limit=limit)
+    except Exception:
+        return []
+
+
+def _seed_manual_compares(subject_ticker: str, limit: int = 8) -> list[dict]:
+    try:
+        from auto_valuation.learning.deployment_seed import manual_compare_items
+
+        return manual_compare_items(subject_ticker=subject_ticker, limit=limit)
+    except Exception:
+        return []
+
+
 def _dashboard_api_payload(data: dict) -> dict:
     payload = dict(data)
     historical = payload.get("historical") or {}
@@ -157,6 +175,9 @@ def api_ticker_search():
 @app.route("/api/watchlist", methods=["GET", "POST"])
 def api_watchlist():
     store = _safe_discovery_store()
+    if request.method == "GET" and store is None:
+        items = _seed_watchlist(limit=30)
+        return jsonify({"items": items, "ok": True, "seeded": bool(items)})
     if store is None:
         return jsonify({"items": [], "ok": False, "reason": "discovery-unavailable"}), 503
 
@@ -182,6 +203,10 @@ def api_watchlist_delete(ticker):
 @app.route("/api/manual-compare", methods=["GET", "POST"])
 def api_manual_compare():
     store = _safe_discovery_store()
+    if request.method == "GET" and store is None:
+        subject = request.args.get("subject", "")
+        items = _seed_manual_compares(subject_ticker=subject, limit=8)
+        return jsonify({"items": items, "ok": True, "seeded": bool(items)})
     if store is None:
         return jsonify({"items": [], "ok": False, "reason": "discovery-unavailable"}), 503
 

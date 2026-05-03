@@ -29,6 +29,8 @@ from auto_valuation.learning.cross_industry import (
     find_analogs,
     match_pattern_library,
 )
+from auto_valuation.learning.deployment_seed import analog_observations as seeded_analog_observations
+from auto_valuation.learning.deployment_seed import cohort_observations as seeded_cohort_observations
 from auto_valuation.learning.ledger import LedgerReader
 from auto_valuation.learning.postmortem import should_run_quinquennial
 from auto_valuation.learning.relationship_graph import build_relationship_graph
@@ -1161,7 +1163,7 @@ def _load_learning_cohort(limit: int | None = None) -> list[Any]:
         reader = LedgerReader()
         records = reader.query(limit=int(limit or _learning_pool_limit()))
     except Exception:
-        return []
+        records = []
 
     observations: list[Any] = []
     for record in records:
@@ -1228,7 +1230,9 @@ def _load_learning_cohort(limit: int | None = None) -> list[Any]:
                 "structural_break_hints": list(getattr(record, "structural_break_hints", []) or []),
             }
         )
-    return observations
+    if observations:
+        return observations
+    return seeded_cohort_observations(limit=int(limit or _learning_pool_limit()))
 
 
 def _load_analog_candidates(limit: int | None = None):
@@ -1236,8 +1240,11 @@ def _load_analog_candidates(limit: int | None = None):
         reader = LedgerReader()
         records = reader.query(limit=int(limit or _learning_pool_limit()))
     except Exception:
-        return []
-    return build_analog_observations(records)
+        records = []
+    analogs = build_analog_observations(records)
+    if analogs:
+        return analogs
+    return seeded_analog_observations(limit=int(limit or _learning_pool_limit()))
 
 
 def _disabled_analog_set(ticker: str, symbol_features: SymbolFeatures) -> AnalogSet:

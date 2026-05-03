@@ -865,12 +865,22 @@ def _top_learned_peer_edges(
     limit: int = 5,
 ) -> list[dict[str, Any]]:
     ticker_text = str(ticker or "").strip().upper()
-    if discovery_store is None or not ticker_text:
+    if not ticker_text:
         return []
     try:
-        relationships = discovery_store.list_peer_relationships(subject_ticker=ticker_text, limit=limit)
+        if discovery_store is not None:
+            relationships = discovery_store.list_peer_relationships(subject_ticker=ticker_text, limit=limit)
+        else:
+            from auto_valuation.learning.deployment_seed import peer_relationships as seeded_peer_relationships
+
+            relationships = seeded_peer_relationships(subject_ticker=ticker_text, limit=limit)
     except Exception:
-        return []
+        try:
+            from auto_valuation.learning.deployment_seed import peer_relationships as seeded_peer_relationships
+
+            relationships = seeded_peer_relationships(subject_ticker=ticker_text, limit=limit)
+        except Exception:
+            return []
 
     items: list[dict[str, Any]] = []
     for relationship in relationships:
@@ -999,11 +1009,22 @@ def _global_universe_summary(universe_store: Any | None) -> dict[str, Any]:
     seed_prefix = int(LEARNING_CONFIG.get("background_runner_seed_prefix_per_cycle", 8) or 0)
     seed_pool_limit = int(LEARNING_CONFIG.get("background_runner_seed_pool_limit", 1000) or 0)
     try:
+        from auto_valuation.learning.deployment_seed import background_runner_state as seeded_background_runner_state
+        from auto_valuation.learning.deployment_seed import universe_summary as seeded_universe_summary
+
+        snapshot_background_runner_state = seeded_background_runner_state()
+        snapshot_summary = seeded_universe_summary()
+    except Exception:
+        snapshot_background_runner_state = {}
+        snapshot_summary = {}
+    try:
         from auto_valuation.learning.background_runner import read_background_runner_state
 
         background_runner_state = read_background_runner_state()
     except Exception:
         background_runner_state = {}
+    if not background_runner_state and snapshot_background_runner_state:
+        background_runner_state = snapshot_background_runner_state
     try:
         from webapp.data.ticker_search import seedable_tickers
 
@@ -1011,7 +1032,17 @@ def _global_universe_summary(universe_store: Any | None) -> dict[str, Any]:
     except Exception:
         seed_pool_size = 0
 
+    snapshot_payload = {
+        **(snapshot_summary or {}),
+        "background_target_symbols": seed_target,
+        "background_seed_prefix_per_cycle": seed_prefix,
+        "background_seed_pool_size": seed_pool_size,
+        "background_runner": background_runner_state,
+    }
+
     if universe_store is None:
+        if snapshot_summary:
+            return {"enabled": True, **snapshot_payload}
         return {
             "enabled": False,
             "tracked_symbols": 0,
@@ -1022,6 +1053,7 @@ def _global_universe_summary(universe_store: Any | None) -> dict[str, Any]:
             "recently_valued_symbols": 0,
             "stale_bootstrap_symbols": 0,
             "priority_candidates": [],
+            "calibration_priority_candidates": [],
             "top_sectors": [],
             "background_target_symbols": seed_target,
             "background_seed_prefix_per_cycle": seed_prefix,
@@ -1030,7 +1062,7 @@ def _global_universe_summary(universe_store: Any | None) -> dict[str, Any]:
         }
 
     try:
-        return {
+        live_summary = {
             "enabled": True,
             **universe_store.summary(
                 stale_after_hours=int(LEARNING_CONFIG.get("symbol_universe_bootstrap_interval_hours", 18)),
@@ -1041,7 +1073,12 @@ def _global_universe_summary(universe_store: Any | None) -> dict[str, Any]:
             "background_seed_pool_size": seed_pool_size,
             "background_runner": background_runner_state,
         }
+        if int(live_summary.get("tracked_symbols") or 0) > 0 or not snapshot_summary:
+            return live_summary
+        return {"enabled": True, **snapshot_payload}
     except Exception:
+        if snapshot_summary:
+            return {"enabled": True, **snapshot_payload}
         return {
             "enabled": False,
             "tracked_symbols": 0,
@@ -1052,6 +1089,7 @@ def _global_universe_summary(universe_store: Any | None) -> dict[str, Any]:
             "recently_valued_symbols": 0,
             "stale_bootstrap_symbols": 0,
             "priority_candidates": [],
+            "calibration_priority_candidates": [],
             "top_sectors": [],
             "background_target_symbols": seed_target,
             "background_seed_prefix_per_cycle": seed_prefix,

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import copy
+import json
 from io import BytesIO
 
 import pytest
 from openpyxl import load_workbook
 
 from auto_valuation.data import macro as macro_module
+from auto_valuation.learning import deployment_seed
+from webapp.app import app as web_app
 from webapp.data.ai_commentary import generate_commentary
 from webapp.data import eodhd_client
 from webapp.data import fmp_client
+from webapp.data import knowledge_model as knowledge_model_module
 from webapp.data import samples as samples_module
 from webapp.data import yfinance_client
 from webapp.data.eodhd_client import _derive_ebit_margin_target
@@ -141,6 +145,97 @@ def test_dashboard_keeps_knowledge_model_when_macro_cache_disabled(monkeypatch) 
 
     assert data["knowledge_model"] is not None
     assert data["knowledge_model"]["summary"].startswith("Weighted knowledge model active")
+
+
+def test_learning_loaders_fallback_to_seed_snapshot(tmp_path, monkeypatch) -> None:
+    seed_path = tmp_path / "dashboard_learning_seed.json"
+    seed_path.write_text(
+        json.dumps(
+            {
+                "cohort_observations": [
+                    {
+                        "ticker": "NKE",
+                        "sector": "Consumer Cyclical",
+                        "industry": "Footwear & Accessories",
+                        "data_vintage_years": 5,
+                        "market_cap_regime": "large",
+                        "macro_regime": "neutral",
+                        "predicted_revenue_growth": 0.05,
+                        "actual_revenue_growth": 0.06,
+                        "predicted_ebit_margin": 0.10,
+                        "actual_ebit_margin": 0.11,
+                        "predicted_wacc": 0.09,
+                        "actual_wacc": 0.09,
+                        "predicted_terminal_growth": 0.025,
+                        "actual_terminal_growth": 0.025,
+                        "predicted_beta": 1.1,
+                        "actual_beta": 1.1,
+                        "predicted_ufcf_margin": 0.08,
+                        "actual_ufcf_margin": 0.09,
+                        "predicted_reinvestment_rate": 0.01,
+                        "actual_reinvestment_rate": 0.015,
+                        "feature_vector": [0.1] * 10,
+                        "structural_break_flag": False,
+                        "structural_break_hints": [],
+                    }
+                ],
+                "analog_observations": [
+                    {
+                        "ticker": "ADDYY",
+                        "sector": "Consumer Cyclical",
+                        "industry": "Footwear & Accessories",
+                        "vintage_year": 5,
+                        "feature_vector": [0.1] * 10,
+                        "feature_map": {},
+                        "outcome_revenue_cagr_5y": 0.02,
+                        "outcome_margin_change_bps": 50.0,
+                        "outcome_ev_multiple_change": 0.1,
+                        "pattern_label": "MATURE_COMPOUNDER",
+                        "market_cap_regime": "large",
+                        "macro_regime": "neutral",
+                        "maturity_stage": "mid",
+                        "valuation_regime": "fair",
+                        "volatility_regime": "stable",
+                        "data_quality_score": 0.8,
+                        "sample_size": 5,
+                        "predictive_usefulness": 0.7,
+                        "as_of_year": 2026,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(deployment_seed, "SEED_PATH", seed_path)
+    deployment_seed.reset_seed_cache()
+
+    class _BrokenLedgerReader:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("ledger unavailable")
+
+    monkeypatch.setattr(knowledge_model_module, "LedgerReader", _BrokenLedgerReader)
+
+    cohort = knowledge_model_module._load_learning_cohort(limit=10)
+    analogs = knowledge_model_module._load_analog_candidates(limit=10)
+
+    assert len(cohort) == 1
+    assert cohort[0]["ticker"] == "NKE"
+    assert len(analogs) == 1
+    assert analogs[0].ticker == "ADDYY"
+
+
+def test_watchlist_api_falls_back_to_seed_when_discovery_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr("webapp.app._safe_discovery_store", lambda: None)
+    monkeypatch.setattr("webapp.app._seed_watchlist", lambda limit=30: [{"ticker": "AAPL", "company_name": "Apple Inc."}])
+
+    client = web_app.test_client()
+    response = client.get("/api/watchlist")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["ok"] is True
+    assert payload["seeded"] is True
+    assert payload["items"][0]["ticker"] == "AAPL"
 
 
 def test_ai_commentary_uses_correct_premium_discount_wording() -> None:
