@@ -87,7 +87,58 @@ def test_seedable_tickers_prefers_primary_common_stock(monkeypatch):
 
     tickers = ticker_search.seedable_tickers(limit=3, common_stock_only=True)
 
-    assert tickers == ["BHP.ASX", "RIO.LSE", "AAPL.US"]
+    assert tickers == ["BHP.ASX", "AAPL.US", "RIO.LSE"]
+
+
+def test_seedable_tickers_skips_cached_alias_when_primary_listing_exists(monkeypatch):
+    monkeypatch.setattr(
+        ticker_search,
+        "_ticker_search_index",
+        lambda: (
+            ticker_search._build_search_item(
+                ticker="BHP1.HM",
+                code="BHP1",
+                name="BHP Group Limited",
+                exchange="HM",
+                country="Germany",
+                source="search-cache",
+                instrument_type="Common Stock",
+                is_primary=False,
+                isin="AU000000BHP4",
+            ),
+            ticker_search._build_search_item(
+                ticker="BHP.AU",
+                code="BHP",
+                name="BHP Group Limited",
+                exchange="AU",
+                country="Australia",
+                source="cache",
+                instrument_type="Common Stock",
+                is_primary=True,
+                isin="AU000000BHP4",
+                primary_ticker="BHP.AU",
+            ),
+            ticker_search._build_search_item(
+                ticker="AAPL.US",
+                code="AAPL",
+                name="Apple Inc",
+                exchange="US",
+                country="USA",
+                source="cache",
+                instrument_type="Common Stock",
+                is_primary=True,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        ticker_search,
+        "_cached_primary_listing_hints",
+        lambda: {"BHP1.HM": {"primary_ticker": "BHP.AU", "isin": "AU000000BHP4"}},
+    )
+
+    tickers = ticker_search.seedable_tickers(limit=5, common_stock_only=True)
+
+    assert tickers == ["AAPL.US", "BHP.AU"]
 
 
 def test_refresh_exchange_symbol_cache_fetches_and_invalidates_index(monkeypatch):

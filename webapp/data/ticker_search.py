@@ -46,12 +46,18 @@ def _build_search_item(
     source: str,
     instrument_type: str = "",
     is_primary: bool = False,
+    isin: str = "",
+    primary_ticker: str = "",
 ) -> dict[str, object]:
     ticker_text = str(ticker or "").strip().upper()
     code_text = str(code or ticker_text.split(".")[0]).strip().upper()
     name_text = str(name or ticker_text).strip()
     exchange_text = str(exchange or "").strip().upper()
     country_text = str(country or "").strip()
+    isin_text = str(isin or "").strip().upper()
+    primary_ticker_text = str(primary_ticker or "").strip().upper()
+    if not primary_ticker_text and is_primary:
+        primary_ticker_text = ticker_text
     search_text = _normalise_search_text(
         " ".join(part for part in (ticker_text, code_text, name_text, exchange_text, country_text) if part)
     )
@@ -70,6 +76,8 @@ def _build_search_item(
         "source": source,
         "instrument_type": str(instrument_type or "").strip(),
         "is_primary": bool(is_primary),
+        "isin": isin_text,
+        "primary_ticker": primary_ticker_text,
     }
 
 
@@ -114,6 +122,8 @@ def _build_index_item(payload_path: Path) -> dict[str, object] | None:
         source="cache",
         instrument_type="Common Stock",
         is_primary=True,
+        isin=str(general.get("ISIN") or "").strip(),
+        primary_ticker=primary_ticker,
     )
 
 
@@ -132,6 +142,8 @@ def _build_cached_search_item(row: dict[str, object], *, source: str = "search-c
         source=source,
         instrument_type=str(row.get("Type") or "").strip(),
         is_primary=bool(row.get("isPrimary") or row.get("IsPrimary")),
+        isin=str(row.get("ISIN") or row.get("Isin") or "").strip(),
+        primary_ticker=str(row.get("PrimaryTicker") or "").strip(),
     )
 
 
@@ -289,6 +301,61 @@ def _ticker_search_index() -> tuple[dict[str, object], ...]:
     return tuple(items)
 
 
+@lru_cache(maxsize=1)
+def _cached_primary_listing_hints() -> dict[str, dict[str, str]]:
+    hints: dict[str, dict[str, str]] = {}
+    for payload_path in sorted(_CACHE_DIR.glob("eodhd_fund_*.json")):
+        try:
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            continue
+        general = data.get("General")
+        if not isinstance(general, dict):
+            continue
+
+        alias_ticker = _compose_ticker(
+            str(general.get("Code") or "").strip().upper(),
+            str(general.get("Exchange") or "").strip().upper(),
+        )
+        primary_ticker = str(general.get("PrimaryTicker") or alias_ticker).strip().upper()
+        if not alias_ticker or not primary_ticker:
+            continue
+
+        hints[alias_ticker] = {
+            "primary_ticker": primary_ticker,
+            "isin": str(general.get("ISIN") or "").strip().upper(),
+        }
+    return hints
+
+
+def _seedable_issuer_key(item: dict[str, object], hints: dict[str, dict[str, str]]) -> str:
+    ticker = str(item.get("ticker") or "").strip().upper()
+    hint = hints.get(ticker, {})
+    primary_ticker = str(item.get("primary_ticker") or hint.get("primary_ticker") or "").strip().upper()
+    if primary_ticker:
+        return f"primary:{primary_ticker}"
+
+    isin = str(item.get("isin") or hint.get("isin") or "").strip().upper()
+    if isin:
+        return f"isin:{isin}"
+
+    name_key = str(item.get("name_key") or "").strip()
+    country = str(item.get("country") or "").strip().upper()
+    if name_key:
+        return f"name:{name_key}:{country}"
+
+    return f"ticker:{ticker}"
+
+
+def invalidate_ticker_search_index() -> None:
+    _ticker_search_index.cache_clear()
+    _cached_primary_listing_hints.cache_clear()
+
+
 def seedable_symbol_items(limit: int | None = None, *, common_stock_only: bool = True) -> list[dict[str, object]]:
     allowed_types = {
         "",
@@ -302,8 +369,8 @@ def seedable_symbol_items(limit: int | None = None, *, common_stock_only: bool =
     ranked_items = sorted(
         _ticker_search_index(),
         key=lambda item: (
-            source_priority.get(str(item.get("source") or ""), 9),
             0 if bool(item.get("is_primary")) else 1,
+            source_priority.get(str(item.get("source") or ""), 9),
             str(item.get("name") or "").upper(),
             str(item.get("ticker") or ""),
         ),
@@ -311,6 +378,9 @@ def seedable_symbol_items(limit: int | None = None, *, common_stock_only: bool =
 
     selected: list[dict[str, object]] = []
     seen: set[str] = set()
+    seen_issuers: set[str] = set()
+    available_tickers = {str(item.get("ticker") or "").strip().upper() for item in ranked_items}
+    primary_hints = _cached_primary_listing_hints()
     max_items = int(limit) if limit is not None and int(limit) > 0 else None
     for item in ranked_items:
         ticker = str(item.get("ticker") or "").strip().upper()
@@ -319,7 +389,18 @@ def seedable_symbol_items(limit: int | None = None, *, common_stock_only: bool =
         instrument_type = str(item.get("instrument_type") or "").strip().lower()
         if common_stock_only and instrument_type not in allowed_types:
             continue
+        primary_ticker = str(
+            item.get("primary_ticker")
+            or (primary_hints.get(ticker) or {}).get("primary_ticker")
+            or ""
+        ).strip().upper()
+        if primary_ticker and primary_ticker != ticker and primary_ticker in available_tickers:
+            continue
+        issuer_key = _seedable_issuer_key(item, primary_hints)
+        if issuer_key in seen_issuers:
+            continue
         seen.add(ticker)
+        seen_issuers.add(issuer_key)
         selected.append(dict(item))
         if max_items is not None and len(selected) >= max_items:
             break
