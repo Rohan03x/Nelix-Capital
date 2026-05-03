@@ -10,6 +10,7 @@ Any unsupported ticker returns NKE data with the name substituted.
 
 from __future__ import annotations
 import copy
+import logging
 from webapp.data.confidence import score_confidence
 from webapp.data.reverse_dcf import compute_reverse_dcf
 from webapp.data.financial_scores import (
@@ -19,6 +20,9 @@ from webapp.data.financial_scores import (
     compute_earnings_quality,
 )
 from webapp.data.ai_commentary import generate_commentary
+
+
+logger = logging.getLogger(__name__)
 
 
 # ─── Sensitivity table helper ────────────────────────────────────────────────
@@ -796,17 +800,24 @@ def get_dashboard_data(ticker: str, overrides: dict | None = None) -> dict:
     ticker = ticker.upper().strip()
     data = None
 
+    def _try_provider(name: str, builder, *args, **kwargs):
+        try:
+            return builder(*args, **kwargs)
+        except Exception as exc:
+            logger.warning("Dashboard provider %s failed for %s: %s", name, ticker, exc)
+            return None
+
     # 1. Try EODHD first (best historical depth — 10–20+ years)
     if eodhd_available():
-        data = eodhd_build(ticker, overrides=overrides)
+        data = _try_provider("eodhd", eodhd_build, ticker, overrides=overrides)
 
     # 2. Fallback to yfinance if EODHD failed
     if data is None and yf_available():
-        data = yf_build(ticker)
+        data = _try_provider("yfinance", yf_build, ticker)
 
     # 3. Fallback to FMP if yfinance also failed
     if data is None and fmp_available():
-        data = fmp_build(ticker)
+        data = _try_provider("fmp", fmp_build, ticker)
 
     # 4. Fallback to hardcoded sample for NKE/AAPL/TSLA
     if data is None and ticker in REGISTRY:

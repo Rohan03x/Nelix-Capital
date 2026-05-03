@@ -7,7 +7,10 @@ import pytest
 from openpyxl import load_workbook
 
 from webapp.data.ai_commentary import generate_commentary
+from webapp.data import eodhd_client
 from webapp.data import fmp_client
+from webapp.data import samples as samples_module
+from webapp.data import yfinance_client
 from webapp.data.eodhd_client import _derive_ebit_margin_target
 from webapp.data.excel_export import build_excel_bytes
 from webapp.data.samples import REGISTRY, _apply_overrides
@@ -158,6 +161,26 @@ def test_ai_commentary_uses_correct_premium_discount_wording() -> None:
 
     assert "premium to the current market price" in undervalued
     assert "discount to the current market price" in overvalued
+
+
+def test_get_dashboard_data_falls_through_when_provider_raises(monkeypatch) -> None:
+    fallback = copy.deepcopy(REGISTRY["NKE"])
+    fallback["data_source"] = "yfinance"
+
+    monkeypatch.setattr(eodhd_client, "is_available", lambda: True)
+    monkeypatch.setattr(
+        eodhd_client,
+        "build_dashboard_data",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    monkeypatch.setattr(yfinance_client, "is_available", lambda: True)
+    monkeypatch.setattr(yfinance_client, "build_dashboard_data", lambda _ticker: copy.deepcopy(fallback))
+    monkeypatch.setattr(fmp_client, "is_available", lambda: False)
+
+    data = samples_module.get_dashboard_data("CDI.PA")
+
+    assert data["data_source"] == "yfinance"
+    assert data["company_name"] == fallback["company_name"]
 
 
 def test_ebit_margin_target_respects_recent_profitable_regime_shift() -> None:
