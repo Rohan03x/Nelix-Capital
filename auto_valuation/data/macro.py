@@ -10,11 +10,16 @@ All rates as decimals (0.045 = 4.5%).
 from __future__ import annotations
 
 import json
+import logging
 import os
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 # ── FRED series mapping by currency (Part 46.3) ────────────────────────────────
 FRED_RF_SERIES: dict[str, str] = {
@@ -51,7 +56,28 @@ _SIZE_PREMIUM_TABLE: list[tuple[float, float]] = [
     (0,       0.060),   # nano-cap (Decile 10)
 ]
 
-_CACHE_DIR = Path(__file__).resolve().parent.parent.parent / ".damodaran_cache"
+def _resolve_cache_dir() -> Path | None:
+    candidates = [
+        Path(__file__).resolve().parent.parent.parent / ".damodaran_cache",
+        Path(tempfile.gettempdir()) / "nelix-capital-macro-cache",
+    ]
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except OSError:
+            continue
+    logger.warning("Damodaran disk cache disabled: no writable cache directory available.")
+    return None
+
+
+def _cache_path(filename: str) -> Path | None:
+    if _CACHE_DIR is None:
+        return None
+    return _CACHE_DIR / filename
+
+
+_CACHE_DIR = _resolve_cache_dir()
 _DAMODARAN_MAX_AGE_DAYS = 90
 
 
@@ -193,11 +219,10 @@ def fetch_damodaran_erp(
 
     Reference: Architecture Plan Part 4.3.
     """
-    cache_path = _CACHE_DIR / "damodaran_erp.json"
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = _cache_path("damodaran_erp.json")
 
     # Check cache
-    if cache_path.exists():
+    if cache_path is not None and cache_path.exists():
         try:
             with open(cache_path, encoding="utf-8") as fh:
                 cached = json.load(fh)
@@ -221,8 +246,9 @@ def fetch_damodaran_erp(
 
     # Persist to cache
     try:
-        with open(cache_path, "w", encoding="utf-8") as fh:
-            json.dump({"erp": erp_default, "fetched": datetime.now(timezone.utc).isoformat()}, fh)
+        if cache_path is not None:
+            with open(cache_path, "w", encoding="utf-8") as fh:
+                json.dump({"erp": erp_default, "fetched": datetime.now(timezone.utc).isoformat()}, fh)
     except Exception:
         pass
 
@@ -263,12 +289,11 @@ def fetch_damodaran_industry_beta(
         "Automotive":             0.80,
     }
 
-    cache_path = _CACHE_DIR / "damodaran_industry_betas.json"
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = _cache_path("damodaran_industry_betas.json")
 
     # Check cache for full table
     table = {}
-    if cache_path.exists():
+    if cache_path is not None and cache_path.exists():
         try:
             with open(cache_path, encoding="utf-8") as fh:
                 cached = json.load(fh)
@@ -283,8 +308,9 @@ def fetch_damodaran_industry_beta(
     if not table:
         table = _INDUSTRY_UNLEV_BETA
         try:
-            with open(cache_path, "w", encoding="utf-8") as fh:
-                json.dump({"betas": table, "fetched": datetime.now(timezone.utc).isoformat()}, fh)
+            if cache_path is not None:
+                with open(cache_path, "w", encoding="utf-8") as fh:
+                    json.dump({"betas": table, "fetched": datetime.now(timezone.utc).isoformat()}, fh)
         except Exception:
             pass
 

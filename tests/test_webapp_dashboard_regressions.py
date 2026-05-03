@@ -6,6 +6,7 @@ from io import BytesIO
 import pytest
 from openpyxl import load_workbook
 
+from auto_valuation.data import macro as macro_module
 from webapp.data.ai_commentary import generate_commentary
 from webapp.data import eodhd_client
 from webapp.data import fmp_client
@@ -131,6 +132,15 @@ def test_fmp_cached_reads_disk_cache(tmp_path, monkeypatch) -> None:
     fmp_client._CACHE.clear()
     second = fmp_client._cached("fred:dgs10", lambda: {"rate": 9.9})
     assert second == {"rate": 4.2}
+
+
+def test_dashboard_keeps_knowledge_model_when_macro_cache_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(macro_module, "_CACHE_DIR", None)
+
+    data = samples_module.get_dashboard_data("NKE")
+
+    assert data["knowledge_model"] is not None
+    assert data["knowledge_model"]["summary"].startswith("Weighted knowledge model active")
 
 
 def test_ai_commentary_uses_correct_premium_discount_wording() -> None:
