@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}DCF Valuation Engine{% endblock %}</title>
+  <meta name="description" content="Institutional-grade DCF valuation for any public company.">
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+
+  <!-- App CSS -->
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+
+  {% block head_extra %}{% endblock %}
+</head>
+<body>
+
+<!-- Top navigation -->
+<nav class="topnav">
+  <div class="topnav__inner">
+    <a href="{{ url_for('index') }}" class="topnav__brand">
+      <div class="topnav__brand-icon">Δ</div>
+      DCF Engine
+    </a>
+    {% if ticker_pill is defined and ticker_pill %}
+      <span class="topnav__ticker-pill">{{ ticker_pill }}</span>
+    {% endif %}
+    <div class="topnav__spacer"></div>
+    <div class="topnav__actions">
+      <button class="btn btn--ghost btn--sm btn--icon" id="themeToggle" title="Toggle theme" onclick="toggleTheme()">
+        <span id="themeIcon">☀</span>
+      </button>
+      <a href="{{ url_for('index') }}" class="btn btn--ghost btn--sm">New Valuation</a>
+    </div>
+  </div>
+</nav>
+
+{% block content %}{% endblock %}
+
+<!-- App JavaScript -->
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+{% block scripts %}{% endblock %}
+
+</body>
+</html>

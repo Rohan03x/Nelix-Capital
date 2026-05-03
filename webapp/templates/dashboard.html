@@ -1,0 +1,1467 @@
+{% extends "base.html" %}
+{% set ticker_pill = data.ticker %}
+{% block title %}{{ data.company_name }} ({{ data.ticker }}) — DCF Dashboard{% endblock %}
+
+{% block content %}
+{% set ccy = data.display_currency_symbol or data.currency_symbol or '$' %}
+{% set ccy_code = data.display_currency or data.currency or 'USD' %}
+{% macro money2(value) -%}{{ ccy }}{{ "{:,.2f}".format(value) }}{%- endmacro %}
+{% macro money1(value) -%}{{ ccy }}{{ "{:,.1f}".format(value) }}{%- endmacro %}
+{% macro money_m(value) -%}{{ ccy }}{{ "{:,.0f}".format(value) }}M{%- endmacro %}
+<div class="page-wrap">
+
+{# ── Demo banner ──────────────────────────────────────────────────────────── #}
+{% if data.is_demo %}
+<div class="demo-banner">⚠ {{ data.demo_note }}</div>
+{% endif %}
+
+{# ── Company header ───────────────────────────────────────────────────────── #}
+<div class="dash-header">
+  <div>
+    <div class="company-name">{{ data.company_name }}</div>
+    <div class="company-meta" style="margin-top:.35rem;">
+      <span class="badge badge-exchange">{{ data.exchange }}</span>
+      <span style="font-family:var(--font-mono);font-size:.8rem;font-weight:700;color:var(--text-primary);">{{ data.ticker }}</span>
+      <span class="badge badge-sector">{{ data.sector }}</span>
+      <span style="font-size:.73rem;color:var(--text-muted);">{{ data.industry }}</span>
+      {% if data.is_demo %}<span class="badge badge-demo">DEMO DATA</span>{% else %}<span class="badge badge-live">LIVE</span>{% endif %}
+    </div>
+    <p style="font-size:.75rem;color:var(--text-secondary);margin-top:.4rem;max-width:600px;line-height:1.55;">{{ data.description }}</p>
+  </div>
+  <div class="price-block">
+    <div class="price-main">{{ money2(data.price) }}</div>
+    <div class="price-date">as of {{ data.price_date }}</div>
+    {% if data.display_currency_note %}<div class="price-date">{{ data.display_currency_note }}</div>{% endif %}
+    {% if data.upside_pct >= 15 %}
+      <span class="rec-pill green">▲ BUY · +{{ "%.1f"|format(data.upside_pct) }}%</span>
+    {% elif data.upside_pct >= -10 %}
+      <span class="rec-pill amber">≈ HOLD · {{ "%.1f"|format(data.upside_pct) }}%</span>
+    {% else %}
+      <span class="rec-pill red">▼ SELL · {{ "%.1f"|format(data.upside_pct) }}%</span>
+    {% endif %}
+    <button class="btn btn-outline" style="margin-top:.6rem;" onclick="addWatchlistFromButton(this)" data-watchlist-item='{{ {"ticker": data.ticker, "company_name": data.company_name, "exchange": data.exchange, "sector": data.sector, "industry": data.industry}|tojson|forceescape }}'>+ Track In Global Brain</button>
+  </div>
+</div>
+
+{# ── 8-card KPI strip ─────────────────────────────────────────────────────── #}
+<div class="kpi-grid" style="grid-template-columns:repeat(auto-fill,minmax(130px,1fr));margin-bottom:1rem;">
+  <div class="kpi-card accent">
+    <div class="kpi-label">Market Price</div>
+    <div class="kpi-value">{{ money2(data.price) }}</div>
+    <div class="kpi-sub">{{ data.price_date }}</div>
+  </div>
+  <div class="kpi-card {% if data.upside_pct >= 0 %}green{% else %}red{% endif %}">
+    <div class="kpi-label">Intrinsic Value</div>
+    <div class="kpi-value {% if data.upside_pct >= 0 %}green{% else %}red{% endif %}" id="kpiIV">{{ money2(data.intrinsic_value) }}</div>
+    <div class="kpi-sub">DCF base case</div>
+  </div>
+  <div class="kpi-card {% if data.upside_pct >= 0 %}green{% else %}red{% endif %}">
+    <div class="kpi-label">Upside / Downside</div>
+    <div class="kpi-value {% if data.upside_pct >= 0 %}green{% else %}red{% endif %}" id="kpiUpside">{% if data.upside_pct >= 0 %}+{% endif %}{{ "%.1f"|format(data.upside_pct) }}%</div>
+    <div class="kpi-sub">vs. market price</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">Recommendation</div>
+    <div style="margin-top:4px;" id="kpiRec">
+      <span class="rec-pill {{ data.recommendation_class }}">{{ data.recommendation }}</span>
+    </div>
+    <div class="kpi-sub">DCF signal</div>
+  </div>
+  <div class="kpi-card {% if data.confidence_score >= 70 %}green{% elif data.confidence_score >= 50 %}amber{% else %}red{% endif %}">
+    <div class="kpi-label">Confidence</div>
+    <div class="kpi-value {% if data.confidence_score >= 70 %}green{% elif data.confidence_score >= 50 %}amber{% else %}red{% endif %}">{{ data.confidence_score }}/100</div>
+    <div class="kpi-sub">model quality</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">WACC</div>
+    <div class="kpi-value" id="dcfWaccKpi">{{ data.wacc }}%</div>
+    <div class="kpi-sub">cost of capital</div>
+  </div>
+  <div class="kpi-card {% if data.tv_pct > 75 %}red{% elif data.tv_pct > 60 %}amber{% else %}green{% endif %}">
+    <div class="kpi-label">TV % of EV</div>
+    <div class="kpi-value {% if data.tv_pct > 75 %}red{% elif data.tv_pct > 60 %}amber{% else %}green{% endif %}" id="dcfTvPctKpi">{{ "%.1f"|format(data.tv_pct) }}%</div>
+    <div class="kpi-sub">terminal value wt.</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">Market Cap</div>
+    <div class="kpi-value">{{ money_m(data.market_cap) }}</div>
+    <div class="kpi-sub">{{ data.exchange }}</div>
+  </div>
+</div>
+
+{# ── Confidence widget ─────────────────────────────────────────────────────── #}
+{% if data.confidence_breakdown %}
+<div class="confidence-widget">
+  <div class="conf-gauge-wrap">
+    <canvas id="confGaugeChart"></canvas>
+    <div class="conf-gauge-center">
+      <div class="conf-score-number {% if data.confidence_breakdown.color == 'green' %}text-green{% elif data.confidence_breakdown.color == 'amber' %}text-amber{% else %}text-red{% endif %}">{{ data.confidence_breakdown.total }}</div>
+      <div class="conf-score-label">/100</div>
+    </div>
+  </div>
+  <div class="conf-details">
+    <div class="conf-grade-line">
+      <span class="conf-grade {{ data.confidence_breakdown.grade }}">{{ data.confidence_breakdown.grade }}</span>
+      <span class="conf-label">{{ data.confidence_breakdown.label }}</span>
+    </div>
+    <div class="conf-bars">
+      {% for dim in data.confidence_breakdown.dimensions %}
+      <div class="conf-bar-row">
+        <div class="conf-bar-name" data-tooltip="{{ dim.comment }}">{{ dim.name }}</div>
+        <div class="conf-bar-track"><div class="conf-bar-fill {{ dim.status }}" style="width:{{ dim.pct }}%"></div></div>
+        <div class="conf-bar-score">{{ dim.score }}/{{ dim.max_points }}</div>
+      </div>
+      {% endfor %}
+    </div>
+    {% if data.confidence_breakdown.warnings %}
+    <div class="conf-warning-list">
+      {% for w in data.confidence_breakdown.warnings[:3] %}
+      <div class="conf-warning">⚠ {{ w }}</div>
+      {% endfor %}
+    </div>
+    {% endif %}
+    {% if not data.confidence_breakdown.dcf_suitable %}
+    <div class="conf-unsuitable">⛔ {{ data.confidence_breakdown.suitability_note }}</div>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+
+{# ── Tab bar ───────────────────────────────────────────────────────────────── #}
+<div class="tab-bar" id="tabBar">
+  <button class="tab-btn active"  onclick="switchTab('overview')">Overview</button>
+  <button class="tab-btn"         onclick="switchTab('memo')">Investment Memo</button>
+  <button class="tab-btn"         onclick="switchTab('dcf')">DCF Model</button>
+  <button class="tab-btn"         onclick="switchTab('sensitivity')">Sensitivity</button>
+  <button class="tab-btn"         onclick="switchTab('mktexp')">Market Expectations</button>
+  <button class="tab-btn"         onclick="switchTab('historical')">Historical</button>
+  <button class="tab-btn"         onclick="switchTab('comps')">Comps</button>
+  <button class="tab-btn"         onclick="switchTab('risk')">Risk Radar</button>
+  <button class="tab-btn"         onclick="switchTab('assumptions')">Assumptions</button>
+  <button class="tab-btn"         onclick="switchTab('export')">Export</button>
+</div>
+
+{# ══════════════════════════════════════════════════════════════════════════ #}
+{# TAB 1 — OVERVIEW                                                          #}
+{# ══════════════════════════════════════════════════════════════════════════ #}
+<div class="tab-pane active" id="tab-overview">
+
+  <div class="section-title">Scenario Analysis</div>
+  <div class="scenarios-grid" style="margin-bottom:1rem;">
+    {% for key, sc in data.scenarios.items() %}
+    <div class="scenario-card {{ key }}">
+      <div class="scenario-label">{{ sc.label }}</div>
+      <div class="scenario-iv {% if sc.upside >= 0 %}text-green{% else %}text-red{% endif %}">{{ money2(sc.iv) }}</div>
+      <div class="scenario-upside {% if sc.upside >= 0 %}text-green{% else %}text-red{% endif %}">{% if sc.upside >= 0 %}+{% endif %}{{ "%.1f"|format(sc.upside) }}% vs market</div>
+      <div class="scenario-params">WACC {{ sc.wacc }}% · g {{ sc.g }}% · Margin {{ sc.margin_target }}%</div>
+      {% if sc.get('narrative') %}<div class="scenario-narrative">{{ sc.narrative }}</div>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+
+  <div class="section-title">Key Insights</div>
+  <div class="insights-grid" style="margin-bottom:1rem;">
+    {% for card in data.insights %}
+    <div class="insight-card {{ card.status }}">
+      <div class="insight-header">
+        <span class="insight-icon">{{ card.icon }}</span>
+        <span class="insight-category">{{ card.category }}</span>
+      </div>
+      <div class="insight-headline">{{ card.headline }}</div>
+      <div class="insight-body">{{ card.body }}</div>
+    </div>
+    {% endfor %}
+  </div>
+
+  {% if data.analyst_consensus %}
+  {% set cons = data.analyst_consensus %}
+  {% set cons_total = (cons.buy_count or 0) + (cons.hold_count or 0) + (cons.sell_count or 0) %}
+  <div class="section-title">Analyst Consensus</div>
+  <div class="analyst-consensus-section">
+    <div class="consensus-counts">
+      <div class="consensus-count-item">
+        <div class="consensus-count-num buy">{{ cons.buy_count or 0 }}</div>
+        <div class="consensus-count-label">Buy</div>
+      </div>
+      <div class="consensus-count-item">
+        <div class="consensus-count-num hold">{{ cons.hold_count or 0 }}</div>
+        <div class="consensus-count-label">Hold</div>
+      </div>
+      <div class="consensus-count-item">
+        <div class="consensus-count-num sell">{{ cons.sell_count or 0 }}</div>
+        <div class="consensus-count-label">Sell</div>
+      </div>
+      {% if cons.mean_target %}
+      <div class="consensus-count-item" style="margin-left:1rem;border-left:1px solid var(--border);padding-left:1rem;">
+        <div class="consensus-count-num" style="font-size:1.2rem;color:var(--text-primary);">{{ money2(cons.mean_target) }}</div>
+        <div class="consensus-count-label">Mean Target</div>
+      </div>
+      {% endif %}
+      {% if cons.revenue_y1_consensus and cons.revenue_y1_model %}
+      <div class="consensus-count-item" style="margin-left:1rem;border-left:1px solid var(--border);padding-left:1rem;">
+        <div style="font-size:.75rem;color:var(--text-secondary);">
+          Y+1 Rev — Model: <strong>{{ money_m(cons.revenue_y1_model) }}</strong> vs.
+          Consensus: <strong>{{ money_m(cons.revenue_y1_consensus) }}</strong>
+          <span class="{% if cons.revenue_y1_model >= cons.revenue_y1_consensus %}text-green{% else %}text-red{% endif %}">
+            ({{ "%.1f"|format((cons.revenue_y1_model - cons.revenue_y1_consensus) / cons.revenue_y1_consensus * 100) }}%)
+          </span>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+    {% if cons_total > 0 %}
+    <div class="consensus-bar-wrap">
+      <div class="consensus-bar-buy"  style="width:{{ "%.0f"|format(cons.buy_count / cons_total * 100) }}%"></div>
+      <div class="consensus-bar-hold" style="width:{{ "%.0f"|format(cons.hold_count / cons_total * 100) }}%"></div>
+      <div class="consensus-bar-sell" style="width:{{ "%.0f"|format(cons.sell_count / cons_total * 100) }}%"></div>
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <div class="section-title">AI Analyst Commentary</div>
+  {% set ac = data.get('ai_commentary') or {} %}
+  <div class="ai-commentary-block" style="margin-bottom:1rem;">
+    <div class="ai-commentary-header">
+      <span class="ai-badge">AI Commentary</span>
+      <span class="ai-commentary-title">Rule-based analyst synthesis — no hallucination, pure model logic</span>
+    </div>
+    <div class="grid-2" style="gap:0.75rem;">
+      <div>
+        <div class="ai-commentary-section">
+          <div class="ai-commentary-section-label">Valuation Summary</div>
+          <div class="ai-commentary-text">{{ ac.get('valuation_summary') or data.analyst_view.valuation_says }}</div>
+        </div>
+        <div class="ai-commentary-section">
+          <div class="ai-commentary-section-label">WACC Commentary</div>
+          <div class="ai-commentary-text">{{ ac.get('wacc_commentary') or data.analyst_view.key_assumptions }}</div>
+        </div>
+        <div class="ai-commentary-section">
+          <div class="ai-commentary-section-label">Why Market Disagrees</div>
+          <div class="ai-commentary-text">{{ ac.get('why_market_disagrees') or data.analyst_view.model_risks }}</div>
+        </div>
+        {% if ac.get('earnings_quality_note') %}
+        <div class="ai-commentary-section">
+          <div class="ai-commentary-section-label">Earnings Quality</div>
+          <div class="ai-commentary-text">{{ ac.earnings_quality_note }}</div>
+        </div>
+        {% endif %}
+      </div>
+      <div>
+        <div class="ai-commentary-section">
+          <div class="ai-commentary-section-label">⚠ Where The Model Could Be Wrong</div>
+          <ul class="ai-where-wrong-list">
+            {% set wrong_list = ac.get('where_wrong') or data.analyst_view.verify_before_use %}
+            {% for item in wrong_list %}
+            <li>{{ item }}</li>
+            {% endfor %}
+          </ul>
+        </div>
+        <div class="ai-commentary-section" style="margin-top:.6rem;">
+          <div class="ai-commentary-section-label">✓ Verify Before Use</div>
+          <ul class="ai-where-wrong-list">
+            {% set checklist = ac.get('verify_checklist') or data.analyst_view.verify_before_use %}
+            {% for item in checklist %}
+            <li>{{ item }}</li>
+            {% endfor %}
+          </ul>
+        </div>
+        {% if ac.get('consensus_delta_note') %}
+        <div class="ai-commentary-section" style="margin-top:.6rem;">
+          <div class="ai-commentary-section-label">Analyst Consensus Delta</div>
+          <div class="ai-commentary-text">{{ ac.consensus_delta_note }}</div>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+</div>
+
+{# ══════════════════════════════════════════════════════════════════════════ #}
+{# TAB 2 — INVESTMENT MEMO                                                   #}
+{# ══════════════════════════════════════════════════════════════════════════ #}
+<div class="tab-pane" id="tab-memo">
+
+  <div class="memo-verdict">
+    {% if data.upside_pct >= 15 %}
+      <span class="memo-verdict-badge green">BUY</span>
+      <div class="memo-verdict-text">Our DCF model values {{ data.company_name }} at <strong>{{ money2(data.intrinsic_value) }}/share</strong>, representing a <strong class="text-green">+{{ "%.1f"|format(data.upside_pct) }}%</strong> upside to the current market price of {{ money2(data.price) }}. At WACC={{ data.wacc }}% and terminal g={{ data.terminal_growth }}%, the stock appears undervalued on a fundamental basis.</div>
+    {% elif data.upside_pct >= -10 %}
+      <span class="memo-verdict-badge amber">HOLD</span>
+      <div class="memo-verdict-text">Our DCF model values {{ data.company_name }} at <strong>{{ money2(data.intrinsic_value) }}/share</strong>, broadly in line with the current price of {{ money2(data.price) }} ({{ "%.1f"|format(data.upside_pct) }}% spread). The stock appears fairly valued; no catalyst-driven entry point at current levels.</div>
+    {% else %}
+      <span class="memo-verdict-badge red">SELL</span>
+      <div class="memo-verdict-text">Our DCF model values {{ data.company_name }} at <strong>{{ money2(data.intrinsic_value) }}/share</strong>, representing a <strong class="text-red">{{ "%.1f"|format(data.upside_pct) }}%</strong> downside to the current market price of {{ money2(data.price) }}. On a fundamental DCF basis, the stock appears overvalued.</div>
+    {% endif %}
+  </div>
+
+  <div class="memo-section">
+    <div class="memo-section-title">Investment Thesis</div>
+    <div class="memo-text">{{ data.analyst_view.valuation_says }}</div>
+    <div class="memo-drivers" style="margin-top:.6rem;">
+      <div class="memo-driver-item">Revenue CAGR forecast: {{ data.forecast[0].revenue > 0 and "%.1f"|format(((data.forecast[-1].revenue / data.forecast[0].revenue) ** (1/7) - 1) * 100) or 'N/A' }}% over 7 years (Y1→Y7)</div>
+      <div class="memo-driver-item">EBIT margin expansion: {{ "%.1f"|format(data.forecast[0].ebit_m) }}% → {{ "%.1f"|format(data.forecast[-1].ebit_m) }}% by Year 7</div>
+      <div class="memo-driver-item">Terminal value = {{ "%.1f"|format(data.tv_pct) }}% of enterprise value — {% if data.tv_pct > 70 %}concentrated risk{% else %}within acceptable range{% endif %}</div>
+      <div class="memo-driver-item">WACC–g spread: {{ "%.1f"|format(data.wacc - data.terminal_growth) }}% ({{ "healthy" if (data.wacc - data.terminal_growth) >= 3 else "tight" }})</div>
+    </div>
+  </div>
+
+  <div class="memo-section">
+    <div class="memo-section-title">Scenario Outcomes</div>
+    <div class="memo-case-grid">
+      <div class="memo-case bull">
+        <div class="memo-case-label">Bull Case</div>
+        <div class="memo-case-iv text-green">{{ money2(data.scenarios.bull.iv) }}</div>
+        <div class="memo-case-upside text-green">+{{ "%.1f"|format(data.scenarios.bull.upside) }}% upside</div>
+        <div class="memo-case-text">WACC={{ data.scenarios.bull.wacc }}%, g={{ data.scenarios.bull.g }}%, Margin={{ data.scenarios.bull.margin_target }}%<br>{% if data.scenarios.bull.get('narrative') %}{{ data.scenarios.bull.narrative }}{% endif %}</div>
+      </div>
+      <div class="memo-case bear">
+        <div class="memo-case-label">Bear Case</div>
+        <div class="memo-case-iv text-red">{{ money2(data.scenarios.bear.iv) }}</div>
+        <div class="memo-case-upside text-red">{{ "%.1f"|format(data.scenarios.bear.upside) }}% downside</div>
+        <div class="memo-case-text">WACC={{ data.scenarios.bear.wacc }}%, g={{ data.scenarios.bear.g }}%, Margin={{ data.scenarios.bear.margin_target }}%<br>{% if data.scenarios.bear.get('narrative') %}{{ data.scenarios.bear.narrative }}{% endif %}</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="memo-section">
+    <div class="memo-section-title">Key Risks</div>
+    <div class="memo-text">{{ data.analyst_view.model_risks }}</div>
+  </div>
+
+  <div class="memo-section">
+    <div class="memo-section-title">Model Quality</div>
+    <div class="memo-text" style="margin-bottom:.5rem;">Confidence score: <strong>{{ data.confidence_score }}/100</strong>{% if data.confidence_breakdown %} ({{ data.confidence_breakdown.label }}){% endif %}. This model {% if data.confidence_score >= 70 %}meets institutional quality standards{% elif data.confidence_score >= 50 %}meets basic quality standards but has limitations noted below{% else %}has significant limitations and should not be used as a sole basis for investment decisions{% endif %}.</div>
+    <ul class="memo-verify-list">
+      {% for item in data.analyst_view.verify_before_use %}
+      <li><span class="check-icon">→</span>{{ item }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+
+  <div class="memo-section">
+    <div class="memo-section-title">Comparable Valuation Context</div>
+    <div class="memo-text">
+      {% if data.peer_median and data.peer_median.get('ev_ebitda') %}Peer group median EV/EBITDA: {{ "%.1f"|format(data.peer_median.ev_ebitda) }}× · EV/EBIT: {% if data.peer_median.ev_ebit %}{{ "%.1f"|format(data.peer_median.ev_ebit) }}×{% else %}N/M{% endif %} · P/E: {% if data.peer_median.pe %}{{ "%.1f"|format(data.peer_median.pe) }}×{% else %}N/M{% endif %}.{% else %}Peer comparable data unavailable (no peer set configured).{% endif %}
+      52-week trading range: {{ money2(data.fifty_two_week_low) }} – {{ money2(data.fifty_two_week_high) }}.
+      Analyst target range: {{ money2(data.analyst_low) }} – {{ money2(data.analyst_high) }}.
+    </div>
+  </div>
+
+</div>
+
+{# ══════════════════════════════════════════════════════════════════════════ #}
+{# TAB 3 — DCF MODEL                                                         #}
+{# ══════════════════════════════════════════════════════════════════════════ #}
+<div class="tab-pane" id="tab-dcf">
+
+  <div class="section-title">Enterprise Value Bridge</div>
+  <div class="ev-bridge" style="margin-bottom:1rem;">
+    <div class="bridge-item">
+      <div class="bridge-sign">+</div>
+      <div class="bridge-value">{{ money_m(data.pv_ufcfs) }}</div>
+      <div class="bridge-label">PV of UFCFs</div>
+      <div style="font-size:.65rem;color:var(--text-muted);">{{ "%.1f"|format(100 - data.tv_pct) }}% of EV</div>
+    </div>
+    <div class="bridge-item">
+      <div class="bridge-sign">+</div>
+      <div class="bridge-value" id="bridgePvTV">{{ money_m(data.pv_terminal) }}</div>
+      <div class="bridge-label">PV of Terminal Value</div>
+      <div style="font-size:.65rem;color:var(--text-muted);" id="bridgeTvPct">{{ "%.1f"|format(data.tv_pct) }}% of EV</div>
+    </div>
+    <div class="bridge-item" style="border-color:var(--accent);">
+      <div class="bridge-sign">=</div>
+      <div class="bridge-value" id="bridgeEV">{{ money_m(data.enterprise_value) }}</div>
+      <div class="bridge-label">Enterprise Value</div>
+    </div>
+    <div class="bridge-item">
+      <div class="bridge-sign">−</div>
+      <div class="bridge-value">{{ money_m(data.net_debt) }}</div>
+      <div class="bridge-label">Net Debt</div>
+    </div>
+    <div class="bridge-item">
+      <div class="bridge-sign">=</div>
+      <div class="bridge-value" id="bridgeEquity">{{ money_m(data.equity_value) }}</div>
+      <div class="bridge-label">Equity Value</div>
+    </div>
+    <div class="bridge-item">
+      <div class="bridge-sign">÷</div>
+      <div class="bridge-value">{{ "{:,.0f}".format(data.diluted_shares) }}M</div>
+      <div class="bridge-label">Diluted Shares</div>
+    </div>
+    <div class="bridge-item" style="border-color:var(--accent);">
+      <div class="bridge-sign">=</div>
+      <div class="bridge-value text-accent" id="bridgeIV">{{ money2(data.intrinsic_value) }}</div>
+      <div class="bridge-label">Intrinsic Value / Share</div>
+    </div>
+  </div>
+
+  <div class="grid-2" style="margin-bottom:1rem;">
+    <div class="card">
+      <div class="card-header"><span class="card-title">EV Composition</span></div>
+      <div class="card-body"><div class="chart-wrap-sm"><canvas id="tvDonutChart"></canvas></div></div>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-title">DCF Parameters</span></div>
+      <div class="card-body">
+        <div class="wacc-grid">
+          <div class="wacc-item">
+            <div class="wacc-component">WACC</div>
+            <div class="wacc-value" id="dcfWacc">{{ data.wacc }}%</div>
+            <div class="wacc-formula">discount rate</div>
+          </div>
+          <div class="wacc-item">
+            <div class="wacc-component">Terminal g</div>
+            <div class="wacc-value" id="dcfG">{{ data.terminal_growth }}%</div>
+            <div class="wacc-formula">perpetuity growth</div>
+          </div>
+          <div class="wacc-item">
+            <div class="wacc-component">WACC − g Spread</div>
+            <div class="wacc-value">{{ "%.1f"|format(data.wacc - data.terminal_growth) }}%</div>
+            <div class="wacc-formula">{{ "adequate" if (data.wacc - data.terminal_growth) >= 3 else "tight" }}</div>
+          </div>
+          <div class="wacc-item">
+            <div class="wacc-component">TV % of EV</div>
+            <div class="wacc-value {% if data.tv_pct > 75 %}text-red{% elif data.tv_pct > 60 %}text-amber{% else %}text-green{% endif %}" id="dcfTvPct">{{ "%.1f"|format(data.tv_pct) }}%</div>
+            <div class="wacc-formula">terminal concentration</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-title">7-Year UFCF Forecast Schedule</div>
+  <div class="data-table-wrap" style="margin-bottom:1rem;">
+    <table id="forecastTable">
+      <thead>
+        <tr>
+          <th>Year</th><th>Revenue ({{ ccy_code }} M)</th><th>EBIT Margin</th><th>EBIT ({{ ccy_code }} M)</th>
+          <th>NOPAT ({{ ccy_code }} M)</th><th>D&amp;A ({{ ccy_code }} M)</th><th>SBC ({{ ccy_code }} M)</th>
+          <th>CapEx ({{ ccy_code }} M)</th><th>ΔNWC ({{ ccy_code }} M)</th><th>UFCF ({{ ccy_code }} M)</th>
+          <th>Disc. Factor</th><th>PV ({{ ccy_code }} M)</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in data.forecast %}
+        <tr>
+          <td>{{ row.year }}</td>
+          <td>{{ "{:,.0f}".format(row.revenue) }}</td>
+          <td>{{ "%.1f"|format(row.ebit_m) }}%</td>
+          <td>{{ "{:,.0f}".format(row.ebit) }}</td>
+          <td>{{ "{:,.0f}".format(row.nopat) }}</td>
+          <td>{{ "{:,.0f}".format(row.da) }}</td>
+          <td>{{ "{:,.0f}".format(row.sbc) }}</td>
+          <td>({{ "{:,.0f}".format(row.capex) }})</td>
+          <td>({{ "{:,.0f}".format(row.d_nowc) }})</td>
+          <td style="font-weight:700;">{{ "{:,.0f}".format(row.ufcf) }}</td>
+          <td>{{ "%.4f"|format(row.df) }}</td>
+          <td style="font-weight:700;">{{ "{:,.0f}".format(row.pv) }}</td>
+        </tr>
+        {% endfor %}
+        <tr style="background:var(--bg-secondary);font-weight:700;">
+          <td>Total PV UFCFs</td><td colspan="10"></td>
+          <td>{{ money_m(data.pv_ufcfs) }}</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="section-title">WACC Decomposition</div>
+  <div class="grid-2" style="margin-bottom:1rem;">
+    <div class="card">
+      <div class="card-header"><span class="card-title">Equity Component</span></div>
+      <div class="card-body">
+        <table>
+          <tbody>
+            <tr><td>Risk-Free Rate (Rf)</td><td>{{ data.risk_free_rate }}%</td></tr>
+            <tr><td>Levered Beta (β)</td><td>{{ data.beta }}×</td></tr>
+            <tr><td>Equity Risk Premium (ERP)</td><td>{{ data.erp }}%</td></tr>
+            <tr><td>Size / Alpha Premium</td><td>{{ data.size_premium }}%</td></tr>
+            <tr style="font-weight:700;color:var(--text-primary);"><td>Cost of Equity (Ke)</td><td>{{ data.cost_of_equity }}%</td></tr>
+            <tr><td>Equity Weight</td><td>{{ data.equity_weight }}%</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-title">Debt Component</span></div>
+      <div class="card-body">
+        <table>
+          <tbody>
+            <tr><td>Pre-Tax Cost of Debt (Kd)</td><td>{{ data.cost_of_debt_pre }}%</td></tr>
+            <tr><td>Tax Rate</td><td>{{ data.tax_rate }}%</td></tr>
+            <tr><td>After-Tax Cost of Debt</td><td>{{ "%.1f"|format(data.cost_of_debt_post) }}%</td></tr>
+            <tr><td>Debt Weight</td><td>{{ data.debt_weight }}%</td></tr>
+            <tr style="font-weight:700;color:var(--text-primary);"><td>WACC</td><td>{{ data.wacc }}%</td></tr>
+            <tr><td>Terminal Growth (g)</td><td>{{ data.terminal_growth }}%</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+{# ══════════════════════════════════════════════════════════════════════════ #}
+{# TAB 4 — SENSITIVITY                                                       #}
+{# ══════════════════════════════════════════════════════════════════════════ #}
+<div class="tab-pane" id="tab-sensitivity">
+
+  <div class="section-title">WACC vs. Terminal Growth — Intrinsic Value per Share</div>
+  <div class="data-table-wrap" style="margin-bottom:1rem;">
+    <table class="sensitivity-table" id="sensitivityTable">
+      <thead>
+        <tr>
+          <th style="text-align:right;color:var(--text-muted);font-size:.68rem;">g ↓ / WACC →</th>
+          {% for lbl in data.sensitivity.wacc_labels %}<th>{{ lbl }}</th>{% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for i, g_lbl in enumerate(data.sensitivity.g_labels) %}
+        <tr>
+          <td style="text-align:right;font-family:var(--font-mono);">{{ g_lbl }}</td>
+          {% for j, val in enumerate(data.sensitivity.iv_grid[i]) %}
+          <td {% if i == data.sensitivity.base_g_idx and j == data.sensitivity.base_wacc_idx %}class="base-cell"{% endif %} data-val="{{ val }}">
+            {% if val is not none %}{{ money1(val) }}{% else %}—{% endif %}
+          </td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="section-desc" style="margin-bottom:1rem;">
+    Base case (WACC={{ data.wacc }}%, g={{ data.terminal_growth }}%) → IV = <strong>{{ money2(data.intrinsic_value) }}</strong>.
+    A 50bp WACC increase reduces IV by approx. <strong>{{ ccy }}{{ "%.0f"|format(data.intrinsic_value * 0.08) }}/share</strong>.
+    The stock currently trades at <strong>{{ money2(data.price) }}</strong>
+    ({% if data.upside_pct >= 0 %}<span class="text-green">+{{ "%.1f"|format(data.upside_pct) }}% upside</span>{% else %}<span class="text-red">{{ "%.1f"|format(data.upside_pct) }}% downside</span>{% endif %}).
+  </div>
+
+  <div class="section-title">Scenario Comparison</div>
+  <div class="scenarios-grid">
+    {% for key, sc in data.scenarios.items() %}
+    <div class="scenario-card {{ key }}">
+      <div class="scenario-label">{{ sc.label }}</div>
+      <div class="scenario-iv {% if sc.upside >= 0 %}text-green{% else %}text-red{% endif %}">{{ money2(sc.iv) }}</div>
+      <div class="scenario-upside {% if sc.upside >= 0 %}text-green{% else %}text-red{% endif %}">{% if sc.upside >= 0 %}+{% endif %}{{ "%.1f"|format(sc.upside) }}%</div>
+      <div class="scenario-params">WACC {{ sc.wacc }}% · g {{ sc.g }}%</div>
+    </div>
+    {% endfor %}
+  </div>
+
+</div>
+
+{# ══════════════════════════════════════════════════════════════════════════ #}
+{# TAB 5 — MARKET EXPECTATIONS / REVERSE DCF                                #}
+{# ══════════════════════════════════════════════════════════════════════════ #}
+<div class="tab-pane" id="tab-mktexp">
+
+  <div class="section-title">Reverse DCF — What Growth Is The Market Pricing In?</div>
+
+  {% if data.reverse_dcf %}
+  {% set rdcf = data.reverse_dcf %}
+  <div class="rdcf-grid" style="margin-bottom:1rem;">
+    <div class="rdcf-item">
+      <div class="rdcf-label">Market-Implied g</div>
+      <div class="rdcf-value {% if rdcf.implied_g < rdcf.model_g %}text-green{% else %}text-red{% endif %}">{{ "%.2f"|format(rdcf.implied_g) }}%</div>
+      <div class="rdcf-sub">at current price {{ money2(rdcf.price) }}</div>
+    </div>
+    <div class="rdcf-item">
+      <div class="rdcf-label">Model Base-Case g</div>
+      <div class="rdcf-value">{{ "%.2f"|format(rdcf.model_g) }}%</div>
+      <div class="rdcf-sub">our DCF assumption</div>
+    </div>
+    <div class="rdcf-item">
+      <div class="rdcf-label">Spread (Model − Market)</div>
+      <div class="rdcf-value {% if rdcf.g_spread_bps > 0 %}text-green{% else %}text-red{% endif %}">{{ rdcf.g_spread_bps }}bps</div>
+      <div class="rdcf-sub">{% if rdcf.g_spread_bps > 0 %}market underestimates growth{% else %}market prices in more growth{% endif %}</div>
+    </div>
+    <div class="rdcf-item">
+      <div class="rdcf-label">Implied WACC</div>
+      <div class="rdcf-value">{{ "%.2f"|format(rdcf.implied_wacc) }}%</div>
+      <div class="rdcf-sub">g fixed at model {{ rdcf.model_g }}%</div>
+    </div>
+    <div class="rdcf-item">
+      <div class="rdcf-label">Model WACC</div>
+      <div class="rdcf-value">{{ "%.2f"|format(rdcf.model_wacc) }}%</div>
+      <div class="rdcf-sub">base CAPM estimate</div>
+    </div>
+  </div>
+
+  <div class="rdcf-narrative" style="margin-bottom:1rem;">{{ rdcf.narrative }}</div>
+
+  <div class="section-title">Reverse DCF Sensitivity — IV vs. Terminal Growth</div>
+  <div class="card" style="margin-bottom:1rem;">
+    <div class="card-body"><div class="chart-wrap"><canvas id="rdcfSensChart"></canvas></div></div>
+  </div>
+
+  {% else %}
+  <div class="section-desc">Reverse DCF data not available for this ticker. Enrichment may have failed silently.</div>
+  {% endif %}
+
+  <div class="section-title">Price Ladder — Valuation Anchors</div>
+  <div class="price-ladder" style="margin-bottom:1rem;">
+    <div class="price-ladder-item">
+      <div class="pli-label">52-Wk Low</div>
+      <div class="pli-value">{{ money2(data.fifty_two_week_low) }}</div>
+    </div>
+    <div class="price-ladder-item {% if data.price <= data.fifty_two_week_high and data.price >= data.fifty_two_week_low %}pli-current{% endif %}">
+      <div class="pli-label">Current Price</div>
+      <div class="pli-value text-accent">{{ money2(data.price) }}</div>
+    </div>
+    <div class="price-ladder-item">
+      <div class="pli-label">52-Wk High</div>
+      <div class="pli-value">{{ money2(data.fifty_two_week_high) }}</div>
+    </div>
+    <div class="price-ladder-item">
+      <div class="pli-label">Analyst Low</div>
+      <div class="pli-value">{{ money2(data.analyst_low) }}</div>
+    </div>
+    <div class="price-ladder-item">
+      <div class="pli-label">Analyst Median</div>
+      <div class="pli-value">{{ money2(data.analyst_median) }}</div>
+    </div>
+    <div class="price-ladder-item">
+      <div class="pli-label">Analyst High</div>
+      <div class="pli-value">{{ money2(data.analyst_high) }}</div>
+    </div>
+    <div class="price-ladder-item">
+      <div class="pli-label">DCF Bear</div>
+      <div class="pli-value text-red">{{ money2(data.scenarios.bear.iv) }}</div>
+    </div>
+    <div class="price-ladder-item" style="border-color:var(--accent);">
+      <div class="pli-label">DCF Base</div>
+      <div class="pli-value text-accent">{{ money2(data.intrinsic_value) }}</div>
+    </div>
+    <div class="price-ladder-item">
+      <div class="pli-label">DCF Bull</div>
+      <div class="pli-value text-green">{{ money2(data.scenarios.bull.iv) }}</div>
+    </div>
+  </div>
+
+  <div class="section-title">Football Field — Valuation Range</div>
+  <div class="card">
+    <div class="card-body"><div class="chart-wrap-tall"><canvas id="footballChart"></canvas></div></div>
+    <div style="padding:.5rem 1rem;font-size:.72rem;color:var(--text-secondary);border-top:1px solid var(--border);">
+      DCF base IV {{ money2(data.intrinsic_value) }} vs. 52-week range {{ money2(data.fifty_two_week_low) }}–{{ money2(data.fifty_two_week_high) }}.
+      Current price <strong>{{ money2(data.price) }}</strong> shown as dashed red line.
+    </div>
+  </div>
+
+  {% set ac = data.get('ai_commentary') or {} %}
+  {% if ac.get('why_market_disagrees') %}
+  <div class="section-title" style="margin-top:1rem;">Why the Market and Model Disagree</div>
+  <div class="why-disagrees-block">
+    <div class="why-disagrees-title">Analysis of the Price–IV Gap</div>
+    <div class="why-disagrees-text">{{ ac.why_market_disagrees }}</div>
+  </div>
+  {% endif %}
+
+</div>
+
+{# ══════════════════════════════════════════════════════════════════════════ #}
+{# TAB 6 — HISTORICAL                                                        #}
+{# ══════════════════════════════════════════════════════════════════════════ #}
+<div class="tab-pane" id="tab-historical">
+
+  <div class="section-title">10-Year Historical Performance</div>
+
+  <div class="grid-2" style="margin-bottom:1rem;">
+    <div class="card">
+      <div class="card-header"><span class="card-title">Revenue ({{ ccy_code }} M)</span></div>
+      <div class="card-body">
+        <div class="chart-wrap"><canvas id="revenueChart"></canvas></div>
+        <div class="section-desc" style="margin-top:.5rem;">
+          Revenue grew from {{ money_m(data.historical.revenue[0]) }} ({{ data.historical.years[0] }})
+          to {{ money_m(data.historical.revenue[-1]) }} ({{ data.historical.years[-1] }}),
+          {% set _n_yrs = data.historical.years|length - 1 %}
+          {% if _n_yrs > 0 and data.historical.revenue[0] > 0 %}a {{ "%.1f"|format(((data.historical.revenue[-1] / data.historical.revenue[0]) ** (1 / _n_yrs) - 1) * 100) }}% {{ _n_yrs }}-yr CAGR.{% endif %}
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-title">Margin Trends (%)</span></div>
+      <div class="card-body">
+        <div class="chart-wrap"><canvas id="marginChart"></canvas></div>
+        <div class="section-desc" style="margin-top:.5rem;">
+          Gross margin avg {{ "%.1f"|format(data.historical.gross_margin | sum / data.historical.gross_margin | length) }}%,
+          EBIT margin avg {{ "%.1f"|format(data.historical.ebit_margin | sum / data.historical.ebit_margin | length) }}%.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid-2" style="margin-bottom:1rem;">
+    <div class="card">
+      <div class="card-header"><span class="card-title">Free Cash Flow ($M)</span></div>
+      <div class="card-body"><div class="chart-wrap"><canvas id="fcfChart"></canvas></div></div>
+    </div>
+    <div class="card">
+      <div class="card-header"><span class="card-title">ROIC (%)</span></div>
+      <div class="card-body">
+        <div class="chart-wrap"><canvas id="roicChart"></canvas></div>
+        <div class="section-desc" style="margin-top:.5rem;">
+          Peak ROIC {{ data.historical.roic | max }}%, current {{ data.historical.roic[-1] }}%.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {% if data.get('dupont') and data.dupont.available %}
+  <div class="section-title">DuPont Decomposition — ROE = Net Margin × Asset Turnover × Leverage</div>
+  <div class="card" style="margin-bottom:1rem;">
+    <div class="card-header"><span class="card-title">DuPont Analysis (10-Year)</span></div>
+    <div class="card-body"><div class="chart-wrap"><canvas id="dupontChart"></canvas></div></div>
+  </div>
+  {% endif %}
+
+  {% if data.get('earnings_quality') and data.earnings_quality.available %}
+  <div class="section-title">Earnings Quality — NI vs. OCF vs. FCF</div>
+  <div class="card" style="margin-bottom:1rem;">
+    {% set eq = data.earnings_quality %}
+    {% if eq.get('quality_note') %}
+    <div class="earnings-quality-summary">
+      {% set ccr = eq.avg_cash_conversion %}
+      <div class="eq-ccr-big {{ eq.quality_color }}">{{ "%.2f"|format(ccr) }}×</div>
+      <div class="eq-note">
+        <strong>Avg. Cash Conversion Ratio (OCF/NI): {{ "%.2f"|format(ccr) }}×</strong><br>
+        {{ eq.quality_note }}
+      </div>
+    </div>
+    {% endif %}
+    <div class="card-body" style="padding-top:0;">
+      <div class="chart-wrap"><canvas id="earningsQualityChart"></canvas></div>
+    </div>
+  </div>
+  {% endif %}
+
+</div>
+
+{# ══════════════════════════════════════════════════════════════════════════ #}
+{# TAB 7 — COMPARABLES                                                       #}
+{# ══════════════════════════════════════════════════════════════════════════ #}
+<div class="tab-pane" id="tab-comps">
+
+  <div class="section-title">Comparable Company Analysis</div>
+  <div class="data-table-wrap" style="margin-bottom:1rem;">
+    <table>
+      <thead>
+        <tr>
+          <th>Company</th><th>Ticker</th><th>EV/EBITDA</th><th>EV/EBIT</th>
+          <th>EV/Revenue</th><th>P/E</th><th>P/FCF</th><th>Brain Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for peer in data.peers %}
+        <tr {% if peer.subject %}class="subject-row"{% endif %}>
+          <td>{{ peer.name }}{% if peer.subject %} ★{% endif %}</td>
+          <td style="font-family:var(--font-mono);font-weight:600;">{{ peer.ticker }}</td>
+          <td>{% if peer.ev_ebitda %}{{ "%.1f"|format(peer.ev_ebitda) }}×{% else %}N/M{% endif %}</td>
+          <td>{% if peer.ev_ebit %}{{ "%.1f"|format(peer.ev_ebit) }}×{% else %}N/M{% endif %}</td>
+          <td>{% if peer.ev_rev %}{{ "%.2f"|format(peer.ev_rev) }}×{% else %}N/M{% endif %}</td>
+          <td>{% if peer.pe %}{{ "%.1f"|format(peer.pe) }}×{% else %}N/M{% endif %}</td>
+          <td>{% if peer.p_fcf %}{{ "%.1f"|format(peer.p_fcf) }}×{% else %}N/M{% endif %}</td>
+          <td>
+            {% if peer.subject %}
+            <span style="font-size:.7rem;color:var(--text-muted);">Subject</span>
+            {% else %}
+            <div style="display:flex;gap:.35rem;flex-wrap:wrap;">
+              <button class="btn btn-outline btn--sm" onclick="addWatchlistFromButton(this)" data-watchlist-item='{{ {"ticker": peer.ticker, "company_name": peer.name, "exchange": data.exchange, "sector": data.sector, "industry": data.industry}|tojson|forceescape }}'>Track</button>
+              <button class="btn btn-primary btn--sm" onclick="recordManualCompare(this)" data-compare-peer='{{ {"ticker": peer.ticker, "company_name": peer.name, "exchange": data.exchange, "sector": data.sector, "industry": data.industry}|tojson|forceescape }}'>Compare + Learn</button>
+            </div>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+        <tr style="font-weight:700;background:var(--bg-secondary);">
+          <td>Peer Median</td><td>—</td>
+          {% if data.peer_median and data.peer_median.get('ev_ebitda') %}
+          <td>{{ "%.1f"|format(data.peer_median.ev_ebitda) }}×</td>
+          <td>{% if data.peer_median.ev_ebit %}{{ "%.1f"|format(data.peer_median.ev_ebit) }}×{% else %}N/M{% endif %}</td>
+          <td>{% if data.peer_median.ev_rev %}{{ "%.2f"|format(data.peer_median.ev_rev) }}×{% else %}N/M{% endif %}</td>
+          <td>{% if data.peer_median.pe %}{{ "%.1f"|format(data.peer_median.pe) }}×{% else %}N/M{% endif %}</td>
+          <td>{% if data.peer_median.p_fcf %}{{ "%.1f"|format(data.peer_median.p_fcf) }}×{% else %}N/M{% endif %}</td>
+          <td>—</td>
+          {% else %}
+          <td colspan="6" style="color:var(--text-secondary);font-weight:400;">N/A (no peer data)</td>
+          {% endif %}
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="grid-2" style="margin-bottom:1rem;gap:.75rem;">
+    <div class="card" style="padding:1rem;">
+      <div class="section-title" style="font-size:.82rem;margin-top:0;">Manual Compare Feed</div>
+      <div class="section-desc" style="margin-bottom:.65rem;">Comparing peers pushes them into the global universe even before you value them directly.</div>
+      <div data-manual-compare-panel style="display:grid;gap:.45rem;"></div>
+    </div>
+    <div class="card" style="padding:1rem;">
+      <div class="section-title" style="font-size:.82rem;margin-top:0;">Brain Watchlist</div>
+      <div class="section-desc" style="margin-bottom:.65rem;">Pinned symbols stay enrolled in the shared universe and will be picked up by the background runner.</div>
+      <div data-watchlist-panel style="display:grid;gap:.45rem;"></div>
+    </div>
+  </div>
+
+</div>
+
+{# ══════════════════════════════════════════════════════════════════════════ #}
+{# TAB 8 — RISK RADAR                                                        #}
+{# ══════════════════════════════════════════════════════════════════════════ #}
+<div class="tab-pane" id="tab-risk">
+
+  {% set pass_count = data.flags | selectattr('status', 'equalto', 'pass') | list | length %}
+  {% set warn_count = data.flags | selectattr('status', 'equalto', 'warn') | list | length %}
+  {% set fail_count = data.flags | selectattr('status', 'equalto', 'fail') | list | length %}
+
+  <div class="kpi-grid" style="grid-template-columns:repeat(3,1fr);max-width:420px;margin-bottom:1rem;">
+    <div class="kpi-card green" style="text-align:center;">
+      <div class="kpi-value green">{{ pass_count }}</div>
+      <div class="kpi-label">Passed</div>
+    </div>
+    <div class="kpi-card amber" style="text-align:center;">
+      <div class="kpi-value amber">{{ warn_count }}</div>
+      <div class="kpi-label">Warnings</div>
+    </div>
+    <div class="kpi-card red" style="text-align:center;">
+      <div class="kpi-value red">{{ fail_count }}</div>
+      <div class="kpi-label">Failed</div>
+    </div>
+  </div>
+
+  <div class="section-title">Model Validation Flags</div>
+  <div class="flag-list" style="margin-bottom:1rem;">
+    {% for flag in data.flags %}
+    <div class="flag-item {{ flag.status }}">
+      <div class="flag-dot {{ flag.status }}"></div>
+      <div class="flag-msg" style="flex:1;">
+        <span class="flag-name">{{ flag.name }}</span> — {{ flag.message }}
+      </div>
+      <span class="flag-status-pill {{ flag.status }}">{{ flag.status | upper }}</span>
+    </div>
+    {% endfor %}
+  </div>
+
+  {% if data.confidence_breakdown %}
+  <div class="section-title">Confidence Score Breakdown</div>
+  <div class="card" style="margin-bottom:1rem;">
+    <div class="card-body">
+      <div style="display:flex;align-items:center;gap:1rem;margin-bottom:.75rem;">
+        <div style="font-family:var(--font-mono);font-size:2rem;font-weight:800;
+          color:{% if data.confidence_breakdown.color == 'green' %}var(--green-text){% elif data.confidence_breakdown.color == 'amber' %}var(--amber-text){% else %}var(--red-text){% endif %};">
+          {{ data.confidence_breakdown.total }}
+        </div>
+        <div>
+          <div style="font-size:.85rem;font-weight:700;color:var(--text-primary);">{{ data.confidence_breakdown.label }}</div>
+          <div class="card-header"><span class="card-title">Free Cash Flow ({{ ccy_code }} M)</span></div>
+        </div>
+      </div>
+      <div class="conf-bars">
+        {% for dim in data.confidence_breakdown.dimensions %}
+        <div class="conf-bar-row">
+          <div class="conf-bar-name" style="width:180px;" data-tooltip="{{ dim.comment }}">{{ dim.name }}</div>
+          <div class="conf-bar-track" style="flex:1;"><div class="conf-bar-fill {{ dim.status }}" style="width:{{ dim.pct }}%"></div></div>
+          <div class="conf-bar-score">{{ dim.score }}/{{ dim.max_points }}</div>
+          <span class="flag-status-pill {{ dim.status }}" style="margin-left:.4rem;">{{ dim.status | upper }}</span>
+        </div>
+        {% endfor %}
+      </div>
+      {% if not data.confidence_breakdown.dcf_suitable %}
+      <div class="conf-unsuitable" style="margin-top:.75rem;">⛔ {{ data.confidence_breakdown.suitability_note }}</div>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+
+  {% if data.get('financial_scores') %}
+  {% set fs = data.financial_scores %}
+  <div class="section-title">Quantitative Health Scores</div>
+  <div class="scores-grid" style="margin-bottom:1rem;">
+
+    {# Altman Z-Score #}
+    {% set az = fs.get('altman_z') or {} %}
+    <div class="altman-card">
+      <div class="score-card-header">
+        <div class="score-card-title">Altman Z-Score</div>
+        {% if az.available %}
+        <span class="score-zone-pill {{ az.zone_color }}">{{ az.zone }}</span>
+        {% endif %}
+      </div>
+      {% if az.available %}
+      <div class="score-big-number {{ az.zone_color }}">{{ "%.2f"|format(az.score) }}</div>
+      <div class="score-narrative">{{ az.narrative }}</div>
+      <div class="altman-components">
+        {% set comp = az.components %}
+        <div class="altman-comp-row"><span class="altman-comp-label">X1 WC/Assets</span><span class="altman-comp-value">{{ "%.3f"|format(comp.x1_wc_assets) }}</span></div>
+        <div class="altman-comp-row"><span class="altman-comp-label">X2 RE/Assets</span><span class="altman-comp-value">{{ "%.3f"|format(comp.x2_re_assets) }}</span></div>
+        <div class="altman-comp-row"><span class="altman-comp-label">X3 EBIT/Assets</span><span class="altman-comp-value">{{ "%.3f"|format(comp.x3_ebit_assets) }}</span></div>
+        <div class="altman-comp-row"><span class="altman-comp-label">X4 MktCap/Liab</span><span class="altman-comp-value">{{ "%.3f"|format(comp.x4_mktcap_liab) }}</span></div>
+        <div class="altman-comp-row"><span class="altman-comp-label">X5 Rev/Assets</span><span class="altman-comp-value">{{ "%.3f"|format(comp.x5_rev_assets) }}</span></div>
+      </div>
+      {% else %}
+      <div class="score-narrative" style="color:var(--text-muted);">{{ az.narrative }}</div>
+      {% endif %}
+    </div>
+
+    {# Piotroski F-Score #}
+    {% set pf = fs.get('piotroski_f') or {} %}
+    <div class="piotroski-card">
+      <div class="score-card-header">
+        <div class="score-card-title">Piotroski F-Score</div>
+        {% if pf.available %}
+        <span class="score-zone-pill {{ pf.zone_color }}">{{ pf.zone }} ({{ pf.score }}/9)</span>
+        {% endif %}
+      </div>
+      {% if pf.available %}
+      <div class="score-big-number {{ pf.zone_color }}">{{ pf.score }}<span style="font-size:1rem;color:var(--text-muted);font-weight:400;">/9</span></div>
+      <div class="score-narrative">{{ pf.narrative }}</div>
+      {% set groups = ['Profitability', 'Leverage', 'Efficiency'] %}
+      {% for group in groups %}
+      <div class="piotroski-group-label">{{ group }}</div>
+      <div class="piotroski-tests">
+        {% for test in pf.tests %}
+        {% if test.group == group %}
+        <div class="piotroski-test-row">
+          <div class="piotroski-dot {{ 'pass' if test.pass else 'fail' }}"></div>
+          <span>{{ test.name }}</span>
+          <span style="margin-left:auto;font-size:.68rem;color:var(--text-muted);">{{ test.detail }}</span>
+        </div>
+        {% endif %}
+        {% endfor %}
+      </div>
+      {% endfor %}
+      {% else %}
+      <div class="score-narrative" style="color:var(--text-muted);">{{ pf.narrative }}</div>
+      {% endif %}
+    </div>
+
+  </div>
+  {% endif %}
+
+</div>
+
+{# ══════════════════════════════════════════════════════════════════════════ #}
+{# TAB 9 — ASSUMPTIONS                                                       #}
+{# ══════════════════════════════════════════════════════════════════════════ #}
+<div class="tab-pane" id="tab-assumptions">
+
+  <div class="section-title">Model Assumptions</div>
+  {% if data.knowledge_model %}
+  {% set km = data.knowledge_model %}
+  {% set km_explain = km.get('explainability') or {} %}
+  {% set company_memory = km_explain.get('company_memory') or {} %}
+  {% set cohort_memory = km_explain.get('cohort_memory') or {} %}
+  {% set analog_evidence = km_explain.get('analog_evidence') or {} %}
+  {% set analog_memory = km_explain.get('analog_memory') or km.get('analogs') or {} %}
+  {% set analog_matches = analog_evidence.get('top_matches') or [] %}
+  {% set global_brain = km_explain.get('global_brain') or km.get('global_learning') or {} %}
+  {% set global_universe = km_explain.get('global_universe') or km.get('global_universe') or {} %}
+  {% set learning_bootstrap = km_explain.get('learning_bootstrap') or km.get('learning_bootstrap') or {} %}
+  {% set relationship_graph = km_explain.get('relationship_graph') or km.get('relationship_graph') or {} %}
+  {% set realized_evidence = km_explain.get('realized_evidence') or km.get('learning_backfill') or {} %}
+  {% set maintenance_state = km_explain.get('maintenance') or km.get('learning_maintenance') or {} %}
+  {% set snapshot_state = km_explain.get('current_snapshot') or km.get('learning_persistence') or {} %}
+  {% set memory_hierarchy = km_explain.get('memory_hierarchy') or km.get('memory_hierarchy') or {} %}
+  {% set memory_layers = memory_hierarchy.get('layers') or [] %}
+  {% set confidence_decomposition = km_explain.get('confidence_decomposition') or {} %}
+  {% set confidence_parts = confidence_decomposition.get('components') or [] %}
+  {% set assumption_conf = confidence_decomposition.get('assumption_confidence') or (km.get('confidence_model') or {}).get('assumption_confidence') or {} %}
+  {% set valuation_conf = confidence_decomposition.get('valuation_confidence') or (km.get('confidence_model') or {}).get('valuation_confidence') or {} %}
+  {% set expected_error_band = valuation_conf.get('expected_error_pct') or km.get('expected_valuation_error_band') or {} %}
+  {% set forecast_layers = km_explain.get('forecast_layers') or [] %}
+  {% set data_gaps = km_explain.get('data_gaps') or [] %}
+  <div class="section-desc" style="margin-bottom:.35rem;">{{ data.knowledge_model.summary }}</div>
+  <div class="section-title" style="font-size:.9rem;margin-top:0;">Everything Knows Model</div>
+  <div class="section-desc" style="margin-bottom:.75rem;">{{ km_explain.get('headline') or 'Shared-brain learning is active. The cards below show how much came from company memory, learned cohorts, analog evidence, and the broader market.' }}</div>
+  <div class="section-title" style="font-size:.82rem;margin-top:0;">Learning Feedback Loop</div>
+  <div class="kpi-grid" style="grid-template-columns:repeat(auto-fit,minmax(190px,1fr));margin-bottom:1rem;">
+    <div class="kpi-card {% if company_memory.get('review_due') %}amber{% else %}green{% endif %}">
+      <div class="kpi-label">Company Memory</div>
+      <div class="kpi-value {% if company_memory.get('review_due') %}amber{% else %}green{% endif %}">{{ company_memory.get('weight_pct', 0) }}%</div>
+      <div class="kpi-sub">{{ company_memory.get('history_window_years', km.get('history_window_years', 0)) }}y window · review {% if company_memory.get('review_due') %}due{% else %}current{% endif %}</div>
+    </div>
+
+    <div class="kpi-card {% if cohort_memory.get('records', 0) >= 5 %}green{% elif cohort_memory.get('records', 0) > 0 %}amber{% else %}amber{% endif %}">
+      <div class="kpi-label">Cohort Memory</div>
+      <div class="kpi-value {% if cohort_memory.get('records', 0) >= 5 %}green{% else %}amber{% endif %}">{{ cohort_memory.get('records', km.get('calibration_cohort_size', 0)) }} recs</div>
+      <div class="kpi-sub">Conf {{ "{:.2f}".format(cohort_memory.get('confidence', km.get('calibration_confidence', 0))) }} · {{ cohort_memory.get('weight_pct', 0) }}% layer</div>
+    </div>
+
+    <div class="kpi-card {% if global_brain.get('enabled') %}green{% else %}amber{% endif %}">
+      <div class="kpi-label">Global Brain</div>
+      <div class="kpi-value {% if global_brain.get('enabled') %}green{% else %}amber{% endif %}">
+        {% if global_brain.get('enabled') %}{{ global_brain.get('cohort_size', 0) }} recs{% else %}Inactive{% endif %}
+      </div>
+      <div class="kpi-sub">
+        {% if global_brain.get('enabled') %}
+          {{ global_brain.get('scope', 'global') }} cohort · {{ global_brain.get('sector_span', 0) }} sectors · conf {{ global_brain.get('confidence', 0) }}
+        {% else %}
+          Waiting for enough realised cross-symbol breadth
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="kpi-card {% if global_universe.get('enabled') and global_universe.get('tracked_symbols', 0) >= 12 %}green{% elif global_universe.get('enabled') %}amber{% else %}amber{% endif %}">
+      <div class="kpi-label">Global Universe</div>
+      <div class="kpi-value {% if global_universe.get('enabled') and global_universe.get('tracked_symbols', 0) >= 12 %}green{% else %}amber{% endif %}">
+        {% if global_universe.get('enabled') %}{{ global_universe.get('tracked_symbols', 0) }} tracked{% else %}Offline{% endif %}
+      </div>
+      <div class="kpi-sub">
+        {% if global_universe.get('enabled') %}
+          {{ global_universe.get('sector_span', 0) }} sectors · {{ global_universe.get('exchange_span', 0) }} exchanges · {{ global_universe.get('bootstrapped_symbols', 0) }} bootstrapped
+        {% else %}
+          Shared symbol registry is inactive
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="kpi-card {% if relationship_graph.get('enabled') %}green{% else %}amber{% endif %}">
+      <div class="kpi-label">Relationship Graph</div>
+      <div class="kpi-value {% if relationship_graph.get('enabled') %}green{% else %}amber{% endif %}">
+        {% if relationship_graph.get('enabled') %}{{ [relationship_graph.get('node_count', 1) - 1, 0]|max }} links{% else %}Thin{% endif %}
+      </div>
+      <div class="kpi-sub">
+        {% if relationship_graph.get('enabled') %}
+          {{ relationship_graph.get('edge_count', 0) }} edges · {{ relationship_graph.get('sector_span', 0) }} sectors · conf {{ relationship_graph.get('confidence', 0) }}
+        {% else %}
+          Waiting for stronger cross-symbol pathways
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="kpi-card {% if realized_evidence.get('updated_records', 0) > 0 %}green{% elif realized_evidence.get('matured_records', 0) > 0 %}amber{% else %}amber{% endif %}">
+      <div class="kpi-label">Realized Evidence</div>
+      <div class="kpi-value {% if realized_evidence.get('updated_records', 0) > 0 %}green{% elif realized_evidence.get('matured_records', 0) > 0 %}amber{% else %}amber{% endif %}">
+        {% if realized_evidence.get('matured_records', 0) > 0 %}{{ realized_evidence.get('matured_records', 0) }} matured{% else %}Thin{% endif %}
+      </div>
+      <div class="kpi-sub">{{ realized_evidence.get('updated_records', 0) }} record(s) refreshed into the ledger</div>
+    </div>
+
+    <div class="kpi-card {% if maintenance_state.get('ran') %}green{% elif maintenance_state.get('reason') == 'throttled' %}amber{% endif %}">
+      <div class="kpi-label">Scheduled Maintenance</div>
+      <div class="kpi-value {% if maintenance_state.get('ran') %}green{% elif maintenance_state.get('reason') == 'throttled' %}amber{% endif %}">
+        {% if maintenance_state.get('ran') %}{{ maintenance_state.get('annual_postmortems_created', 0) }} annuals{% elif maintenance_state.get('reason') == 'throttled' %}Throttled{% else %}Idle{% endif %}
+      </div>
+      <div class="kpi-sub">
+        {% if maintenance_state.get('ran') %}
+          {{ maintenance_state.get('quinquennial_reports_created', 0) }} 5y reports · {{ maintenance_state.get('scanned_tickers', 0) }} tickers scanned
+        {% elif maintenance_state.get('last_run_at') %}
+          Last run {{ maintenance_state.get('last_run_at') }}
+        {% else %}
+          Deferred until the next maintenance window
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="kpi-card {% if snapshot_state.get('persisted') %}green{% elif snapshot_state.get('enabled') %}amber{% endif %}">
+      <div class="kpi-label">Current Snapshot</div>
+      <div class="kpi-value {% if snapshot_state.get('persisted') %}green{% elif snapshot_state.get('enabled') %}amber{% endif %}">
+        {% if snapshot_state.get('persisted') %}Persisted{% elif snapshot_state.get('enabled') %}{{ snapshot_state.get('reason', 'pending')|replace('-', ' ')|title }}{% else %}Disabled{% endif %}
+      </div>
+      <div class="kpi-sub">{% if snapshot_state.get('horizon_year') %}Horizon FY{{ snapshot_state.get('horizon_year') }}{% else %}Base-case learning snapshot{% endif %}</div>
+    </div>
+  </div>
+
+  {% if global_universe.get('calibration_priority_candidates') %}
+  <div class="score-narrative" style="margin:-.2rem 0 1rem 0;">
+    Calibration queue is prioritizing
+    {% for candidate in global_universe.get('calibration_priority_candidates') %}
+      {{ candidate.ticker }}{% if candidate.mode == 'ticker' %} ({{ candidate.direct_samples }} ticker postmortem{% if candidate.direct_samples != 1 %}s{% endif %}){% else %} ({{ candidate.cohort_samples }} cohort postmortem{% if candidate.cohort_samples != 1 %}s{% endif %}){% endif %}{% if not loop.last %}, {% endif %}
+    {% endfor %}
+    because recent forecast misses there offer the biggest calibration lift.
+  </div>
+  {% endif %}
+
+  <div class="insights-grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr));margin-bottom:1rem;">
+    <div class="card" style="padding:1rem;">
+      <div class="section-title" style="font-size:.82rem;margin-top:0;">Why This Forecast Moved</div>
+      <div class="section-desc" style="margin-bottom:.65rem;">Layer weights show how much each driver came from company memory, learned cohorts, and the broader market.</div>
+      {% for layer in forecast_layers[:5] %}
+      <div style="padding:{% if loop.first %}0{% else %}.65rem 0 0{% endif %};margin-top:{% if loop.first %}0{% else %}.65rem{% endif %};border-top:{% if loop.first %}0{% else %}1px solid var(--border){% endif %};">
+        <div style="display:flex;justify-content:space-between;gap:.5rem;align-items:flex-start;">
+          <div style="font-size:.78rem;font-weight:700;color:var(--text-primary);">{{ layer.driver }}</div>
+          <div style="font-size:.78rem;font-weight:700;color:var(--text-primary);">{{ layer.final_value }}{{ layer.unit }}</div>
+        </div>
+        <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.22rem;">
+          {{ layer.weights.company_history }}% company · {{ layer.weights.sector_prior }}% sector · {{ layer.weights.learned_cohort }}% cohort
+        </div>
+        {% if layer.overlays %}
+        <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.22rem;">
+          {% for overlay in layer.overlays %}
+            {{ overlay.label }} {{ "{:+.1f}".format(overlay.impact) if overlay.unit == 'pp' else "{:+.2f}".format(overlay.impact) }}{{ overlay.unit }}{% if not loop.last %} · {% endif %}
+          {% endfor %}
+        </div>
+        {% endif %}
+        <div class="assumption-source" style="margin-top:.22rem;">{{ layer.source }}</div>
+        {% if layer.warn %}<div class="assumption-warn">⚠ {{ layer.warn }}</div>{% endif %}
+      </div>
+      {% endfor %}
+    </div>
+
+    <div class="card" style="padding:1rem;">
+      <div class="section-title" style="font-size:.82rem;margin-top:0;">Analog Evidence</div>
+      <div class="section-desc" style="margin-bottom:.65rem;">{{ analog_evidence.get('note') or 'Analog evidence is still sparse, so the model is leaning on company history and sector priors.' }}</div>
+      {% if analog_evidence.get('pattern_label') %}
+      <div style="font-size:.92rem;font-weight:700;color:var(--text-primary);">{{ analog_evidence.get('pattern_label') }}</div>
+      <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.2rem;">Pattern score {{ analog_evidence.get('pattern_score', 0) }}</div>
+      {% endif %}
+      {% if analog_evidence.get('match_count') %}
+      <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.35rem;">{{ analog_evidence.get('match_count') }} live analog match{% if analog_evidence.get('match_count') != 1 %}es{% endif %} · confidence {{ analog_evidence.get('confidence', analog_memory.get('confidence', 0)) }}</div>
+      {% endif %}
+      {% if analog_evidence.get('archetypes') %}
+      <div style="margin-top:.75rem;display:grid;gap:.45rem;">
+        {% for archetype in analog_evidence.get('archetypes')[:3] %}
+        <div style="padding:.55rem .65rem;border:1px solid var(--border);border-radius:10px;background:var(--bg-secondary);font-size:.74rem;color:var(--text-primary);">{{ archetype }}</div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="score-narrative" style="color:var(--text-muted);margin-top:.65rem;">No named analog archetypes are active yet.</div>
+      {% endif %}
+      {% if analog_matches %}
+      <div style="font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);margin:1rem 0 .35rem;">Top live analogs</div>
+      <div style="display:grid;gap:.5rem;">
+        {% for match in analog_matches[:3] %}
+        <div style="padding:.6rem .7rem;border:1px solid var(--border);border-radius:12px;background:var(--bg-secondary);">
+          <div style="display:flex;justify-content:space-between;gap:.5rem;align-items:flex-start;">
+            <div>
+              <div style="font-size:.78rem;font-weight:700;color:var(--text-primary);">{{ match.ticker }}</div>
+              <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.18rem;">{{ match.sector }}{% if match.industry %} · {{ match.industry }}{% endif %}</div>
+
+        {% if learning_bootstrap.get('enabled') %}
+        <div class="score-narrative" style="margin:-.15rem 0 1rem 0;">
+          {% if learning_bootstrap.get('ran') %}
+            Replay bootstrap enrolled this ticker into the shared brain with {{ learning_bootstrap.get('replay_predictions_created', 0) }} historical prediction(s) and {{ learning_bootstrap.get('realized_outcomes_created', 0) }} realized outcome label(s).
+          {% elif learning_bootstrap.get('reason') == 'fresh' %}
+            Replay bootstrap is already fresh for this ticker, so the global brain reused the existing historical enrollment.
+          {% endif %}
+        </div>
+        {% endif %}
+            </div>
+            <div style="text-align:right;">
+              <div style="font-size:.78rem;font-weight:700;color:var(--text-primary);">{{ '%.2f'|format(match.score or 0) }}</div>
+              <div style="font-size:.68rem;color:var(--text-muted);">Analog score</div>
+            </div>
+          </div>
+          <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.3rem;">Similarity {{ '%.2f'|format(match.similarity or 0) }} · Regime {{ '%.2f'|format(match.regime_similarity or 0) }}</div>
+          {% if match.why_it_matters %}
+          <div class="score-narrative" style="margin-top:.35rem;">{{ match.why_it_matters }}</div>
+          {% endif %}
+          {% if match.evidence %}
+          <div style="display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.45rem;">
+            {% for evidence in match.evidence[:3] %}
+            <span style="padding:.2rem .45rem;border-radius:999px;background:rgba(19,31,52,0.08);font-size:.68rem;color:var(--text-secondary);">{{ evidence.label }} {{ '%.2f'|format(evidence.similarity or 0) }}</span>
+            {% endfor %}
+          </div>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+
+    <div class="card" style="padding:1rem;">
+      <div class="section-title" style="font-size:.82rem;margin-top:0;">Relationship Graph</div>
+      <div class="section-desc" style="margin-bottom:.65rem;">{{ relationship_graph.get('summary') or 'The relationship graph turns analogs and realized peers into a connected cross-symbol map.' }}</div>
+      {% if relationship_graph.get('enabled') %}
+      {% set graph_visual = relationship_graph.get('visualization') or {} %}
+      {% set graph_roles = relationship_graph.get('role_counts') or {} %}
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:.5rem;margin-bottom:.75rem;">
+        <div style="padding:.55rem .65rem;border:1px solid var(--border);border-radius:10px;background:var(--bg-secondary);">
+          <div style="font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);">Nodes</div>
+          <div style="font-size:1.05rem;font-weight:700;color:var(--text-primary);margin-top:.15rem;">{{ relationship_graph.get('node_count', 0) }}</div>
+        </div>
+        <div style="padding:.55rem .65rem;border:1px solid var(--border);border-radius:10px;background:var(--bg-secondary);">
+          <div style="font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);">Edges</div>
+          <div style="font-size:1.05rem;font-weight:700;color:var(--text-primary);margin-top:.15rem;">{{ relationship_graph.get('edge_count', 0) }}</div>
+        </div>
+        <div style="padding:.55rem .65rem;border:1px solid var(--border);border-radius:10px;background:var(--bg-secondary);">
+          <div style="font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);">Confidence</div>
+          <div style="font-size:1.05rem;font-weight:700;color:var(--text-primary);margin-top:.15rem;">{{ '%.0f'|format((relationship_graph.get('confidence', 0) or 0) * 100) }}/100</div>
+        </div>
+        <div style="padding:.55rem .65rem;border:1px solid var(--border);border-radius:10px;background:var(--bg-secondary);">
+          <div style="font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);">Analogs</div>
+          <div style="font-size:1.05rem;font-weight:700;color:var(--text-primary);margin-top:.15rem;">{{ graph_roles.get('analog', 0) }}</div>
+        </div>
+        <div style="padding:.55rem .65rem;border:1px solid var(--border);border-radius:10px;background:var(--bg-secondary);">
+          <div style="font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);">Realized</div>
+          <div style="font-size:1.05rem;font-weight:700;color:var(--text-primary);margin-top:.15rem;">{{ graph_roles.get('realized_peer', 0) }}</div>
+        </div>
+      </div>
+      {% if graph_visual.get('nodes') %}
+      <div style="margin-bottom:.85rem;padding:.85rem;border:1px solid var(--border);border-radius:16px;background:radial-gradient(circle at top, rgba(56,189,248,0.16), transparent 42%), linear-gradient(180deg, rgba(15,23,42,0.05), rgba(15,23,42,0));">
+        <div style="display:flex;justify-content:space-between;gap:.75rem;align-items:flex-start;flex-wrap:wrap;margin-bottom:.55rem;">
+          <div>
+            <div style="font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);">Live network map</div>
+            <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.15rem;">{{ relationship_graph.get('analog_pool_size', 0) }} analog candidates · {{ relationship_graph.get('realized_candidate_count', 0) }} realized peers scanned · {{ relationship_graph.get('candidate_pool_size', 0) }} total learning records</div>
+          </div>
+          <div style="display:flex;gap:.35rem;flex-wrap:wrap;justify-content:flex-end;">
+            {% for legend in graph_visual.get('legend') or [] %}
+            <span style="display:inline-flex;align-items:center;gap:.35rem;padding:.24rem .5rem;border:1px solid var(--border);border-radius:999px;background:rgba(255,255,255,0.72);font-size:.68rem;color:var(--text-secondary);">
+              <span style="width:.55rem;height:.55rem;border-radius:999px;display:inline-block;background:{{ legend.fill }};box-shadow:0 0 0 1px {{ legend.stroke }};"></span>{{ legend.label }}
+            </span>
+            {% endfor %}
+          </div>
+        </div>
+        <svg id="relationship-graph-network" role="img" aria-label="Relationship graph network" viewBox="{{ graph_visual.get('view_box', '0 0 560 340') }}" style="width:100%;height:auto;display:block;overflow:visible;">
+          <rect x="0" y="0" width="560" height="340" rx="18" fill="rgba(255,255,255,0.35)"></rect>
+          <ellipse cx="280" cy="170" rx="212" ry="126" fill="none" stroke="rgba(15,23,42,0.08)" stroke-dasharray="6 6"></ellipse>
+          <ellipse cx="280" cy="170" rx="138" ry="82" fill="none" stroke="rgba(15,23,42,0.05)"></ellipse>
+          {% for edge in graph_visual.get('edges') or [] %}
+          {% set edge_color = '#5eead4' if edge.relationship == 'analog-fingerprint' else '#fdba74' if edge.relationship == 'realized-spillover' else '#94a3b8' %}
+          <line x1="{{ edge.x1 }}" y1="{{ edge.y1 }}" x2="{{ edge.x2 }}" y2="{{ edge.y2 }}" stroke="{{ edge_color }}" stroke-width="{{ edge.stroke_width }}" stroke-opacity="{{ edge.opacity }}" stroke-linecap="round">
+            <title>{{ edge.source }} -> {{ edge.target }} · {{ edge.relationship|replace('-', ' ')|title }} · weight {{ '%.2f'|format(edge.weight or 0) }}</title>
+          </line>
+          {% endfor %}
+          {% for node in graph_visual.get('nodes') or [] %}
+          <circle cx="{{ node.x }}" cy="{{ node.y }}" r="{{ node.radius + 3 }}" fill="{{ node.stroke }}" fill-opacity="0.18"></circle>
+          <circle cx="{{ node.x }}" cy="{{ node.y }}" r="{{ node.radius }}" fill="{{ node.fill }}" stroke="{{ node.stroke }}" stroke-width="1.5">
+            <title>{{ node.ticker }} · {{ node.role|replace('-', ' ')|title }}{% if node.get('score') is not none %} · strength {{ '%.2f'|format(node.score or 0) }}{% endif %}{% if node.get('rationale') %} · {{ node.rationale }}{% endif %}</title>
+          </circle>
+          <text x="{{ node.x }}" y="{{ node.y + 4 }}" text-anchor="middle" fill="{{ node.text }}" style="font-size:.58rem;font-weight:700;letter-spacing:.04em;">{{ node.short_label }}</text>
+          <text x="{{ node.x }}" y="{{ node.label_y }}" text-anchor="middle" fill="#475569" style="font-size:.58rem;font-weight:700;letter-spacing:.03em;">{{ node.ticker }}</text>
+          {% endfor %}
+        </svg>
+        {% if relationship_graph.get('communities') %}
+        <div style="display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.65rem;">
+          {% for community in relationship_graph.get('communities')[:3] %}
+          <span style="padding:.22rem .48rem;border-radius:999px;border:1px solid var(--border);background:rgba(15,23,42,0.04);font-size:.68rem;color:var(--text-secondary);">{{ community.label }} · {{ community.count }} symbol{% if community.count != 1 %}s{% endif %}</span>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </div>
+      {% endif %}
+      {% if relationship_graph.get('central_nodes') %}
+      <div style="font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);margin-bottom:.35rem;">Central connected symbols</div>
+      <div style="display:grid;gap:.45rem;">
+        {% for node in relationship_graph.get('central_nodes')[:3] %}
+        <div style="padding:.5rem .6rem;border:1px solid var(--border);border-radius:10px;background:var(--bg-secondary);">
+          <div style="display:flex;justify-content:space-between;gap:.5rem;align-items:center;">
+            <div style="font-size:.74rem;font-weight:700;color:var(--text-primary);">{{ node.ticker }}</div>
+            <div style="font-size:.72rem;color:var(--text-secondary);">{{ node.role|replace('-', ' ')|title }}</div>
+          </div>
+          <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.18rem;">Strength {{ '%.2f'|format(node.score or 0) }} · Similarity {{ '%.2f'|format(node.similarity or 0) }}</div>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+      {% if relationship_graph.get('pathways') %}
+      <div style="font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);margin:1rem 0 .35rem;">Active pathways</div>
+      <div style="display:grid;gap:.45rem;">
+        {% for pathway in relationship_graph.get('pathways')[:3] %}
+        <div style="padding:.5rem .6rem;border:1px solid var(--border);border-radius:10px;background:var(--bg-secondary);">
+          <div style="display:flex;justify-content:space-between;gap:.5rem;align-items:center;">
+            <div style="font-size:.74rem;font-weight:700;color:var(--text-primary);">{{ pathway.ticker }}</div>
+            <div style="font-size:.72rem;color:var(--text-secondary);">{{ '%.2f'|format(pathway.score or 0) }}</div>
+          </div>
+          <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.18rem;">{{ pathway.rationale }}</div>
+          <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.12rem;">{{ pathway.impact }}</div>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+      {% else %}
+      <div class="score-narrative" style="color:var(--text-muted);">Relationship graph is waiting for stronger connected symbols or realized peers.</div>
+      {% endif %}
+    </div>
+
+    <div class="card" style="padding:1rem;">
+      <div class="section-title" style="font-size:.82rem;margin-top:0;">Confidence &amp; Gaps</div>
+      <div class="section-desc" style="margin-bottom:.65rem;">{{ confidence_decomposition.get('summary') or 'Confidence falls back toward company memory and sector priors when realized evidence is thin.' }}</div>
+      {% if assumption_conf or valuation_conf %}
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.5rem;margin-bottom:.75rem;">
+        <div style="padding:.55rem .65rem;border:1px solid var(--border);border-radius:10px;background:var(--bg-secondary);">
+          <div style="font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);">Assumption Confidence</div>
+          <div style="font-size:1.05rem;font-weight:700;color:var(--text-primary);margin-top:.15rem;">{{ assumption_conf.get('score_100', 0) }}/100</div>
+          <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.12rem;">{{ assumption_conf.get('label', 'n/a')|title }}</div>
+        </div>
+        <div style="padding:.55rem .65rem;border:1px solid var(--border);border-radius:10px;background:var(--bg-secondary);">
+          <div style="font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);">Valuation Confidence</div>
+          <div style="font-size:1.05rem;font-weight:700;color:var(--text-primary);margin-top:.15rem;">{{ valuation_conf.get('score_100', 0) }}/100</div>
+          <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.12rem;">{{ valuation_conf.get('label', 'n/a')|title }}</div>
+        </div>
+        <div style="padding:.55rem .65rem;border:1px solid var(--border);border-radius:10px;background:var(--bg-secondary);">
+          <div style="font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);">Expected Valuation Error</div>
+          <div style="font-size:1.05rem;font-weight:700;color:var(--text-primary);margin-top:.15rem;">{{ '%.1f'|format(expected_error_band.get('p50', km.get('expected_valuation_error_pct', 0))) }}%</div>
+          <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.12rem;">p90 {{ '%.1f'|format(expected_error_band.get('p90', (km.get('expected_valuation_error_band') or {}).get('p90', 0))) }}%</div>
+        </div>
+      </div>
+      {% endif %}
+      {% if confidence_decomposition.get('dominant_risk') %}
+      <div class="score-narrative" style="margin-bottom:.65rem;">Largest current drag on valuation confidence: {{ confidence_decomposition.get('dominant_risk') }}.</div>
+      {% endif %}
+      {% if confidence_parts %}
+      <div style="display:grid;gap:.5rem;">
+        {% for part in confidence_parts %}
+        <div style="padding:.45rem .55rem;border:1px solid var(--border);border-radius:10px;background:var(--bg-secondary);">
+          <div style="display:flex;justify-content:space-between;gap:.5rem;align-items:center;">
+            <div style="font-size:.74rem;font-weight:700;color:var(--text-primary);">{{ part.label }}</div>
+            <div style="font-size:.74rem;font-weight:700;color:var(--text-primary);">{{ part.score }}/100</div>
+          </div>
+          <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.18rem;">{{ part.detail }}</div>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+      <div style="font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);margin:1rem 0 .35rem;">Memory Hierarchy</div>
+      {% if memory_layers %}
+      <div style="display:grid;gap:.45rem;margin-bottom:.75rem;">
+        {% for layer in memory_layers[:4] %}
+        <div style="padding:.5rem .6rem;border:1px solid var(--border);border-radius:10px;background:var(--bg-secondary);">
+          <div style="display:flex;justify-content:space-between;gap:.5rem;align-items:center;">
+            <div style="font-size:.74rem;font-weight:700;color:var(--text-primary);">{{ layer.label }}</div>
+            <div style="font-size:.72rem;color:var(--text-secondary);">{{ layer.score }}/100 · {{ layer.status|title }}</div>
+          </div>
+          <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.18rem;">{{ layer.note }}</div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="score-narrative" style="color:var(--text-muted);margin-bottom:.75rem;">Memory hierarchy will appear once the shared-brain layers are available.</div>
+      {% endif %}
+      <div style="font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);margin:1rem 0 .35rem;">Remaining Data Gaps</div>
+      {% if data_gaps %}
+      <div style="display:grid;gap:.45rem;">
+        {% for gap in data_gaps[:4] %}
+        <div style="padding:.5rem .6rem;border:1px solid var(--border);border-radius:10px;background:var(--bg-secondary);">
+          <div style="font-size:.74rem;font-weight:700;color:var(--text-primary);">{{ gap.title }}</div>
+          <div style="font-size:.72rem;color:var(--text-secondary);margin-top:.18rem;">{{ gap.detail }}</div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="score-narrative" style="color:var(--text-muted);">No open learning gaps are currently flagged.</div>
+      {% endif %}
+      {% if km_explain.get('limitations_note') %}
+      <div class="assumption-warn" style="margin-top:.75rem;">⚠ {{ km_explain.get('limitations_note') }}</div>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+  <div class="card" style="padding:0;margin-bottom:1rem;">
+    <div style="display:grid;grid-template-columns:1fr 80px 80px 80px 1fr;gap:.5rem;padding:.5rem .75rem;
+      border-bottom:1px solid var(--border);background:var(--bg-secondary);">
+      <span style="font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);">Driver</span>
+      <span style="font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);text-align:right;">Auto</span>
+      <span style="font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);text-align:right;">Active</span>
+      <span style="font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);text-align:center;">Mode</span>
+      <span style="font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);">Source</span>
+    </div>
+    {% for row in data.assumptions %}
+    <div class="assumption-row" id="assump-{{ loop.index0 }}">
+      <div class="assumption-driver">{{ row.driver }}</div>
+      <div class="assumption-auto">{{ row.auto }}{{ row.unit }}</div>
+      <div id="active-{{ loop.index0 }}">
+        <span>{{ row.active }}{{ row.unit }}</span>
+        <input class="assumption-input" type="number" step="0.1" value="{{ row.active }}"
+          data-driver="{{ row.driver | lower | replace(' ','_') | replace('(','') | replace(')','') | replace('.','') | replace('&','') | replace('/','') }}"
+          data-unit="{{ row.unit }}" style="display:none;" id="input-{{ loop.index0 }}">
+      </div>
+      <div style="text-align:center;">
+        <span class="mode-badge AUTO" id="modebadge-{{ loop.index0 }}" onclick="toggleMode({{ loop.index0 }})">AUTO</span>
+      </div>
+      <div>
+        <div class="assumption-source">{{ row.source }}</div>
+        {% if row.warn %}<div class="assumption-warn">⚠ {{ row.warn }}</div>{% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <div style="display:flex;gap:.75rem;align-items:center;flex-wrap:wrap;margin-bottom:1rem;">
+    <button class="btn btn-primary" onclick="recomputeModel()">↻ Recompute Intrinsic Value</button>
+    <button class="btn btn-outline" onclick="resetAssumptions()">Reset to Auto</button>
+    <span id="recomputeStatus" style="font-size:.78rem;color:var(--text-secondary);"></span>
+  </div>
+
+</div>
+
+{# ══════════════════════════════════════════════════════════════════════════ #}
+{# TAB 10 — EXPORT                                                           #}
+{# ══════════════════════════════════════════════════════════════════════════ #}
+<div class="tab-pane" id="tab-export">
+
+  <div class="section-title">Download &amp; Share</div>
+  <div class="export-grid" style="margin-bottom:1rem;">
+    <div class="export-card">
+      <div class="export-icon">📊</div>
+      <div class="export-title">Excel Workbook</div>
+      <div class="export-desc">Full DCF, sensitivity, comps, assumptions, and flags — formatted for institutional review.</div>
+      <a href="/api/export/{{ data.ticker }}" class="btn btn-primary" style="margin-top:.5rem;">↓ Download .xlsx</a>
+    </div>
+    <div class="export-card">
+      <div class="export-icon">📋</div>
+      <div class="export-title">JSON Data</div>
+      <div class="export-desc">Raw model output as JSON for programmatic use or integration with other tools.</div>
+      <a href="/api/dashboard/{{ data.ticker }}" class="btn btn-outline" style="margin-top:.5rem;" target="_blank">↗ View JSON</a>
+    </div>
+    <div class="export-card">
+      <div class="export-icon">🖨</div>
+      <div class="export-title">Print / PDF</div>
+      <div class="export-desc">Print the current dashboard view as a PDF using your browser's print dialog.</div>
+      <button class="btn btn-outline" style="margin-top:.5rem;" onclick="window.print()">⎙ Print</button>
+    </div>
+  </div>
+
+  <div style="font-size:.72rem;color:var(--text-muted);background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:.75rem 1rem;">
+    <strong>{{ data.ticker }}</strong> Valuation · as of {{ data.price_date }} ·
+    IV={{ money2(data.intrinsic_value) }} · WACC={{ data.wacc }}% · g={{ data.terminal_growth }}% ·
+    EV={{ money_m(data.enterprise_value) }} · Confidence={{ data.confidence_score }}/100
+  </div>
+
+</div>
+
+{# ── Hidden JSON data for JS charts ──────────────────────────────────────── #}
+<script id="chartData" type="application/json">
+{
+  "ticker":      "{{ data.ticker }}",
+  "company_name": {{ data.company_name | tojson }},
+  "exchange": {{ data.exchange | tojson }},
+  "sector": {{ data.sector | tojson }},
+  "industry": {{ data.industry | tojson }},
+  "currency":    "{{ data.currency }}",
+  "currency_symbol": {{ ccy | tojson }},
+  "display_currency": "{{ data.display_currency or data.currency }}",
+  "display_currency_symbol": {{ ccy | tojson }},
+  "price":       {{ data.price }},
+  "iv":          {{ data.intrinsic_value }},
+  "pv_ufcfs":    {{ data.pv_ufcfs }},
+  "pv_terminal": {{ data.pv_terminal }},
+  "tv_pct":      {{ data.tv_pct }},
+  "confidence_score": {{ data.confidence_score }},
+  "fifty_two_week_low":  {{ data.fifty_two_week_low }},
+  "fifty_two_week_high": {{ data.fifty_two_week_high }},
+  "analyst_low":    {{ data.analyst_low }},
+  "analyst_high":   {{ data.analyst_high }},
+  "analyst_median": {{ data.analyst_median }},
+  "dcf_bear": {{ data.scenarios.bear.iv }},
+  "dcf_bull": {{ data.scenarios.bull.iv }},
+  "historical_years":        {{ data.historical.years | tojson }},
+  "historical_revenue":      {{ data.historical.revenue | tojson }},
+  "historical_gross_margin": {{ data.historical.gross_margin | tojson }},
+  "historical_ebit_margin":  {{ data.historical.ebit_margin | tojson }},
+  "historical_fcf":          {{ data.historical.fcf | tojson }},
+  "historical_roic":         {{ data.historical.roic | tojson }},
+  "rdcf_sensitivity": {{ data.reverse_dcf.sensitivity_curve | tojson if data.reverse_dcf else [] }},
+  "rdcf_implied_g":   {{ data.reverse_dcf.implied_g if data.reverse_dcf else "null" }},
+  "rdcf_model_g":     {{ data.reverse_dcf.model_g if data.reverse_dcf else "null" }},
+  "dupont_years":          {{ data.dupont.years        | tojson if data.dupont and data.dupont.available else "[]" }},
+  "dupont_net_margin":     {{ data.dupont.net_margin   | tojson if data.dupont and data.dupont.available else "[]" }},
+  "dupont_asset_turnover": {{ data.dupont.asset_turnover | tojson if data.dupont and data.dupont.available else "[]" }},
+  "dupont_leverage":       {{ data.dupont.leverage     | tojson if data.dupont and data.dupont.available else "[]" }},
+  "eq_years":       {{ data.earnings_quality.years        | tojson if data.earnings_quality and data.earnings_quality.available else "[]" }},
+  "eq_net_income":  {{ data.earnings_quality.net_income   | tojson if data.earnings_quality and data.earnings_quality.available else "[]" }},
+  "eq_operating_cf":{{ data.earnings_quality.operating_cf | tojson if data.earnings_quality and data.earnings_quality.available else "[]" }},
+  "eq_fcf":         {{ data.earnings_quality.fcf          | tojson if data.earnings_quality and data.earnings_quality.available else "[]" }}
+}
+</script>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>switchTab('overview');</script>
+{% endblock %}
+
+

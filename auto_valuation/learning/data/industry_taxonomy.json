@@ -1,0 +1,112 @@
+{
+  "clusters": [
+    {
+      "id": "luxury-goods",
+      "family": "luxury-fashion",
+      "canonical_industry": "Luxury Goods",
+      "sector": "Consumer Cyclical",
+      "aliases": ["luxury goods", "luxury brands", "personal goods", "designer brands", "high end fashion"],
+      "related_industries": ["Apparel Retail", "Footwear & Accessories"],
+      "keywords": ["luxury", "designer", "fashion", "leather", "jewelry", "watches", "accessories"]
+    },
+    {
+      "id": "footwear-accessories",
+      "family": "luxury-fashion",
+      "canonical_industry": "Footwear & Accessories",
+      "sector": "Consumer Cyclical",
+      "aliases": ["footwear accessories", "footwear and accessories", "shoes accessories"],
+      "related_industries": ["Apparel Retail", "Luxury Goods"],
+      "keywords": ["footwear", "shoes", "sneakers", "accessories"]
+    },
+    {
+      "id": "apparel-retail",
+      "family": "luxury-fashion",
+      "canonical_industry": "Apparel Retail",
+      "sector": "Consumer Cyclical",
+      "aliases": ["apparel", "apparel manufacturing", "textile manufacturing", "clothing retail"],
+      "related_industries": ["Footwear & Accessories", "Luxury Goods"],
+      "keywords": ["apparel", "clothing", "textile", "fashion"]
+    },
+    {
+      "id": "internet-retail",
+      "family": "consumer-retail",
+      "canonical_industry": "Internet Retail",
+      "sector": "Consumer Cyclical",
+      "aliases": ["internet retailing", "e commerce", "ecommerce"],
+      "related_industries": ["Specialty Retail"],
+      "keywords": ["internet", "retail", "marketplace", "commerce"]
+    },
+    {
+      "id": "specialty-retail",
+      "family": "consumer-retail",
+      "canonical_industry": "Specialty Retail",
+      "sector": "Consumer Cyclical",
+      "aliases": ["specialty retail", "specialty stores"],
+      "related_industries": ["Internet Retail", "Home Improvement Retail"],
+      "keywords": ["specialty", "retail", "stores"]
+    },
+    {
+      "id": "restaurants",
+      "family": "food-service",
+      "canonical_industry": "Restaurants",
+      "sector": "Consumer Cyclical",
+      "aliases": ["restaurant", "restaurants", "dining", "food service"],
+      "related_industries": [],
+      "keywords": ["restaurant", "dining", "food", "service"]
+    },
+    {
+      "id": "consumer-electronics",
+      "family": "consumer-hardware",
+      "canonical_industry": "Consumer Electronics",
+      "sector": "Technology",
+      "aliases": ["consumer electronics", "electronics hardware"],
+      "related_industries": ["Computer Hardware"],
+      "keywords": ["consumer", "electronics", "devices", "hardware"]
+    },
+    {
+      "id": "software-application",
+      "family": "software",
+      "canonical_industry": "Software—Application",
+      "sector": "Technology",
+      "aliases": ["software application", "application software", "software applications"],
+      "related_industries": ["Software—Infrastructure", "Information Technology Services"],
+      "keywords": ["software", "application", "saas", "platform"]
+    },
+    {
+      "id": "software-infrastructure",
+      "family": "software",
+      "canonical_industry": "Software—Infrastructure",
+      "sector": "Technology",
+      "aliases": ["software infrastructure", "infrastructure software", "cloud infrastructure"],
+      "related_industries": ["Software—Application", "Information Technology Services"],
+      "keywords": ["software", "infrastructure", "cloud", "security"]
+    },
+    {
+      "id": "semiconductors",
+      "family": "semis",
+      "canonical_industry": "Semiconductors",
+      "sector": "Technology",
+      "aliases": ["semiconductors", "semiconductor devices", "chipmakers"],
+      "related_industries": ["Electronic Components"],
+      "keywords": ["semiconductor", "chip", "foundry", "logic", "memory"]
+    },
+    {
+      "id": "industrial-conglomerates",
+      "family": "industrials",
+      "canonical_industry": "Industrial Conglomerates",
+      "sector": "Industrials",
+      "aliases": ["industrial conglomerates", "conglomerates"],
+      "related_industries": ["Specialty Industrial Machinery"],
+      "keywords": ["industrial", "conglomerate", "machinery"]
+    },
+    {
+      "id": "specialty-industrial-machinery",
+      "family": "industrials",
+      "canonical_industry": "Specialty Industrial Machinery",
+      "sector": "Industrials",
+      "aliases": ["specialty industrial machinery", "industrial machinery"],
+      "related_industries": ["Industrial Conglomerates"],
+      "keywords": ["industrial", "machinery", "automation", "equipment"]
+    }
+  ]
+}

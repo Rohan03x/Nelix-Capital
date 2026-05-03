@@ -1,0 +1,3 @@
+{
+  "buildCommand": "python build.py"
+}

@@ -1,0 +1,101 @@
+{
+  "_comment": "Per-ticker override file. Copy to overrides/TICKER.json and edit. All fields are optional.",
+  "_version": "4.1",
+  "_reference": "Architecture Plan Parts 31, 66.2",
+
+  "ticker": "AAPL",
+
+  "forecast_years": 5,
+  "scenario": "base",
+
+  "_dcf_note": "Terminal value and growth",
+  "terminal_growth_default": 0.025,
+  "terminal_growth_gdp_cap": 0.040,
+  "terminal_growth_floor": 0.005,
+  "exit_multiple_default": 12.0,
+  "growth_model": "1stage",
+
+  "_wacc_note": "WACC inputs — set wacc_override to skip CAPM computation entirely.",
+  "wacc_override": null,
+  "beta_override": null,
+  "blume_adjustment": true,
+  "erp": 0.055,
+  "size_premium": 0.0,
+  "crp": 0.0,
+
+  "_tax_note": "Tax rate (statutory / normalised). Overrides CATR computation.",
+  "tax_rate_default": 0.15,
+  "tax_rate_cap": 0.25,
+
+  "_capex_note": "CapEx assumptions",
+  "capex_maintenance_pct_ppe": 0.025,
+  "capex_convergence_years": 5,
+
+  "_wc_note": "Working capital assumptions",
+  "wc_days_lookback_years": 3,
+  "ebit_margin_fade_years": 7,
+  "revenue_growth_fade_years": 7,
+
+  "_sbc_note": "SBC treatment: 'addback' (default) | 'expense' | 'ignore'.",
+  "sbc_treatment": "addback",
+
+  "_flags_note": "Feature flags — set to true to enable specialist modules.",
+  "rd_capitalise": false,
+  "ebitdar_adjustment": false,
+  "use_reit_model": false,
+  "financial_company_gate": false,
+
+  "_bridge_note": "EV→equity bridge adjustments. All values USD millions.",
+  "nci_mm": null,
+  "preferred_equity_mm": null,
+  "convertible_notes_mm": null,
+  "convertible_strike_price": null,
+  "equity_investments_mm": null,
+
+  "_comps_note": "Fields below are used by the comps module, not ValuationConfig.",
+  "peer_tickers": ["MSFT", "GOOGL", "META", "AMZN"],
+  "exclude_peers": [],
+
+  "_proforma_note": "Optional pro forma adjustments per peer (Part 78.2).",
+  "peer_proforma_adjustments": {
+    "MSFT": {
+      "event_description": "ACTIVISION acquisition FY2023",
+      "revenue_adjustment_mm": 8900,
+      "ebitda_adjustment_mm": 2200
+    }
+  },
+
+  "_transactions_note": "Precedent transactions (Part 77.3). All values in USD millions.",
+  "precedent_transactions": [
+    {
+      "target": "Example Target Corp",
+      "acquirer": "Example Acquirer Inc",
+      "announcement_date": "2023-06-15",
+      "enterprise_value_mm": 45000,
+      "ltm_revenue_mm": 8500,
+      "ltm_ebitda_mm": 2100,
+      "ev_revenue_multiple": 5.3,
+      "ev_ebitda_multiple": 21.4,
+      "control_premium_pct": 0.32
+    }
+  ],
+
+  "_debt_note": "Override debt schedule if FMP data is stale or incorrect.",
+  "debt_overrides": {
+    "current_ibd_mm": null,
+    "cost_of_debt": null
+  },
+
+  "_share_note": "Override diluted share count if FMP is materially wrong.",
+  "diluted_shares_override_mm": null,
+
+  "_pension_note": "Override pension underfunding if not available via FMP.",
+  "pension_underfunding_mm": null,
+
+  "_lease_note": "Finance lease obligations if FMP does not include them in total_debt.",
+  "finance_leases_mm": null,
+
+  "_currency_note": "If reporting in non-USD, provide FX rate override.",
+  "fx_rate_to_usd": null,
+  "output_currency": "USD"
+}

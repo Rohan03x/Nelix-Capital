@@ -1,0 +1,2183 @@
+"""Weighted knowledge-model bridge for live webapp assumptions."""
+
+from __future__ import annotations
+
+import statistics
+from typing import Any
+
+from auto_valuation.config import LEARNING_CONFIG
+from auto_valuation.assumptions.defaults import (
+    get_sector_capex_pct,
+    get_sector_ebit_margin,
+    get_sector_terminal_sbc_pct,
+    get_sector_wc_days,
+)
+from auto_valuation.assumptions.engine import AssumptionSet
+from auto_valuation.assumptions.growth import sector_median_growth
+from auto_valuation.assumptions.wacc import blended_beta as _blended_beta
+from auto_valuation.data.macro import fetch_damodaran_industry_beta
+from auto_valuation.learning._layered_calibrator import CalibrationObservation, calibrate
+from auto_valuation.learning.confidence import build_ranked_confidence_model
+from auto_valuation.learning.feature_space import SymbolFeatures, build_feature_map, build_symbol_features
+from auto_valuation.learning.cross_industry import (
+    AnalogSet,
+    FEATURE_NAMES,
+    PATTERN_LIBRARY,
+    build_analog_observations,
+    cosine_similarity,
+    compute_global_overlay,
+    find_analogs,
+    match_pattern_library,
+)
+from auto_valuation.learning.ledger import LedgerReader
+from auto_valuation.learning.postmortem import should_run_quinquennial
+from auto_valuation.learning.relationship_graph import build_relationship_graph
+
+
+_SECTOR_ALIASES = {
+    "basic materials": "Materials",
+    "consumer cyclical": "Consumer Discretionary",
+    "consumer defensive": "Consumer Staples",
+    "financial services": "Financials",
+    "healthcare": "Health Care",
+    "technology": "Information Technology",
+}
+
+
+class _LiveCalibrationStore:
+    def save_prior(self, _prior: Any) -> None:
+        return None
+
+
+_LIVE_CALIBRATION_STORE = _LiveCalibrationStore()
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _as_decimal(value: float | None) -> float:
+    if value is None:
+        return 0.0
+    value = float(value)
+    return value / 100 if abs(value) > 1.0 else value
+
+
+def _safe_mean(values: list[float]) -> float:
+    clean = [float(value) for value in values if value is not None]
+    return statistics.mean(clean) if clean else 0.0
+
+
+def _safe_pstdev(values: list[float]) -> float:
+    clean = [float(value) for value in values if value is not None]
+    return statistics.pstdev(clean) if len(clean) >= 2 else 0.0
+
+
+def _trimmed_mean(values: list[float]) -> float:
+    clean = [float(value) for value in values if value is not None]
+    if not clean:
+        return 0.0
+    if len(clean) < 5:
+        return _safe_mean(clean)
+    ordered = sorted(clean)
+    return statistics.mean(ordered[1:-1])
+
+
+def _learning_pool_limit(default: int = 1000) -> int:
+    try:
+        return max(int(LEARNING_CONFIG.get("learning_observation_limit", default)), default)
+    except Exception:
+        return default
+
+
+def _growth_rates(revenues: list[float]) -> list[float]:
+    rates: list[float] = []
+    for idx in range(1, len(revenues)):
+        prev = revenues[idx - 1]
+        curr = revenues[idx]
+        if prev and prev > 0 and curr is not None:
+            rates.append(curr / prev - 1)
+    return rates
+
+
+def _rolling_cagr(revenues: list[float], years: int = 5) -> float:
+    if len(revenues) < 2:
+        return 0.0
+    usable = revenues[-(years + 1):] if len(revenues) > years else revenues
+    if len(usable) < 2 or usable[0] <= 0 or usable[-1] <= 0:
+        return 0.0
+    periods = len(usable) - 1
+    return (usable[-1] / usable[0]) ** (1.0 / periods) - 1.0
+
+
+def _history_window_years(revenues: list[float]) -> int:
+    if len(revenues) < 2:
+        return 1
+    return max(1, min(5, len(revenues) - 1))
+
+
+def _maturity_bucket(data_vintage_years: int) -> str:
+    if data_vintage_years <= 3:
+        return "1-3"
+    if data_vintage_years <= 10:
+        return "4-10"
+    if data_vintage_years <= 20:
+        return "11-20"
+    return "21+"
+
+
+def _pattern_definition(pattern_name: str | None) -> Any | None:
+    if not pattern_name:
+        return None
+    for pattern in PATTERN_LIBRARY:
+        if pattern.name == pattern_name:
+            return pattern
+    return None
+
+
+def _overlay_rows(driver_key: str, weights: dict[str, Any]) -> list[dict[str, Any]]:
+    overlays: list[dict[str, Any]] = []
+
+    pattern_overlay = float(weights.get("pattern_overlay_pp") or 0.0)
+    if abs(pattern_overlay) >= 0.1:
+        overlays.append(
+            {
+                "label": "Analog pattern",
+                "impact": round(pattern_overlay, 1),
+                "unit": "pp",
+            }
+        )
+
+    if driver_key == "beta":
+        global_overlay = float(weights.get("global_overlay") or 0.0)
+        if abs(global_overlay) >= 0.01:
+            overlays.append(
+                {
+                    "label": "Global brain",
+                    "impact": round(global_overlay, 2),
+                    "unit": "x",
+                }
+            )
+        relationship_overlay = float(weights.get("relationship_overlay") or 0.0)
+        if abs(relationship_overlay) >= 0.01:
+            overlays.append(
+                {
+                    "label": "Relationship graph",
+                    "impact": round(relationship_overlay, 2),
+                    "unit": "x",
+                }
+            )
+        return overlays
+
+    global_overlay = float(weights.get("global_overlay_pp") or 0.0)
+    if abs(global_overlay) >= 0.1:
+        overlays.append(
+            {
+                "label": "Global brain",
+                "impact": round(global_overlay, 1),
+                "unit": "pp",
+            }
+        )
+    relationship_overlay = float(weights.get("relationship_overlay_pp") or 0.0)
+    if abs(relationship_overlay) >= 0.1:
+        overlays.append(
+            {
+                "label": "Relationship graph",
+                "impact": round(relationship_overlay, 1),
+                "unit": "pp",
+            }
+        )
+    return overlays
+
+
+def _driver_layer(
+    key: str,
+    label: str,
+    final_value: float,
+    unit: str,
+    weights: dict[str, Any],
+) -> dict[str, Any]:
+    display_precision = 2 if unit == "x" else 1
+    return {
+        "driver": label,
+        "final_value": round(float(final_value), display_precision),
+        "unit": unit,
+        "weights": {
+            "company_history": round(float(weights.get("company_history") or 0.0) * 100),
+            "sector_prior": round(float(weights.get("sector_prior") or 0.0) * 100),
+            "learned_cohort": round(float(weights.get("learned_cohort") or 0.0) * 100),
+        },
+        "company_anchor": weights.get("company_value"),
+        "sector_anchor": weights.get("sector_value"),
+        "learned_adjustment": weights.get("learned_value"),
+        "overlays": _overlay_rows(key, weights),
+        "source": weights.get("source"),
+        "warn": weights.get("warn"),
+    }
+
+
+def _obs_value(observation: Any, key: str, default: Any = None) -> Any:
+    if isinstance(observation, dict):
+        return observation.get(key, default)
+    return getattr(observation, key, default)
+
+
+def _residual_values(observations: list[Any], actual_key: str, predicted_key: str) -> list[float]:
+    residuals: list[float] = []
+    for observation in observations:
+        actual = _obs_value(observation, actual_key)
+        predicted = _obs_value(observation, predicted_key)
+        if actual is None or predicted is None:
+            continue
+        residuals.append(float(actual) - float(predicted))
+    return residuals
+
+
+def _structural_break_flag(observation: Any) -> bool:
+    if bool(_obs_value(observation, "structural_break_flag", False)):
+        return True
+    if bool(_obs_value(observation, "structural_break_detected", False)):
+        return True
+    return bool(_obs_value(observation, "structural_break_hints", []) or [])
+
+
+def _observation_similarity(observation: Any, feature_vector: Any) -> float:
+    other_vector = _obs_value(observation, "feature_vector")
+    if not feature_vector or not other_vector:
+        return 0.0
+    try:
+        return max(0.0, float(cosine_similarity(feature_vector, other_vector)))
+    except Exception:
+        return 0.0
+
+
+def _normalise_layer_scores(scores: dict[str, float]) -> dict[str, float]:
+    clean = {key: max(float(value), 0.0) for key, value in scores.items()}
+    total = sum(clean.values())
+    if total <= 0:
+        return {key: 0.0 for key in clean}
+    return {key: value / total for key, value in clean.items()}
+
+
+def _blend_observation_metric(
+    layer_observations: dict[str, list[Any]],
+    layer_weights: dict[str, float],
+    actual_key: str,
+    predicted_key: str,
+) -> tuple[float, int, float]:
+    contributions: list[tuple[float, float, int]] = []
+    for layer_name, observations in layer_observations.items():
+        residuals = _residual_values(observations, actual_key, predicted_key)
+        if not residuals:
+            continue
+        contributions.append((float(layer_weights.get(layer_name) or 0.0), _trimmed_mean(residuals), len(residuals)))
+    total_weight = sum(weight for weight, _, _ in contributions)
+    if total_weight <= 0:
+        return 0.0, 0, 0.0
+    normalized = [(weight / total_weight, mean_residual, count) for weight, mean_residual, count in contributions]
+    adjustment = sum(weight * mean_residual for weight, mean_residual, _ in normalized)
+    conflict = _safe_pstdev([mean_residual for _, mean_residual, _ in normalized]) if len(normalized) >= 2 else 0.0
+    evidence_count = sum(count for _, _, count in contributions)
+    return adjustment, evidence_count, conflict
+
+
+def _build_layered_learning_snapshot(
+    *,
+    ticker: str,
+    sector: str,
+    industry: str,
+    data_vintage_years: int,
+    market_cap_regime: str,
+    macro_regime: str,
+    feature_vector: dict[str, float],
+    observations: list[Any],
+    analog_set: AnalogSet,
+    global_learning: dict[str, Any],
+    pattern_name: str | None,
+    pattern_score: float,
+    margin_normalisation: dict[str, Any],
+    core_weight_maps: list[dict[str, float]],
+    calibrated: Any,
+    base_ufcf_margin: float,
+    base_reinvestment_rate: float,
+) -> dict[str, Any]:
+    target_bucket = _maturity_bucket(data_vintage_years)
+    ticker_upper = (ticker or "").upper()
+    company_observations = [
+        observation
+        for observation in observations
+        if str(_obs_value(observation, "ticker", "") or "").upper() == ticker_upper and ticker_upper
+    ]
+    cohort_observations = [
+        observation
+        for observation in observations
+        if _knowledge_sector(str(_obs_value(observation, "sector", "") or "")) == sector
+        and (not industry or str(_obs_value(observation, "industry", "") or "") in ("", industry))
+        and _maturity_bucket(int(_obs_value(observation, "data_vintage_years", 0) or 0)) == target_bucket
+        and str(_obs_value(observation, "market_cap_regime", "") or "") == market_cap_regime
+        and str(_obs_value(observation, "macro_regime", "") or "") == macro_regime
+    ]
+    sector_observations = [
+        observation
+        for observation in observations
+        if _knowledge_sector(str(_obs_value(observation, "sector", "") or "")) == sector
+        and _maturity_bucket(int(_obs_value(observation, "data_vintage_years", 0) or 0)) == target_bucket
+    ]
+    macro_observations = [
+        observation
+        for observation in observations
+        if str(_obs_value(observation, "market_cap_regime", "") or "") == market_cap_regime
+        and str(_obs_value(observation, "macro_regime", "") or "") == macro_regime
+    ]
+    global_observations = list(observations)
+
+    same_sector_similarities = [_observation_similarity(observation, feature_vector) for observation in sector_observations]
+    cross_sector_similarities = [
+        _observation_similarity(observation, feature_vector)
+        for observation in global_observations
+        if _knowledge_sector(str(_obs_value(observation, "sector", "") or "")) != sector
+    ]
+    same_sector_similarity = max(same_sector_similarities) if same_sector_similarities else 0.0
+    cross_sector_similarity = max(cross_sector_similarities) if cross_sector_similarities else 0.0
+
+    flagged_records = sum(1 for observation in global_observations if _structural_break_flag(observation))
+    flagged_ratio = flagged_records / len(global_observations) if global_observations else 0.0
+    similarity_gap = max(0.0, cross_sector_similarity - same_sector_similarity)
+    structural_break_score = 0.0
+    structural_break_reasons: list[str] = []
+    if flagged_ratio > 0:
+        structural_break_score = max(structural_break_score, flagged_ratio)
+        structural_break_reasons.append(
+            f"{flagged_records} realised observation(s) already carry structural-break hints in the learning ledger."
+        )
+    if margin_normalisation.get("applied"):
+        margin_signal = 0.55 if float(margin_normalisation.get("scenario_width_multiplier") or 1.0) > 1.5 else 0.35
+        structural_break_score = max(structural_break_score, margin_signal)
+        structural_break_reasons.append(str(margin_normalisation.get("note") or "Margin history is unstable versus the recent base."))
+    if pattern_name == "DISRUPTED_INCUMBENT" and pattern_score >= 0.7:
+        structural_break_score = max(structural_break_score, min(1.0, 0.45 + 0.35 * pattern_score))
+        structural_break_reasons.append("The active analog pattern resembles a disrupted incumbent regime rather than a stable continuation.")
+    if similarity_gap > 0.08:
+        structural_break_score = max(structural_break_score, _clamp((similarity_gap - 0.08) / 0.22, 0.0, 1.0))
+        structural_break_reasons.append(
+            f"Cross-sector analog similarity ({cross_sector_similarity:.2f}) is overtaking same-sector similarity ({same_sector_similarity:.2f})."
+        )
+    structural_break_detected = structural_break_score >= 0.45
+
+    avg_company_weight = _safe_mean([weights.get("company_history", 0.0) for weights in core_weight_maps])
+    avg_sector_weight = _safe_mean([weights.get("sector_prior", 0.0) for weights in core_weight_maps])
+    avg_cohort_weight = _safe_mean([weights.get("learned_cohort", 0.0) for weights in core_weight_maps])
+    analog_signal = _clamp(
+        0.04 + float(analog_set.analog_confidence or 0.0) * 0.18 + max(pattern_score - 0.65, 0.0) * 0.15,
+        0.0,
+        0.28,
+    )
+    macro_signal = _clamp(
+        0.03 + min(len(macro_observations) / 8.0, 1.0) * 0.10 + float(global_learning.get("confidence") or 0.0) * 0.06,
+        0.0,
+        0.20,
+    )
+    global_signal = _clamp(
+        0.02 + (float(global_learning.get("confidence") or 0.0) * 0.14 if global_learning.get("enabled") else 0.02),
+        0.0,
+        0.18,
+    )
+    layer_weights = _normalise_layer_scores(
+        {
+            "company_memory": avg_company_weight * (0.25 if not company_observations else 1.0) * (1.0 - 0.35 * structural_break_score),
+            "sector_memory": avg_sector_weight * (1.0 + 0.10 * structural_break_score),
+            "cohort_memory": avg_cohort_weight * (0.35 if not cohort_observations else 1.0) * (1.0 - 0.20 * structural_break_score),
+            "analog_memory": analog_signal * (1.0 + 0.45 * structural_break_score),
+            "macro_memory": macro_signal * (1.0 + 0.25 * structural_break_score),
+            "global_memory": global_signal * (1.0 + 0.35 * structural_break_score),
+        }
+    )
+    layer_observations = {
+        "company_memory": company_observations,
+        "cohort_memory": cohort_observations,
+        "sector_memory": sector_observations,
+        "macro_memory": macro_observations,
+        "global_memory": global_observations,
+    }
+    revenue_conflict = _safe_pstdev(
+        [
+            _trimmed_mean(values)
+            for values in [
+                _residual_values(company_observations, "actual_revenue_growth", "predicted_revenue_growth"),
+                _residual_values(cohort_observations, "actual_revenue_growth", "predicted_revenue_growth"),
+                _residual_values(sector_observations, "actual_revenue_growth", "predicted_revenue_growth"),
+                _residual_values(macro_observations, "actual_revenue_growth", "predicted_revenue_growth"),
+                _residual_values(global_observations, "actual_revenue_growth", "predicted_revenue_growth"),
+            ]
+            if values
+        ]
+    )
+    margin_conflict = _safe_pstdev(
+        [
+            _trimmed_mean(values)
+            for values in [
+                _residual_values(company_observations, "actual_ebit_margin", "predicted_ebit_margin"),
+                _residual_values(cohort_observations, "actual_ebit_margin", "predicted_ebit_margin"),
+                _residual_values(sector_observations, "actual_ebit_margin", "predicted_ebit_margin"),
+                _residual_values(macro_observations, "actual_ebit_margin", "predicted_ebit_margin"),
+                _residual_values(global_observations, "actual_ebit_margin", "predicted_ebit_margin"),
+            ]
+            if values
+        ]
+    )
+    conflict_score = max(revenue_conflict, margin_conflict)
+    weak_evidence = len(company_observations) == 0 and len(cohort_observations) < 5
+    effective_confidence = _clamp(
+        float(calibrated.calibration_confidence or 0.0)
+        * (0.72 if weak_evidence else 1.0)
+        * (1.0 - 0.35 * structural_break_score),
+        0.0,
+        1.0,
+    )
+    scenario_width_multiplier = round(
+        _clamp(
+            max(
+                float(margin_normalisation.get("scenario_width_multiplier") or 1.0),
+                1.0 + (0.30 if weak_evidence else 0.0) + (0.55 * structural_break_score) + min(conflict_score / 0.03, 0.45),
+            ),
+            1.0,
+            2.5,
+        ),
+        2,
+    )
+    ufcf_adjustment, ufcf_evidence, ufcf_conflict = _blend_observation_metric(
+        layer_observations,
+        layer_weights,
+        "actual_ufcf_margin",
+        "predicted_ufcf_margin",
+    )
+    reinvestment_adjustment, reinvestment_evidence, reinvestment_conflict = _blend_observation_metric(
+        layer_observations,
+        layer_weights,
+        "actual_reinvestment_rate",
+        "predicted_reinvestment_rate",
+    )
+    learned_ufcf_margin = _clamp(base_ufcf_margin + ufcf_adjustment, -0.25, 0.35)
+    learned_reinvestment_rate = _clamp(base_reinvestment_rate + reinvestment_adjustment, 0.0, 0.25)
+    ufcf_confidence = _clamp(
+        min(1.0, ufcf_evidence / 10.0) * (1.0 - min(ufcf_conflict / 0.04, 0.75)),
+        0.0,
+        1.0,
+    )
+    reinvestment_confidence = _clamp(
+        min(1.0, reinvestment_evidence / 10.0) * (1.0 - min(reinvestment_conflict / 0.04, 0.75)),
+        0.0,
+        1.0,
+    )
+
+    def _layer_snapshot(layer_name: str, records: int, note: str, enabled: bool = True) -> dict[str, Any]:
+        return {
+            "weight_pct": round(float(layer_weights.get(layer_name) or 0.0) * 100),
+            "records": records,
+            "enabled": enabled,
+            "note": note,
+        }
+
+    return {
+        "layer_mix": {
+            "company_memory": _layer_snapshot(
+                "company_memory",
+                len(company_observations),
+                "Same-ticker realised history feeds the company-memory layer when prior forecasts have matured.",
+                enabled=bool(company_observations),
+            ),
+            "sector_memory": _layer_snapshot(
+                "sector_memory",
+                len(sector_observations),
+                "Sector priors remain the stabilising layer when company-specific evidence is thin or noisy.",
+                enabled=bool(sector_observations),
+            ),
+            "cohort_memory": _layer_snapshot(
+                "cohort_memory",
+                len(cohort_observations),
+                "Matched realised cohorts contribute residual corrections rather than replacing the base model wholesale.",
+                enabled=bool(cohort_observations),
+            ),
+            "analog_memory": {
+                **_layer_snapshot(
+                    "analog_memory",
+                    len(analog_set.analogs),
+                    "Analog history comes from similar operating fingerprints and pattern matches across symbols.",
+                    enabled=bool(analog_set.analogs),
+                ),
+                "confidence": round(float(analog_set.analog_confidence or 0.0), 2),
+                "pattern_name": pattern_name,
+            },
+            "macro_memory": _layer_snapshot(
+                "macro_memory",
+                len(macro_observations),
+                f"Macro memory reuses realised records from the same {macro_regime} regime and {market_cap_regime} cap bucket.",
+                enabled=bool(macro_observations),
+            ),
+            "global_memory": {
+                **_layer_snapshot(
+                    "global_memory",
+                    len(global_observations),
+                    global_learning.get("note") or "Global cross-symbol memory stays as a low-conviction stabiliser until enough evidence accrues.",
+                    enabled=bool(global_learning.get("enabled")),
+                ),
+                "scope": global_learning.get("scope"),
+                "sector_span": int(global_learning.get("sector_span") or 0),
+                "confidence": round(float(global_learning.get("confidence") or 0.0), 2),
+            },
+        },
+        "structural_break": {
+            "detected": structural_break_detected,
+            "score": round(structural_break_score, 2),
+            "flagged_records": flagged_records,
+            "same_sector_similarity": round(same_sector_similarity, 3),
+            "cross_sector_similarity": round(cross_sector_similarity, 3),
+            "reasons": structural_break_reasons,
+            "note": (
+                "Structural-break risk is active, so scenario widths are widened and historical anchors are treated more cautiously."
+                if structural_break_detected
+                else "No strong structural-break signal is active in the current layered evidence set."
+            ),
+        },
+        "uncertainty": {
+            "weak_evidence": weak_evidence,
+            "conflict_score": round(conflict_score, 4),
+            "effective_confidence": round(effective_confidence, 2),
+            "scenario_width_multiplier": scenario_width_multiplier,
+            "note": (
+                "Weak or conflicting evidence lowers confidence and widens ranges instead of forcing precision."
+                if weak_evidence or conflict_score > 0.01 or structural_break_detected
+                else "Evidence quality is stable enough that the learning layer can stay relatively tight."
+            ),
+        },
+        "learned_metrics": {
+            "ufcf_margin_pct": round(learned_ufcf_margin * 100, 1),
+            "ufcf_margin_adjustment_pp": round(ufcf_adjustment * 100, 1),
+            "ufcf_margin_confidence": round(ufcf_confidence, 2),
+            "ufcf_margin_evidence": ufcf_evidence,
+            "reinvestment_rate_pct": round(learned_reinvestment_rate * 100, 1),
+            "reinvestment_adjustment_pp": round(reinvestment_adjustment * 100, 1),
+            "reinvestment_confidence": round(reinvestment_confidence, 2),
+            "reinvestment_evidence": reinvestment_evidence,
+            "note": "Cashflow-side learning is derived from realised UFCF and reinvestment proxies when those labels exist in the ledger.",
+        },
+    }
+
+
+def _build_data_gaps(
+    *,
+    history_window_years: int,
+    review_due: bool,
+    calibration_cohort_size: int,
+    global_learning: dict[str, Any],
+    pattern_name: str | None,
+    pattern_score: float,
+    margin_normalisation: dict[str, Any],
+    layered_learning: dict[str, Any],
+) -> list[dict[str, str]]:
+    gaps: list[dict[str, str]] = []
+    uncertainty = dict(layered_learning.get("uncertainty") or {})
+    structural_break = dict(layered_learning.get("structural_break") or {})
+
+    if history_window_years < 4:
+        gaps.append(
+            {
+                "title": "Short company memory",
+                "detail": f"Only {history_window_years} year(s) of history are carrying the company-memory layer, so sector priors still anchor more of the forecast.",
+                "severity": "amber",
+            }
+        )
+
+    if calibration_cohort_size < 5:
+        gaps.append(
+            {
+                "title": "Realised cohort is still thin",
+                "detail": f"Only {calibration_cohort_size} matching realised records are available, so learned cohort weights stay deliberately small.",
+                "severity": "amber",
+            }
+        )
+
+    if not global_learning.get("enabled"):
+        gaps.append(
+            {
+                "title": "Global brain is not fully engaged",
+                "detail": "Cross-symbol overlays stay off until the market-wide realised cohort is broad enough by regime and sector span.",
+                "severity": "amber",
+            }
+        )
+
+    if not pattern_name or pattern_score < 0.7:
+        gaps.append(
+            {
+                "title": "Analog evidence is weak",
+                "detail": "No high-conviction analog pattern matched this ticker, so the model leans more heavily on company and sector memory.",
+                "severity": "amber",
+            }
+        )
+
+    if margin_normalisation.get("applied"):
+        gaps.append(
+            {
+                "title": "Margin history is unstable",
+                "detail": str(margin_normalisation.get("note") or "Margin volatility forced a more conservative normalisation anchor."),
+                "severity": "red" if float(margin_normalisation.get("scenario_width_multiplier") or 1.0) > 1.5 else "amber",
+            }
+        )
+
+    if bool(uncertainty.get("weak_evidence")):
+        gaps.append(
+            {
+                "title": "Layered evidence is still thin",
+                "detail": "The live learning engine is lowering confidence and widening ranges because the company/cohort evidence base is still sparse.",
+                "severity": "amber",
+            }
+        )
+
+    if bool(structural_break.get("detected")):
+        gaps.append(
+            {
+                "title": "Structural break risk is active",
+                "detail": str(structural_break.get("note") or "Recent evidence suggests the business may be shifting regimes."),
+                "severity": "red" if float(structural_break.get("score") or 0.0) >= 0.65 else "amber",
+            }
+        )
+
+    if review_due:
+        gaps.append(
+            {
+                "title": "Company history review is due",
+                "detail": "The quinquennial review window is open, so older history should be treated with more caution than usual.",
+                "severity": "amber",
+            }
+        )
+
+    return gaps
+
+
+def _build_learning_explainability(
+    *,
+    history_window_years: int,
+    completed_years: int,
+    review_due: bool,
+    next_review_in_years: int,
+    calibrated: Any,
+    analog_payload: dict[str, Any],
+    global_learning: dict[str, Any],
+    pattern_name: str | None,
+    pattern_score: float,
+    margin_normalisation: dict[str, Any],
+    assumption_weights: dict[str, dict[str, Any]],
+    layered_learning: dict[str, Any],
+    refined_growth: float,
+    refined_margin_target: float,
+    refined_wacc: float,
+    refined_terminal_growth: float,
+    smoothed_beta: float,
+    relationship_graph: dict[str, Any],
+) -> dict[str, Any]:
+    layer_mix = dict(layered_learning.get("layer_mix") or {})
+    company_mix = dict(layer_mix.get("company_memory") or {})
+    sector_mix = dict(layer_mix.get("sector_memory") or {})
+    cohort_mix = dict(layer_mix.get("cohort_memory") or {})
+    analog_mix = dict(layer_mix.get("analog_memory") or {})
+    macro_mix = dict(layer_mix.get("macro_memory") or {})
+    global_mix = dict(layer_mix.get("global_memory") or {})
+    structural_break = dict(layered_learning.get("structural_break") or {})
+    uncertainty = dict(layered_learning.get("uncertainty") or {})
+    learned_metrics = dict(layered_learning.get("learned_metrics") or {})
+
+    avg_company_weight = int(company_mix.get("weight_pct") or 0)
+    avg_sector_weight = int(sector_mix.get("weight_pct") or 0)
+    avg_learned_weight = int(cohort_mix.get("weight_pct") or 0)
+
+    pattern = _pattern_definition(pattern_name)
+    pattern_label = pattern_name.replace("_", " ").title() if pattern_name else None
+    analog_items = list(analog_payload.get("items") or [])
+    analog_pattern_enabled = bool(pattern and pattern_score >= 0.7)
+    analog_enabled = analog_pattern_enabled or bool(analog_items)
+    nearest_tickers = ", ".join(
+        str(item.get("ticker") or "")
+        for item in analog_items[:3]
+        if item.get("ticker")
+    )
+    if analog_items and analog_pattern_enabled:
+        analog_note = (
+            f"{len(analog_items)} live analog match(s) are active. "
+            f"Pattern analog {pattern_label} reinforces them with score {pattern_score:.2f}."
+        )
+        if nearest_tickers:
+            analog_note = f"{analog_note} Nearest analogs: {nearest_tickers}."
+    elif analog_items:
+        analog_note = f"{len(analog_items)} live analog match(s) are active."
+        if nearest_tickers:
+            analog_note = f"{analog_note} Nearest analogs: {nearest_tickers}."
+    elif analog_pattern_enabled:
+        analog_note = f"Pattern analog {pattern_label} is active with score {pattern_score:.2f}."
+    else:
+        analog_note = "No high-conviction analog pattern is active; analog evidence remains descriptive rather than directive."
+
+    analog_matches: list[dict[str, Any]] = []
+    for item in analog_items[:3]:
+        evidence_rows = [
+            {
+                "label": str(evidence.get("label") or evidence.get("dimension") or "Signal"),
+                "similarity": round(float(evidence.get("similarity") or 0.0), 2),
+                "subject": evidence.get("subject"),
+                "analog": evidence.get("analog"),
+                "bucket": evidence.get("bucket"),
+            }
+            for evidence in list(item.get("evidence") or [])[:3]
+        ]
+        evidence_summary = ", ".join(
+            f"{evidence['label']} {evidence['subject']} vs {evidence['analog']}"
+            for evidence in evidence_rows[:2]
+            if evidence.get("subject") not in (None, "") and evidence.get("analog") not in (None, "")
+        )
+        analog_matches.append(
+            {
+                "ticker": item.get("ticker"),
+                "sector": item.get("sector"),
+                "industry": item.get("industry"),
+                "score": round(float(item.get("score") or 0.0), 3),
+                "similarity": round(float(item.get("similarity") or 0.0), 3),
+                "static_similarity": round(float(item.get("static_similarity") or 0.0), 3),
+                "regime_similarity": round(float(item.get("regime_similarity") or 0.0), 3),
+                "maturity_stage": item.get("maturity_stage"),
+                "valuation_regime": item.get("valuation_regime"),
+                "volatility_regime": item.get("volatility_regime"),
+                "evidence": evidence_rows,
+                "why_it_matters": evidence_summary or "Matched on operating fingerprint and regime alignment.",
+                "weights": {
+                    "recency": round(float((item.get("weights") or {}).get("recency") or 0.0), 2),
+                    "data_quality": round(float((item.get("weights") or {}).get("data_quality") or 0.0), 2),
+                    "sample": round(float((item.get("weights") or {}).get("sample") or 0.0), 2),
+                    "usefulness": round(float((item.get("weights") or {}).get("usefulness") or 0.0), 2),
+                },
+            }
+        )
+
+    confidence_components = [
+        {
+            "label": "Company memory",
+            "score": avg_company_weight,
+            "detail": f"{history_window_years}y of operating history and {int(company_mix.get('records') or 0)} matured ticker-specific record(s) support the company layer.",
+        },
+        {
+            "label": "Cohort memory",
+            "score": round(float(uncertainty.get("effective_confidence") or calibrated.calibration_confidence or 0.0) * 100),
+            "detail": f"{int(cohort_mix.get('records') or calibrated.calibration_cohort_size or 0)} realised records feed residual cohort corrections.",
+        },
+        {
+            "label": "Analog evidence",
+            "score": max(round((pattern_score if analog_enabled else min(pattern_score, 0.4)) * 100), int(analog_mix.get("weight_pct") or 0)),
+            "detail": analog_note,
+        },
+        {
+            "label": "Global brain",
+            "score": round(float(global_learning.get("confidence") or 0.0) * 100),
+            "detail": global_learning.get("note") or "Global cross-symbol overlays are inactive until enough realised evidence exists.",
+        },
+        {
+            "label": "Regime stability",
+            "score": round((1.0 - float(structural_break.get("score") or 0.0)) * 100),
+            "detail": structural_break.get("note") or "No structural-break warning is active.",
+        },
+    ]
+
+    data_gaps = _build_data_gaps(
+        history_window_years=history_window_years,
+        review_due=review_due,
+        calibration_cohort_size=calibrated.calibration_cohort_size,
+        global_learning=global_learning,
+        pattern_name=pattern_name,
+        pattern_score=pattern_score,
+        margin_normalisation=margin_normalisation,
+        layered_learning=layered_learning,
+    )
+
+    review_window = "due now" if review_due else f"in {next_review_in_years} year(s)"
+    headline = (
+        f"Core forecast mix: {avg_company_weight}% company memory, {avg_sector_weight}% sector prior, "
+        f"{avg_learned_weight}% realised cohort learning, {int(analog_mix.get('weight_pct') or 0)}% analog memory, "
+        f"and {int(global_mix.get('weight_pct') or 0)}% global memory. Review window {review_window}."
+    )
+
+    return {
+        "headline": headline,
+        "company_memory": {
+            "history_window_years": history_window_years,
+            "completed_years": completed_years,
+            "weight_pct": avg_company_weight,
+            "records": int(company_mix.get("records") or 0),
+            "review_due": review_due,
+            "next_review_in_years": next_review_in_years,
+            "note": company_mix.get("note") or f"Company history remains the primary anchor because the business has {completed_years} completed year(s) on file.",
+        },
+        "sector_memory": {
+            "weight_pct": int(sector_mix.get("weight_pct") or 0),
+            "records": int(sector_mix.get("records") or 0),
+            "note": sector_mix.get("note"),
+        },
+        "cohort_memory": {
+            "records": int(calibrated.calibration_cohort_size or cohort_mix.get("records") or 0),
+            "confidence": round(float(uncertainty.get("effective_confidence") or calibrated.calibration_confidence or 0.0), 2),
+            "weight_pct": avg_learned_weight,
+            "note": cohort_mix.get("note") or "The learned cohort only nudges assumptions when realised records are broad enough to justify it.",
+        },
+        "analog_evidence": {
+            "enabled": analog_enabled,
+            "pattern_enabled": analog_pattern_enabled,
+            "pattern_name": pattern_name,
+            "pattern_label": pattern_label,
+            "pattern_score": round(pattern_score, 2),
+            "weight_pct": int(analog_mix.get("weight_pct") or 0),
+            "confidence": round(float(analog_mix.get("confidence") or 0.0), 2),
+            "match_count": int(analog_payload.get("count") or analog_mix.get("records") or 0),
+            "archetypes": list(pattern.archetypes[:3]) if pattern else [],
+            "top_matches": analog_matches,
+            "cohorts": list(analog_payload.get("cohorts") or [])[:3],
+            "overlay": dict(analog_payload.get("overlay") or {}),
+            "note": analog_note,
+        },
+        "analog_memory": {
+            "enabled": bool(analog_mix.get("enabled")),
+            "weight_pct": int(analog_mix.get("weight_pct") or 0),
+            "records": int(analog_mix.get("records") or 0),
+            "pattern_name": analog_mix.get("pattern_name"),
+            "confidence": round(float(analog_mix.get("confidence") or 0.0), 2),
+            "note": analog_mix.get("note") or analog_note,
+        },
+        "macro_memory": {
+            "weight_pct": int(macro_mix.get("weight_pct") or 0),
+            "records": int(macro_mix.get("records") or 0),
+            "enabled": bool(macro_mix.get("enabled")),
+            "note": macro_mix.get("note"),
+        },
+        "global_brain": {
+            "enabled": bool(global_learning.get("enabled")),
+            "scope": global_learning.get("scope"),
+            "cohort_size": int(global_learning.get("cohort_size") or 0),
+            "sector_span": int(global_learning.get("sector_span") or 0),
+            "confidence": round(float(global_learning.get("confidence") or 0.0), 2),
+            "weight_pct": int(global_mix.get("weight_pct") or 0),
+            "overlays": [
+                {"driver": "Revenue Growth", "impact": float(global_learning.get("revenue_growth_adj_pp") or 0.0), "unit": "pp"},
+                {"driver": "EBIT Margin", "impact": float(global_learning.get("ebit_margin_adj_pp") or 0.0), "unit": "pp"},
+                {"driver": "WACC", "impact": float(global_learning.get("wacc_adj_pp") or 0.0), "unit": "pp"},
+                {"driver": "Terminal Growth", "impact": float(global_learning.get("terminal_growth_adj_pp") or 0.0), "unit": "pp"},
+                {"driver": "Beta", "impact": float(global_learning.get("beta_adj") or 0.0), "unit": "x"},
+            ],
+            "note": global_learning.get("note") or "Global cross-symbol overlays are currently inactive.",
+        },
+        "global_memory": {
+            "enabled": bool(global_mix.get("enabled")),
+            "weight_pct": int(global_mix.get("weight_pct") or 0),
+            "records": int(global_mix.get("records") or 0),
+            "scope": global_mix.get("scope"),
+            "sector_span": int(global_mix.get("sector_span") or 0),
+            "confidence": round(float(global_mix.get("confidence") or 0.0), 2),
+            "note": global_mix.get("note"),
+        },
+        "relationship_graph": relationship_graph,
+        "structural_break": structural_break,
+        "uncertainty": uncertainty,
+        "learned_metrics": learned_metrics,
+        "forecast_layers": [
+            _driver_layer("revenue_growth_near", "Revenue Growth", refined_growth, "%", assumption_weights["revenue_growth_near"]),
+            _driver_layer("ebit_margin_target", "EBIT Margin", refined_margin_target, "%", assumption_weights["ebit_margin_target"]),
+            _driver_layer("wacc", "WACC", refined_wacc, "%", assumption_weights["wacc"]),
+            _driver_layer("terminal_growth", "Terminal Growth", refined_terminal_growth, "%", assumption_weights["terminal_growth"]),
+            _driver_layer("beta", "Beta", smoothed_beta, "x", assumption_weights["beta"]),
+        ],
+        "confidence_decomposition": {
+            "summary": "Shared-brain confidence explains how much of the forecast is supported by history, realised learning, analogs, macro regime memory, and cross-symbol evidence. Weak or conflicting evidence lowers confidence instead of pretending precision.",
+            "components": confidence_components,
+        },
+        "data_gaps": data_gaps,
+        "limitations_note": "When evidence is thin or regimes look unstable, the model deliberately widens ranges and falls back toward more stable anchors instead of forcing overfit learned overlays.",
+    }
+
+
+def _memory_hierarchy_status(score: int) -> str:
+    if score >= 80:
+        return "high"
+    if score >= 65:
+        return "moderate"
+    if score >= 50:
+        return "guarded"
+    return "low"
+
+
+def _build_memory_hierarchy(
+    *,
+    explainability: dict[str, Any],
+    confidence_model: dict[str, Any],
+    relationship_graph: dict[str, Any],
+) -> dict[str, Any]:
+    company_memory = dict(explainability.get("company_memory") or {})
+    sector_memory = dict(explainability.get("sector_memory") or {})
+    cohort_memory = dict(explainability.get("cohort_memory") or {})
+    analog_memory = dict(explainability.get("analog_memory") or {})
+    macro_memory = dict(explainability.get("macro_memory") or {})
+    global_memory = dict(explainability.get("global_memory") or {})
+    uncertainty = dict(explainability.get("uncertainty") or {})
+
+    episodic_score = int(
+        round(
+            _clamp(
+                0.70 * (float(company_memory.get("weight_pct") or 0.0) / 100.0)
+                + 0.30 * min(float(company_memory.get("records") or 0.0) / 3.0, 1.0),
+                0.0,
+                1.0,
+            )
+            * 100
+        )
+    )
+    semantic_score = int(
+        round(
+            _clamp(
+                0.42 * (float(sector_memory.get("weight_pct") or 0.0) / 100.0)
+                + 0.40 * (float(cohort_memory.get("weight_pct") or 0.0) / 100.0)
+                + 0.18 * (float(macro_memory.get("weight_pct") or 0.0) / 100.0),
+                0.0,
+                1.0,
+            )
+            * 100
+        )
+    )
+    relational_score = int(
+        round(
+            _clamp(
+                0.32 * (float(analog_memory.get("weight_pct") or 0.0) / 100.0)
+                + 0.24 * (float(global_memory.get("weight_pct") or 0.0) / 100.0)
+                + 0.44 * float(relationship_graph.get("confidence") or 0.0),
+                0.0,
+                1.0,
+            )
+            * 100
+        )
+    )
+    procedural_score = int(
+        round(
+            _clamp(
+                0.45 * float((confidence_model.get("assumption_confidence") or {}).get("score") or 0.0)
+                + 0.30 * float((confidence_model.get("valuation_confidence") or {}).get("score") or 0.0)
+                + 0.25 * (1.0 - min(float(uncertainty.get("conflict_score") or 0.0) / 0.03, 1.0)),
+                0.0,
+                1.0,
+            )
+            * 100
+        )
+    )
+
+    layers = [
+        {
+            "key": "episodic",
+            "label": "Episodic Memory",
+            "score": episodic_score,
+            "status": _memory_hierarchy_status(episodic_score),
+            "note": company_memory.get("note") or "Ticker-specific history and matured postmortems anchor the episodic layer.",
+            "sources": ["company history", "matured ticker records"],
+        },
+        {
+            "key": "semantic",
+            "label": "Semantic Memory",
+            "score": semantic_score,
+            "status": _memory_hierarchy_status(semantic_score),
+            "note": "Sector priors, matched cohorts, and macro regime priors form the reusable knowledge layer.",
+            "sources": ["sector priors", "cohort residuals", "macro regime"],
+        },
+        {
+            "key": "relational",
+            "label": "Relational Memory",
+            "score": relational_score,
+            "status": _memory_hierarchy_status(relational_score),
+            "note": relationship_graph.get("note") or "Cross-symbol links are still too thin to contribute much relational memory.",
+            "sources": ["analogs", "global overlays", "relationship graph"],
+            "connected_tickers": list(relationship_graph.get("connected_tickers") or [])[:5],
+        },
+        {
+            "key": "procedural",
+            "label": "Procedural Memory",
+            "score": procedural_score,
+            "status": _memory_hierarchy_status(procedural_score),
+            "note": "Confidence scoring and range widening define how the brain acts when evidence conflicts or regimes shift.",
+            "sources": ["confidence model", "scenario width", "conflict controls"],
+            "scenario_width_multiplier": float(uncertainty.get("scenario_width_multiplier") or 1.0),
+        },
+    ]
+
+    return {
+        "summary": "Memory is split across episodic ticker history, semantic sector/cohort knowledge, relational cross-symbol links, and procedural confidence controls.",
+        "episodic": dict(layers[0]),
+        "semantic": dict(layers[1]),
+        "relational": dict(layers[2]),
+        "procedural": dict(layers[3]),
+        "layers": layers,
+    }
+
+def _normalise_weights(company_weight: float, sector_weight: float, learning_weight: float) -> dict[str, float]:
+    total = company_weight + sector_weight + learning_weight
+    if total <= 0:
+        return {"company_history": 1.0, "sector_prior": 0.0, "learned_cohort": 0.0}
+    return {
+        "company_history": company_weight / total,
+        "sector_prior": sector_weight / total,
+        "learned_cohort": learning_weight / total,
+    }
+
+
+def _market_cap_regime(market_cap_m: float) -> str:
+    if market_cap_m < 2_000:
+        return "small"
+    if market_cap_m < 10_000:
+        return "mid"
+    return "large"
+
+
+def _knowledge_sector(sector: str) -> str:
+    cleaned = (sector or "").strip()
+    if not cleaned:
+        return "Default"
+    return _SECTOR_ALIASES.get(cleaned.lower(), cleaned)
+
+
+def _trailing_ratio_pct(numerators: list[float], denominators: list[float], *, years: int = 5, absolute: bool = False) -> float:
+    ratios: list[float] = []
+    for numerator, denominator in zip(numerators[-years:], denominators[-years:]):
+        if denominator and denominator > 0 and numerator is not None:
+            value = abs(numerator) if absolute else numerator
+            ratios.append(value / denominator * 100)
+    return _safe_mean(ratios)
+
+
+def _normalized_tax_rate_pct(pretax_incomes: list[float], tax_provisions: list[float], fallback: float) -> float:
+    weights: list[tuple[float, float]] = []
+    for pretax_income, tax_provision in zip(pretax_incomes[-5:], tax_provisions[-5:]):
+        if pretax_income and abs(pretax_income) > 1e-9 and tax_provision is not None:
+            etr = tax_provision / pretax_income * 100
+            if abs(etr) <= 60:
+                weights.append((abs(pretax_income), etr))
+    if not weights:
+        return fallback
+    total_weight = sum(weight for weight, _ in weights)
+    if total_weight <= 0:
+        return fallback
+    weighted = sum(weight * etr for weight, etr in weights) / total_weight
+    return _clamp(weighted, 5.0, 45.0)
+
+
+def _build_feature_vector(
+    revenues: list[float],
+    ebit_margins: list[float],
+    gross_margin_base_pct: float,
+    capex_pct: float,
+    total_assets: float,
+    total_debt: float,
+    revenue_base: float,
+    operating_cf: float,
+    fcf: float,
+    da_pct: float,
+    tax_rate_pct: float,
+    market_cap: float,
+) -> dict[str, float]:
+    return build_feature_map(
+        revenues=revenues,
+        ebit_margins=ebit_margins,
+        gross_margin_base_pct=gross_margin_base_pct,
+        capex_pct=capex_pct,
+        total_assets=total_assets,
+        total_debt=total_debt,
+        revenue_base=revenue_base,
+        operating_cf=operating_cf,
+        fcf=fcf,
+        da_pct=da_pct,
+        tax_rate_pct=tax_rate_pct,
+        market_cap=market_cap,
+        market_cap_regime=_market_cap_regime(market_cap),
+        macro_regime="neutral",
+    )
+
+
+def _margin_normalisation(ebit_margins: list[float], base_margin_pct: float, target_margin_pct: float) -> dict[str, Any]:
+    recent = [float(margin) for margin in ebit_margins[-5:] if margin is not None]
+    if not recent:
+        return {
+            "applied": False,
+            "margin_range_pp": 0.0,
+            "margin_volatility_pp": 0.0,
+            "normalized_margin_pct": round(base_margin_pct, 1),
+            "target_anchor_pct": round(target_margin_pct, 1),
+            "scenario_width_multiplier": 1.0,
+            "note": None,
+            "source_suffix": "",
+        }
+
+    margin_range_pp = max(recent) - min(recent) if len(recent) >= 2 else 0.0
+    margin_volatility_pp = _safe_pstdev(recent)
+    normalized_margin_pct = round(_trimmed_mean(recent), 1)
+    profitable_regime = [margin for margin in recent if margin > 0]
+    profitable_anchor_pct = round(_trimmed_mean(profitable_regime), 1) if profitable_regime else normalized_margin_pct
+
+    if margin_range_pp >= 15.0:
+        target_anchor_pct = round(0.65 * profitable_anchor_pct + 0.35 * target_margin_pct, 1)
+        scenario_width_multiplier = 1.8
+        note = (
+            f"Extreme margin volatility detected ({margin_range_pp:.1f}pp range). "
+            f"Base target is anchored to a normalised profitable-regime margin of {profitable_anchor_pct:.1f}% and wider scenarios are used."
+        )
+        source_suffix = f"; normalised profitable-regime anchor {profitable_anchor_pct:.1f}%"
+        applied = True
+    elif margin_range_pp >= 10.0:
+        target_anchor_pct = round(0.55 * normalized_margin_pct + 0.45 * target_margin_pct, 1)
+        scenario_width_multiplier = 1.35
+        note = (
+            f"High margin volatility detected ({margin_range_pp:.1f}pp range). "
+            f"Base target is moderated toward a normalised margin anchor of {normalized_margin_pct:.1f}%."
+        )
+        source_suffix = f"; normalised margin anchor {normalized_margin_pct:.1f}%"
+        applied = True
+    else:
+        target_anchor_pct = round(target_margin_pct, 1)
+        scenario_width_multiplier = 1.0
+        note = None
+        source_suffix = ""
+        applied = False
+
+    return {
+        "applied": applied,
+        "margin_range_pp": round(margin_range_pp, 1),
+        "margin_volatility_pp": round(margin_volatility_pp, 1),
+        "normalized_margin_pct": normalized_margin_pct,
+        "target_anchor_pct": target_anchor_pct,
+        "scenario_width_multiplier": scenario_width_multiplier,
+        "note": note,
+        "source_suffix": source_suffix,
+    }
+
+
+def _load_learning_cohort(limit: int | None = None) -> list[Any]:
+    try:
+        reader = LedgerReader()
+        records = reader.query(limit=int(limit or _learning_pool_limit()))
+    except Exception:
+        return []
+
+    observations: list[Any] = []
+    for record in records:
+        if record.actual_revenue_mm is None and record.actual_ebit_margin is None:
+            continue
+
+        predicted_revenue_growth = _as_decimal(record.near_term_revenue_growth)
+        predicted_margin = _as_decimal(record.predicted_ebit_margin)
+        predicted_wacc = _as_decimal(record.predicted_wacc)
+        predicted_terminal_growth = _as_decimal(record.predicted_terminal_growth)
+        predicted_beta = float(record.beta or 1.0)
+        predicted_revenue_mm = float(getattr(record, "predicted_revenue_mm", 0.0) or 0.0)
+        predicted_ufcf_mm = float(getattr(record, "predicted_ufcf_mm", 0.0) or 0.0)
+        actual_revenue_mm = getattr(record, "actual_revenue_mm", None)
+        actual_ufcf_mm = getattr(record, "actual_ufcf_mm", None)
+        predicted_ufcf_margin = (
+            predicted_ufcf_mm / max(abs(predicted_revenue_mm), 1.0) if predicted_revenue_mm else None
+        )
+        actual_ufcf_margin = (
+            float(actual_ufcf_mm) / max(abs(float(actual_revenue_mm)), 1.0)
+            if actual_revenue_mm not in (None, 0) and actual_ufcf_mm is not None
+            else predicted_ufcf_margin
+        )
+        predicted_reinvestment_rate = max(
+            float(getattr(record, "capex_pct_revenue", 0.0) or 0.0)
+            - float(getattr(record, "da_pct_revenue", 0.0) or 0.0),
+            0.0,
+        )
+        actual_reinvestment_rate = predicted_reinvestment_rate
+        if actual_ufcf_margin is not None and predicted_ufcf_margin is not None:
+            actual_reinvestment_rate = max(
+                predicted_reinvestment_rate + (predicted_ufcf_margin - actual_ufcf_margin),
+                0.0,
+            )
+
+        revenue_delta = 0.0
+        if record.actual_revenue_mm is not None and record.predicted_revenue_mm:
+            revenue_delta = (record.actual_revenue_mm - record.predicted_revenue_mm) / max(abs(record.predicted_revenue_mm), 1.0)
+
+        observations.append(
+            {
+                "ticker": getattr(record, "ticker", "") or "",
+                "sector": record.sector or "Default",
+                "industry": record.industry or "",
+                "data_vintage_years": max(1, int(record.data_vintage_years or 1)),
+                "market_cap_regime": record.market_cap_regime or "large",
+                "macro_regime": record.macro_regime or "neutral",
+                "predicted_revenue_growth": predicted_revenue_growth,
+                "actual_revenue_growth": predicted_revenue_growth + revenue_delta,
+                "predicted_ebit_margin": predicted_margin,
+                "actual_ebit_margin": _as_decimal(record.actual_ebit_margin) if record.actual_ebit_margin is not None else predicted_margin,
+                "predicted_wacc": predicted_wacc or 0.10,
+                "actual_wacc": predicted_wacc or 0.10,
+                "predicted_terminal_growth": predicted_terminal_growth or 0.025,
+                "actual_terminal_growth": predicted_terminal_growth or 0.025,
+                "predicted_beta": predicted_beta,
+                "actual_beta": predicted_beta,
+                "predicted_ufcf_margin": predicted_ufcf_margin,
+                "actual_ufcf_margin": actual_ufcf_margin,
+                "predicted_reinvestment_rate": predicted_reinvestment_rate,
+                "actual_reinvestment_rate": actual_reinvestment_rate,
+                "feature_vector": tuple(getattr(record, "feature_vector", None) or ()) or None,
+                "structural_break_flag": bool(getattr(record, "structural_break_hints", []) or []),
+                "structural_break_hints": list(getattr(record, "structural_break_hints", []) or []),
+            }
+        )
+    return observations
+
+
+def _load_analog_candidates(limit: int | None = None):
+    try:
+        reader = LedgerReader()
+        records = reader.query(limit=int(limit or _learning_pool_limit()))
+    except Exception:
+        return []
+    return build_analog_observations(records)
+
+
+def _disabled_analog_set(ticker: str, symbol_features: SymbolFeatures) -> AnalogSet:
+    analog_set = AnalogSet(subject_ticker=ticker, subject_features=symbol_features)
+    analog_set.overlay = compute_global_overlay(analog_set)
+    return analog_set
+
+
+def _serialise_analog_set(analog_set: AnalogSet) -> dict[str, Any]:
+    return {
+        "enabled": bool(analog_set.analogs),
+        "count": len(analog_set.analogs),
+        "pattern_match": analog_set.pattern_match,
+        "pattern_match_score": round(float(analog_set.pattern_match_score or 0.0), 2),
+        "cohorts": [
+            {
+                "label": cohort.label,
+                "score": round(cohort.score, 3),
+                "members": list(cohort.members),
+                "explanation": cohort.explanation,
+            }
+            for cohort in analog_set.cohorts
+        ],
+        "items": [
+            {
+                "ticker": match.analog.ticker,
+                "sector": match.analog.sector,
+                "industry": match.analog.industry,
+                "score": round(match.analog_score, 3),
+                "similarity": round(match.similarity_score, 3),
+                "static_similarity": round(match.static_similarity, 3),
+                "regime_similarity": round(match.regime_similarity, 3),
+                "weights": {
+                    "recency": round(match.recency_weight, 2),
+                    "data_quality": round(match.quality_weight, 2),
+                    "sample": round(match.sample_weight, 2),
+                    "usefulness": round(match.usefulness_weight, 2),
+                },
+                "maturity_stage": match.analog.maturity_stage,
+                "valuation_regime": match.analog.valuation_regime,
+                "volatility_regime": match.analog.volatility_regime,
+                "evidence": list(match.evidence),
+            }
+            for match in analog_set.analogs[:5]
+        ],
+        "overlay": dict(analog_set.overlay or {}),
+    }
+
+
+def _global_cross_symbol_overlay(
+    observations: list[Any],
+    *,
+    data_vintage_years: int,
+    market_cap_regime: str,
+    macro_regime: str,
+) -> dict[str, Any]:
+    if not observations:
+        return {
+            "enabled": False,
+            "scope": None,
+            "cohort_size": 0,
+            "sector_span": 0,
+            "confidence": 0.0,
+            "revenue_growth_adj_pp": 0.0,
+            "ebit_margin_adj_pp": 0.0,
+            "wacc_adj_pp": 0.0,
+            "terminal_growth_adj_pp": 0.0,
+            "beta_adj": 0.0,
+            "note": None,
+        }
+
+    maturity = _maturity_bucket(data_vintage_years)
+    regime_matches = [
+        observation
+        for observation in observations
+        if str(_obs_value(observation, "market_cap_regime", "") or "") == market_cap_regime
+        and str(_obs_value(observation, "macro_regime", "") or "") == macro_regime
+        and _maturity_bucket(int(_obs_value(observation, "data_vintage_years", 0) or 0)) == maturity
+    ]
+    cap_matches = [
+        observation
+        for observation in observations
+        if str(_obs_value(observation, "market_cap_regime", "") or "") == market_cap_regime
+        and str(_obs_value(observation, "macro_regime", "") or "") == macro_regime
+    ]
+
+    selected: list[Any] = []
+    scope: str | None = None
+    for candidate_scope, candidate_cohort, min_size, min_sector_span in (
+        ("regime", regime_matches, 5, 2),
+        ("market-cap", cap_matches, 6, 2),
+        ("global", observations, 10, 3),
+    ):
+        sector_span = len(
+            {
+                str(_obs_value(observation, "sector", "") or "")
+                for observation in candidate_cohort
+                if _obs_value(observation, "sector", None)
+            }
+        )
+        if len(candidate_cohort) >= min_size and sector_span >= min_sector_span:
+            selected = candidate_cohort
+            scope = candidate_scope
+            break
+
+    if not selected or scope is None:
+        return {
+            "enabled": False,
+            "scope": None,
+            "cohort_size": 0,
+            "sector_span": 0,
+            "confidence": 0.0,
+            "revenue_growth_adj_pp": 0.0,
+            "ebit_margin_adj_pp": 0.0,
+            "wacc_adj_pp": 0.0,
+            "terminal_growth_adj_pp": 0.0,
+            "beta_adj": 0.0,
+            "note": None,
+        }
+
+    sector_span = len(
+        {
+            str(_obs_value(observation, "sector", "") or "")
+            for observation in selected
+            if _obs_value(observation, "sector", None)
+        }
+    )
+    confidence = _clamp(min(1.0, len(selected) / 18.0) * min(1.0, sector_span / 4.0), 0.15, 1.0)
+    damping = _clamp(0.10 + 0.20 * confidence, 0.10, 0.30)
+    revenue_growth_adj_pp = round(
+        _clamp(
+            _safe_mean(
+                [
+                    float(actual) - float(predicted)
+                    for observation in selected
+                    for actual, predicted in [
+                        (
+                            _obs_value(observation, "actual_revenue_growth"),
+                            _obs_value(observation, "predicted_revenue_growth"),
+                        )
+                    ]
+                    if actual is not None and predicted is not None
+                ]
+            )
+            * damping
+            * 100,
+            -4.0,
+            4.0,
+        ),
+        1,
+    )
+    ebit_margin_adj_pp = round(
+        _clamp(
+            _safe_mean(
+                [
+                    float(actual) - float(predicted)
+                    for observation in selected
+                    for actual, predicted in [
+                        (
+                            _obs_value(observation, "actual_ebit_margin"),
+                            _obs_value(observation, "predicted_ebit_margin"),
+                        )
+                    ]
+                    if actual is not None and predicted is not None
+                ]
+            )
+            * damping
+            * 100,
+            -4.0,
+            4.0,
+        ),
+        1,
+    )
+    wacc_adj_pp = round(
+        _clamp(
+            _safe_mean(
+                [
+                    float(actual) - float(predicted)
+                    for observation in selected
+                    for actual, predicted in [
+                        (_obs_value(observation, "actual_wacc"), _obs_value(observation, "predicted_wacc"))
+                    ]
+                    if actual is not None and predicted is not None
+                ]
+            )
+            * damping
+            * 100,
+            -1.5,
+            1.5,
+        ),
+        1,
+    )
+    terminal_growth_adj_pp = round(
+        _clamp(
+            _safe_mean(
+                [
+                    float(actual) - float(predicted)
+                    for observation in selected
+                    for actual, predicted in [
+                        (
+                            _obs_value(observation, "actual_terminal_growth"),
+                            _obs_value(observation, "predicted_terminal_growth"),
+                        )
+                    ]
+                    if actual is not None and predicted is not None
+                ]
+            )
+            * min(damping, 0.22)
+            * 100,
+            -0.8,
+            0.8,
+        ),
+        1,
+    )
+    beta_adj = round(
+        _clamp(
+            _safe_mean(
+                [
+                    float(actual) - float(predicted)
+                    for observation in selected
+                    for actual, predicted in [
+                        (_obs_value(observation, "actual_beta"), _obs_value(observation, "predicted_beta"))
+                    ]
+                    if actual is not None and predicted is not None
+                ]
+            )
+            * damping,
+            -0.25,
+            0.25,
+        ),
+        2,
+    )
+
+    note = (
+        f"Global cross-symbol learning active: {scope} cohort of {len(selected)} realised records "
+        f"across {sector_span} sectors."
+    )
+
+    return {
+        "enabled": True,
+        "scope": scope,
+        "cohort_size": len(selected),
+        "sector_span": sector_span,
+        "confidence": round(confidence, 2),
+        "revenue_growth_adj_pp": revenue_growth_adj_pp,
+        "ebit_margin_adj_pp": ebit_margin_adj_pp,
+        "wacc_adj_pp": wacc_adj_pp,
+        "terminal_growth_adj_pp": terminal_growth_adj_pp,
+        "beta_adj": beta_adj,
+        "note": note,
+    }
+
+
+def _assumption_source(
+    *,
+    weights: dict[str, float],
+    pattern_name: str | None,
+    pattern_score: float,
+    pattern_overlay_pp: float,
+    cohort_size: int,
+    review_due: bool,
+) -> tuple[str, str | None]:
+    parts = [
+        f"{weights['company_history']:.0%} company 5y history",
+        f"{weights['sector_prior']:.0%} sector prior",
+    ]
+    if weights["learned_cohort"] > 0:
+        parts.append(f"{weights['learned_cohort']:.0%} learned cohort")
+
+    source = "Knowledge model: " + ", ".join(parts)
+    if pattern_name and pattern_score >= 0.7 and abs(pattern_overlay_pp) >= 0.1:
+        source += f"; pattern {pattern_name} {pattern_overlay_pp:+.1f}pp"
+
+    warn = None
+    if review_due:
+        warn = "Quinquennial review window is due for this company history."
+    elif cohort_size < 5:
+        warn = "Learning cohort is still thin; sector priors carry more weight."
+    return source, warn
+
+
+def refine_live_assumptions(
+    *,
+    ticker: str,
+    sector: str,
+    industry: str,
+    market_cap: float,
+    revenues: list[float],
+    ebit_margins: list[float],
+    gross_margin_base_pct: float,
+    revenue_growth_near: float,
+    terminal_growth: float,
+    ebit_margin_base_pct: float,
+    ebit_margin_target: float,
+    beta: float,
+    wacc: float,
+    rf_rate: float,
+    erp: float,
+    kd_post: float,
+    e_wt: float,
+    d_wt: float,
+    total_assets: float,
+    total_debt: float,
+    revenue_base: float,
+    operating_cf: float,
+    fcf: float,
+    capex_pct: float,
+    capexes: list[float],
+    da_pct: float,
+    das: list[float],
+    sbc_pct: float,
+    sbcs: list[float],
+    tax_rate_pct: float,
+    pretax_incomes: list[float],
+    tax_provisions: list[float],
+    dso: float,
+    dio: float,
+    dpo: float,
+    observations: list[CalibrationObservation] | None = None,
+) -> dict[str, Any]:
+    knowledge_sector = _knowledge_sector(sector)
+    market_cap_regime = _market_cap_regime(market_cap)
+    history_window_years = _history_window_years(revenues)
+    completed_years = max(1, len(revenues) - 1)
+    review_due = should_run_quinquennial(completed_years)
+    next_review_in_years = 0 if review_due else 5 - (completed_years % 5)
+    industry_lower = (industry or "").lower()
+
+    revenue_volatility = _safe_pstdev(_growth_rates(revenues[-(history_window_years + 1):]))
+    margin_volatility = _safe_pstdev([margin / 100 for margin in ebit_margins[-history_window_years:]])
+    observations = list(observations) if observations is not None else _load_learning_cohort()
+    analog_candidates = _load_analog_candidates()
+    symbol_features = build_symbol_features(
+        ticker=ticker,
+        sector=sector,
+        industry=industry,
+        revenues=revenues,
+        ebit_margins=ebit_margins,
+        gross_margin_base_pct=gross_margin_base_pct,
+        capex_pct=capex_pct,
+        total_assets=total_assets,
+        total_debt=total_debt,
+        revenue_base=revenue_base,
+        operating_cf=operating_cf,
+        fcf=fcf,
+        da_pct=da_pct,
+        tax_rate_pct=tax_rate_pct,
+        market_cap=market_cap,
+        market_cap_regime=market_cap_regime,
+        macro_regime="neutral",
+        observation_year=completed_years,
+    )
+    feature_vector = dict(symbol_features.feature_map)
+    margin_normalisation = _margin_normalisation(ebit_margins, ebit_margin_base_pct, ebit_margin_target)
+
+    raw_assumptions = AssumptionSet(
+        revenue_growth_rates=[revenue_growth_near / 100] * 7,
+        near_term_growth=revenue_growth_near / 100,
+        long_run_growth=terminal_growth / 100,
+        ebit_margin_current=ebit_margin_base_pct / 100,
+        ebit_margin_terminal=ebit_margin_target / 100,
+        ebit_margin_schedule=[
+            (ebit_margin_base_pct + (ebit_margin_target - ebit_margin_base_pct) * (year / 7)) / 100
+            for year in range(1, 8)
+        ],
+        effective_tax_rate=tax_rate_pct / 100,
+        dso_days=dso,
+        dio_days=dio,
+        dpo_days=dpo,
+        capex_pct_revenue=capex_pct / 100,
+        da_pct_revenue=da_pct / 100,
+        sbc_pct_revenue=sbc_pct / 100,
+    )
+    base_ufcf_margin = (
+        raw_assumptions.ebit_margin_terminal * (1.0 - raw_assumptions.effective_tax_rate)
+        + raw_assumptions.da_pct_revenue
+        + raw_assumptions.sbc_pct_revenue
+        - raw_assumptions.capex_pct_revenue
+    )
+    base_reinvestment_rate = max(raw_assumptions.capex_pct_revenue - raw_assumptions.da_pct_revenue, 0.0)
+
+    calibrated = calibrate(
+        raw_assumptions,
+        knowledge_sector,
+        industry,
+        len(revenues),
+        market_cap_regime,
+        "neutral",
+        observations=observations,
+        base_wacc=wacc / 100,
+        base_terminal_growth=terminal_growth / 100,
+        base_beta=beta,
+        calibration_store=_LIVE_CALIBRATION_STORE,
+    )
+    fallback_global_learning = _global_cross_symbol_overlay(
+        observations,
+        data_vintage_years=len(revenues),
+        market_cap_regime=market_cap_regime,
+        macro_regime="neutral",
+    )
+    max_analog_results = max(6, int(LEARNING_CONFIG.get("max_analogs_returned", 10)))
+    graph_neighbor_limit = max(6, int(LEARNING_CONFIG.get("relationship_graph_max_neighbors", max_analog_results)))
+
+    analog_set = (
+        find_analogs(
+            ticker,
+            symbol_features,
+            analog_candidates,
+            subject_sector=sector,
+            subject_industry=industry,
+            subject_vintage_year=len(revenues),
+            subject_market_cap_regime=market_cap_regime,
+            subject_macro_regime="neutral",
+            observation_year=completed_years,
+            max_results=max_analog_results,
+            cross_sector_only=False,
+        )
+        if analog_candidates
+        else _disabled_analog_set(ticker, symbol_features)
+    )
+    analog_learning = dict(analog_set.overlay or compute_global_overlay(analog_set))
+    global_learning = analog_learning if analog_learning.get("enabled") else fallback_global_learning
+    relationship_graph = build_relationship_graph(
+        ticker=ticker,
+        subject_features=symbol_features,
+        analog_set=analog_set,
+        observations=observations,
+        sector=sector,
+        industry=industry,
+        max_neighbors=graph_neighbor_limit,
+    )
+    relationship_overlay = dict(relationship_graph.get("overlay") or {})
+
+    pattern_name, pattern_score, pattern_overlay = match_pattern_library(symbol_features)
+    if pattern_score < 0.7:
+        pattern_name = None
+        pattern_overlay = {}
+
+    sector_growth_pct = round(sector_median_growth(knowledge_sector) * 100, 1)
+    sector_margin_pct = round(get_sector_ebit_margin(knowledge_sector) * 100, 1)
+    sector_capex_pct = round(get_sector_capex_pct(knowledge_sector) * 100, 1)
+    sector_sbc_pct = round(get_sector_terminal_sbc_pct(knowledge_sector) * 100, 1)
+    sector_wc_days = get_sector_wc_days(knowledge_sector)
+    sector_beta = fetch_damodaran_industry_beta(industry or knowledge_sector) or fetch_damodaran_industry_beta(knowledge_sector) or 1.0
+
+    company_growth_pct = round(_rolling_cagr(revenues, history_window_years) * 100, 1) if len(revenues) >= 2 else revenue_growth_near
+    company_tax_pct = round(_normalized_tax_rate_pct(pretax_incomes, tax_provisions, tax_rate_pct), 1)
+    company_da_pct = round(_trailing_ratio_pct(das, revenues, years=history_window_years), 1) or da_pct
+    company_capex_pct = round(_trailing_ratio_pct(capexes, revenues, years=history_window_years, absolute=True), 1) or capex_pct
+    company_sbc_pct = round(_trailing_ratio_pct(sbcs, revenues, years=history_window_years), 1) or sbc_pct
+    company_margin_target_pct = margin_normalisation["target_anchor_pct"] if margin_normalisation["applied"] else ebit_margin_target
+
+    growth_weights = _normalise_weights(
+        _clamp(0.48 + 0.04 * history_window_years - 0.30 * min(revenue_volatility, 0.50), 0.38, 0.72),
+        0.22,
+        _clamp(0.08 + 0.18 * calibrated.calibration_confidence, 0.0, 0.22) if calibrated.calibration_cohort_size else 0.0,
+    )
+    margin_company_weight = _clamp(0.50 + 0.04 * history_window_years - 0.55 * min(margin_volatility, 0.20), 0.40, 0.72)
+    margin_sector_weight = 0.25
+    if margin_normalisation["applied"]:
+        margin_company_weight = _clamp(margin_company_weight - 0.18, 0.24, 0.55)
+        margin_sector_weight = 0.42 if margin_normalisation["scenario_width_multiplier"] > 1.5 else 0.34
+    margin_weights = _normalise_weights(
+        margin_company_weight,
+        margin_sector_weight,
+        _clamp(0.08 + 0.15 * calibrated.calibration_confidence, 0.0, 0.20) if calibrated.calibration_cohort_size else 0.0,
+    )
+    risk_weights = _normalise_weights(
+        0.58,
+        0.24,
+        _clamp(0.06 + 0.12 * calibrated.calibration_confidence, 0.0, 0.18) if calibrated.calibration_cohort_size else 0.0,
+    )
+
+    growth_pattern_pp = round(pattern_overlay.get("revenue_growth_adj", 0.0) * 100 * pattern_score, 1)
+    margin_pattern_pp = round(pattern_overlay.get("ebit_margin_adj", 0.0) * 100 * pattern_score, 1)
+    global_growth_pp = float(global_learning.get("revenue_growth_adj_pp") or 0.0)
+    if history_window_years >= 4 and growth_weights["company_history"] >= 0.60:
+        global_growth_pp = 0.0
+    global_margin_pp = float(global_learning.get("ebit_margin_adj_pp") or 0.0)
+    global_wacc_pp = float(global_learning.get("wacc_adj_pp") or 0.0)
+    global_terminal_growth_pp = float(global_learning.get("terminal_growth_adj_pp") or 0.0)
+    global_beta_adj = float(global_learning.get("beta_adj") or 0.0)
+    relationship_growth_pp = round(float(relationship_overlay.get("revenue_growth_adj_pp") or 0.0) * 0.35, 2)
+    relationship_margin_pp = round(float(relationship_overlay.get("ebit_margin_adj_pp") or 0.0) * 0.35, 2)
+    relationship_wacc_pp = round(float(relationship_overlay.get("wacc_adj_pp") or 0.0) * 0.35, 2)
+    relationship_terminal_growth_pp = round(float(relationship_overlay.get("terminal_growth_adj_pp") or 0.0) * 0.35, 2)
+    relationship_beta_adj = round(float(relationship_overlay.get("beta_adj") or 0.0) * 0.35, 3)
+
+    refined_growth = round(
+        _clamp(
+            company_growth_pct * growth_weights["company_history"]
+            + sector_growth_pct * growth_weights["sector_prior"]
+            + (calibrated.revenue_growth_adj * 100) * growth_weights["learned_cohort"]
+            + growth_pattern_pp
+            + global_growth_pp
+            + relationship_growth_pp,
+            -15.0,
+            50.0,
+        ),
+        1,
+    )
+    refined_margin_target = round(
+        _clamp(
+            company_margin_target_pct * margin_weights["company_history"]
+            + sector_margin_pct * margin_weights["sector_prior"]
+            + (calibrated.ebit_margin_adj * 100) * margin_weights["learned_cohort"]
+            + margin_pattern_pp
+            + global_margin_pp
+            + relationship_margin_pp,
+            max(-10.0, ebit_margin_base_pct),
+            45.0 if "software" not in industry_lower else 80.0,
+        ),
+        1,
+    )
+
+    smoothed_beta = round(
+        _clamp(
+            _blended_beta(
+                beta * risk_weights["company_history"]
+                + sector_beta * risk_weights["sector_prior"]
+                + calibrated.beta_adj * risk_weights["learned_cohort"],
+                sector_beta,
+                industry_weight=0.15,
+            )
+            + global_beta_adj
+            + relationship_beta_adj,
+            0.3,
+            3.0,
+        ),
+        2,
+    )
+    sector_wacc = _clamp(
+        (e_wt / 100) * (rf_rate + (0.67 * sector_beta + 0.33) * erp) + (d_wt / 100) * kd_post,
+        5.0,
+        20.0,
+    )
+    refined_wacc = round(
+        _clamp(
+            wacc * risk_weights["company_history"]
+            + sector_wacc * risk_weights["sector_prior"]
+            + (calibrated.wacc_adj * 100) * risk_weights["learned_cohort"]
+            + global_wacc_pp
+            + relationship_wacc_pp,
+            5.0,
+            20.0,
+        ),
+        1,
+    )
+    refined_terminal_growth = round(
+        _clamp(
+            terminal_growth * max(0.65, 1.0 - risk_weights["learned_cohort"])
+            + (calibrated.terminal_growth_adj * 100) * risk_weights["learned_cohort"]
+            + global_terminal_growth_pp
+            + relationship_terminal_growth_pp,
+            0.5,
+            4.0,
+        ),
+        1,
+    )
+
+    working_capital_weight = _clamp(0.45 + 0.06 * history_window_years, 0.45, 0.75)
+    working_capital_sector_weight = 1.0 - working_capital_weight
+    refined_dso = round(dso * working_capital_weight + sector_wc_days["dso"] * working_capital_sector_weight, 1)
+    refined_dio = round(dio * working_capital_weight + sector_wc_days["dio"] * working_capital_sector_weight, 1)
+    refined_dpo = round(dpo * working_capital_weight + sector_wc_days["dpo"] * working_capital_sector_weight, 1)
+
+    intensity_company_weight = _clamp(0.52 + 0.05 * history_window_years, 0.52, 0.77)
+    intensity_sector_weight = 1.0 - intensity_company_weight
+    refined_capex_pct = round(_clamp(company_capex_pct * intensity_company_weight + sector_capex_pct * intensity_sector_weight, 0.5, 25.0), 1)
+    refined_da_pct = round(_clamp(company_da_pct * 0.75 + min(company_capex_pct, sector_capex_pct) * 0.25, 0.2, 15.0), 1)
+    refined_sbc_pct = round(_clamp(company_sbc_pct * intensity_company_weight + sector_sbc_pct * intensity_sector_weight, 0.0, 15.0), 1)
+    refined_tax_pct = round(_clamp(company_tax_pct * 0.75 + tax_rate_pct * 0.25, 5.0, 45.0), 1)
+    layered_learning = _build_layered_learning_snapshot(
+        ticker=ticker,
+        sector=knowledge_sector,
+        industry=industry,
+        data_vintage_years=len(revenues),
+        market_cap_regime=market_cap_regime,
+        macro_regime="neutral",
+        feature_vector=feature_vector,
+        observations=observations,
+        analog_set=analog_set,
+        global_learning=global_learning,
+        pattern_name=pattern_name,
+        pattern_score=pattern_score,
+        margin_normalisation=margin_normalisation,
+        core_weight_maps=[growth_weights, margin_weights, risk_weights, risk_weights],
+        calibrated=calibrated,
+        base_ufcf_margin=base_ufcf_margin,
+        base_reinvestment_rate=base_reinvestment_rate,
+    )
+    learned_metrics = dict(layered_learning.get("learned_metrics") or {})
+    uncertainty = dict(layered_learning.get("uncertainty") or {})
+    structural_break = dict(layered_learning.get("structural_break") or {})
+    learned_reinvestment_confidence = float(learned_metrics.get("reinvestment_confidence") or 0.0)
+    if learned_reinvestment_confidence > 0:
+        implied_capex_pct = float(learned_metrics.get("reinvestment_rate_pct") or 0.0) + refined_da_pct
+        capex_blend_weight = _clamp(
+            0.10 + (0.18 * learned_reinvestment_confidence) + (0.06 if structural_break.get("detected") else 0.0),
+            0.0,
+            0.35,
+        )
+        refined_capex_pct = round(
+            _clamp(
+                refined_capex_pct * (1.0 - capex_blend_weight) + implied_capex_pct * capex_blend_weight,
+                0.5,
+                25.0,
+            ),
+            1,
+        )
+        learned_metrics["implied_capex_pct"] = round(implied_capex_pct, 1)
+        learned_metrics["capex_blend_weight"] = round(capex_blend_weight, 2)
+    else:
+        learned_metrics["implied_capex_pct"] = round(refined_capex_pct, 1)
+        learned_metrics["capex_blend_weight"] = 0.0
+    layered_learning["learned_metrics"] = learned_metrics
+
+    growth_source, growth_warn = _assumption_source(
+        weights=growth_weights,
+        pattern_name=pattern_name,
+        pattern_score=pattern_score,
+        pattern_overlay_pp=growth_pattern_pp,
+        cohort_size=calibrated.calibration_cohort_size,
+        review_due=review_due,
+    )
+    margin_source, margin_warn = _assumption_source(
+        weights=margin_weights,
+        pattern_name=pattern_name,
+        pattern_score=pattern_score,
+        pattern_overlay_pp=margin_pattern_pp,
+        cohort_size=calibrated.calibration_cohort_size,
+        review_due=review_due,
+    )
+    risk_source, risk_warn = _assumption_source(
+        weights=risk_weights,
+        pattern_name=pattern_name,
+        pattern_score=pattern_score,
+        pattern_overlay_pp=0.0,
+        cohort_size=calibrated.calibration_cohort_size,
+        review_due=review_due,
+    )
+    working_capital_source = (
+        f"Knowledge model: {working_capital_weight:.0%} company trailing days, "
+        f"{working_capital_sector_weight:.0%} sector working-capital prior"
+    )
+    intensity_source = (
+        f"Knowledge model: {intensity_company_weight:.0%} company trailing intensity, "
+        f"{intensity_sector_weight:.0%} sector prior"
+    )
+
+    global_growth_source = ""
+    global_margin_source = ""
+    global_risk_source = ""
+    relationship_growth_source = ""
+    relationship_margin_source = ""
+    relationship_risk_source = ""
+    if global_learning["enabled"]:
+        if abs(global_growth_pp) >= 0.1:
+            global_growth_source = (
+                f"; global cross-symbol {global_learning['scope']} cohort {global_growth_pp:+.1f}pp "
+                f"across {global_learning['cohort_size']} records/{global_learning['sector_span']} sectors"
+            )
+        if abs(global_margin_pp) >= 0.1:
+            global_margin_source = (
+                f"; global cross-symbol {global_learning['scope']} cohort {global_margin_pp:+.1f}pp "
+                f"across {global_learning['cohort_size']} records/{global_learning['sector_span']} sectors"
+            )
+        if any(abs(value) >= 0.05 for value in (global_wacc_pp, global_terminal_growth_pp, global_beta_adj)):
+            global_risk_source = (
+                f"; global cross-symbol {global_learning['scope']} cohort risk overlay "
+                f"(WACC {global_wacc_pp:+.1f}pp, g {global_terminal_growth_pp:+.1f}pp, beta {global_beta_adj:+.2f})"
+            )
+    if relationship_graph.get("enabled"):
+        if abs(relationship_growth_pp) >= 0.1:
+            relationship_growth_source = (
+                f"; relationship graph {relationship_growth_pp:+.1f}pp across {relationship_graph.get('node_count', 0) - 1} connected symbols"
+            )
+        if abs(relationship_margin_pp) >= 0.1:
+            relationship_margin_source = (
+                f"; relationship graph {relationship_margin_pp:+.1f}pp from connected analog pathways"
+            )
+        if any(abs(value) >= 0.05 for value in (relationship_wacc_pp, relationship_terminal_growth_pp, relationship_beta_adj)):
+            relationship_risk_source = (
+                f"; relationship graph risk overlay (WACC {relationship_wacc_pp:+.1f}pp, g {relationship_terminal_growth_pp:+.1f}pp, beta {relationship_beta_adj:+.2f})"
+            )
+
+    review_text = "due now" if review_due else f"in {next_review_in_years} year(s)"
+    pattern_text = f" Pattern match: {pattern_name}." if pattern_name else ""
+    margin_text = f" {margin_normalisation['note']}" if margin_normalisation["note"] else ""
+    global_text = f" {global_learning['note']}" if global_learning["enabled"] else ""
+    relationship_text = f" {relationship_graph['note']}" if relationship_graph.get("enabled") else ""
+    uncertainty_text = ""
+    if structural_break.get("detected"):
+        uncertainty_text = (
+            f" Structural-break risk {int(round(float(structural_break.get('score') or 0.0) * 100))}% is active; scenario ranges are widened."
+        )
+    elif uncertainty.get("weak_evidence"):
+        uncertainty_text = " Realised evidence is still thin, so confidence stays conservative and scenario ranges remain wider than normal."
+    analog_text = ""
+    if analog_set.analogs:
+        analog_text = f" Nearest analogs: {', '.join(match.analog.ticker for match in analog_set.analogs[:3])}."
+    summary = (
+        "Weighted knowledge model active: company history blended with sector priors, realised cohorts, analog history, "
+        f"macro regime memory, and global cross-symbol patterns. Quinquennial review {review_text}. "
+        f"Cohort size: {calibrated.calibration_cohort_size}.{pattern_text}{margin_text}{global_text}{relationship_text}{uncertainty_text}{analog_text}"
+    )
+
+    assumption_weights = {
+        "revenue_growth_near": {
+            **{key: round(value, 2) for key, value in growth_weights.items()},
+            "company_value": company_growth_pct,
+            "sector_value": sector_growth_pct,
+            "learned_value": round(calibrated.revenue_growth_adj * 100, 1),
+            "pattern_overlay_pp": growth_pattern_pp,
+            "global_overlay_pp": global_growth_pp,
+            "relationship_overlay_pp": relationship_growth_pp,
+            "source": growth_source + global_growth_source + relationship_growth_source,
+            "warn": growth_warn,
+        },
+        "terminal_growth": {
+            **{key: round(value, 2) for key, value in risk_weights.items()},
+            "company_value": terminal_growth,
+            "sector_value": terminal_growth,
+            "learned_value": round(calibrated.terminal_growth_adj * 100, 1),
+            "pattern_overlay_pp": 0.0,
+            "global_overlay_pp": global_terminal_growth_pp,
+            "relationship_overlay_pp": relationship_terminal_growth_pp,
+            "source": risk_source + global_risk_source + relationship_risk_source,
+            "warn": risk_warn,
+        },
+        "ebit_margin_target": {
+            **{key: round(value, 2) for key, value in margin_weights.items()},
+            "company_value": company_margin_target_pct,
+            "sector_value": sector_margin_pct,
+            "learned_value": round(calibrated.ebit_margin_adj * 100, 1),
+            "pattern_overlay_pp": margin_pattern_pp,
+            "global_overlay_pp": global_margin_pp,
+            "relationship_overlay_pp": relationship_margin_pp,
+            "source": margin_source + global_margin_source + relationship_margin_source + margin_normalisation["source_suffix"],
+            "warn": margin_normalisation["note"] or margin_warn,
+        },
+        "beta": {
+            **{key: round(value, 2) for key, value in risk_weights.items()},
+            "company_value": round(beta, 2),
+            "sector_value": round(sector_beta, 2),
+            "learned_value": round(calibrated.beta_adj, 2),
+            "pattern_overlay_pp": 0.0,
+            "global_overlay": global_beta_adj,
+            "relationship_overlay": relationship_beta_adj,
+            "source": risk_source + global_risk_source + relationship_risk_source,
+            "warn": risk_warn,
+        },
+        "wacc": {
+            **{key: round(value, 2) for key, value in risk_weights.items()},
+            "company_value": round(wacc, 1),
+            "sector_value": round(sector_wacc, 1),
+            "learned_value": round(calibrated.wacc_adj * 100, 1),
+            "pattern_overlay_pp": 0.0,
+            "global_overlay_pp": global_wacc_pp,
+            "relationship_overlay_pp": relationship_wacc_pp,
+            "source": risk_source + global_risk_source + relationship_risk_source,
+            "warn": risk_warn,
+        },
+        "tax_rate_pct": {
+            "company_history": 0.75,
+            "sector_prior": 0.0,
+            "learned_cohort": 0.0,
+            "company_value": company_tax_pct,
+            "sector_value": 0.0,
+            "learned_value": 0.0,
+            "pattern_overlay_pp": 0.0,
+            "source": "Knowledge model: 75% weighted 5y tax history, 25% latest observed rate",
+            "warn": growth_warn,
+        },
+        "da_pct": {
+            "company_history": 0.75,
+            "sector_prior": 0.25,
+            "learned_cohort": 0.0,
+            "company_value": company_da_pct,
+            "sector_value": round(min(company_capex_pct, sector_capex_pct), 1),
+            "learned_value": 0.0,
+            "pattern_overlay_pp": 0.0,
+            "source": "Knowledge model: 75% company trailing D&A intensity, 25% maintenance-capex anchor",
+            "warn": None,
+        },
+        "capex_pct": {
+            "company_history": round(intensity_company_weight, 2),
+            "sector_prior": round(intensity_sector_weight, 2),
+            "learned_cohort": 0.0,
+            "company_value": company_capex_pct,
+            "sector_value": sector_capex_pct,
+            "learned_value": round(float(learned_metrics.get("implied_capex_pct") or 0.0), 1),
+            "pattern_overlay_pp": 0.0,
+            "source": intensity_source + (
+                f"; realised reinvestment proxy implies {float(learned_metrics.get('implied_capex_pct') or 0.0):.1f}% capex"
+                if float(learned_metrics.get("reinvestment_evidence") or 0.0) > 0
+                else ""
+            ),
+            "warn": uncertainty.get("note") if uncertainty.get("weak_evidence") or structural_break.get("detected") else None,
+        },
+        "sbc_pct": {
+            "company_history": round(intensity_company_weight, 2),
+            "sector_prior": round(intensity_sector_weight, 2),
+            "learned_cohort": 0.0,
+            "company_value": company_sbc_pct,
+            "sector_value": sector_sbc_pct,
+            "learned_value": 0.0,
+            "pattern_overlay_pp": 0.0,
+            "source": intensity_source,
+            "warn": None,
+        },
+        "dso": {
+            "company_history": round(working_capital_weight, 2),
+            "sector_prior": round(working_capital_sector_weight, 2),
+            "learned_cohort": 0.0,
+            "company_value": round(dso, 1),
+            "sector_value": round(sector_wc_days["dso"], 1),
+            "learned_value": 0.0,
+            "pattern_overlay_pp": 0.0,
+            "source": working_capital_source,
+            "warn": None,
+        },
+        "dio": {
+            "company_history": round(working_capital_weight, 2),
+            "sector_prior": round(working_capital_sector_weight, 2),
+            "learned_cohort": 0.0,
+            "company_value": round(dio, 1),
+            "sector_value": round(sector_wc_days["dio"], 1),
+            "learned_value": 0.0,
+            "pattern_overlay_pp": 0.0,
+            "source": working_capital_source,
+            "warn": None,
+        },
+        "dpo": {
+            "company_history": round(working_capital_weight, 2),
+            "sector_prior": round(working_capital_sector_weight, 2),
+            "learned_cohort": 0.0,
+            "company_value": round(dpo, 1),
+            "sector_value": round(sector_wc_days["dpo"], 1),
+            "learned_value": 0.0,
+            "pattern_overlay_pp": 0.0,
+            "source": working_capital_source,
+            "warn": None,
+        },
+    }
+
+    analog_payload = _serialise_analog_set(analog_set)
+
+    explainability = _build_learning_explainability(
+        history_window_years=history_window_years,
+        completed_years=completed_years,
+        review_due=review_due,
+        next_review_in_years=next_review_in_years,
+        calibrated=calibrated,
+        analog_payload=analog_payload,
+        global_learning=global_learning,
+        pattern_name=pattern_name,
+        pattern_score=pattern_score,
+        margin_normalisation=margin_normalisation,
+        assumption_weights=assumption_weights,
+        layered_learning=layered_learning,
+        refined_growth=refined_growth,
+        refined_margin_target=refined_margin_target,
+        refined_wacc=refined_wacc,
+        refined_terminal_growth=refined_terminal_growth,
+        smoothed_beta=smoothed_beta,
+        relationship_graph=relationship_graph,
+    )
+    confidence_model = build_ranked_confidence_model(
+        {
+            "calibration_confidence": round(calibrated.calibration_confidence, 2),
+            "learning_confidence": round(float(uncertainty.get("effective_confidence") or calibrated.calibration_confidence or 0.0), 2),
+            "calibration_cohort_size": calibrated.calibration_cohort_size,
+            "history_window_years": history_window_years,
+            "quinquennial_review_due": review_due,
+            "pattern_match_score": round(pattern_score, 2),
+            "scenario_width_multiplier": float(uncertainty.get("scenario_width_multiplier") or margin_normalisation["scenario_width_multiplier"]),
+            "wacc": refined_wacc,
+            "terminal_growth": refined_terminal_growth,
+            "global_learning": global_learning,
+            "analogs": analog_payload,
+            "relationship_graph": relationship_graph,
+            "layered_learning": layered_learning,
+            "explainability": explainability,
+        }
+    )
+    explainability["confidence_decomposition"] = {
+        "summary": confidence_model["summary"],
+        "dominant_risk": confidence_model["dominant_risk"],
+        "assumption_confidence": dict(confidence_model["assumption_confidence"]),
+        "valuation_confidence": dict(confidence_model["valuation_confidence"]),
+        "components": list(confidence_model["components"]),
+    }
+    memory_hierarchy = _build_memory_hierarchy(
+        explainability=explainability,
+        confidence_model=confidence_model,
+        relationship_graph=relationship_graph,
+    )
+    explainability["memory_hierarchy"] = memory_hierarchy
+
+    return {
+        "summary": summary,
+        "review_cadence_years": 5,
+        "history_window_years": history_window_years,
+        "market_cap_regime": market_cap_regime,
+        "quinquennial_review_due": review_due,
+        "next_review_in_years": next_review_in_years,
+        "calibration_cohort_size": calibrated.calibration_cohort_size,
+        "calibration_confidence": round(calibrated.calibration_confidence, 2),
+        "learning_confidence": round(float(confidence_model["assumption_confidence"]["score"] or 0.0), 2),
+        "assumption_confidence": round(float(confidence_model["assumption_confidence"]["score"] or 0.0), 2),
+        "valuation_confidence": round(float(confidence_model["valuation_confidence"]["score"] or 0.0), 2),
+        "confidence_ranking_signal": float(confidence_model["ranking_signal"]),
+        "expected_valuation_error_pct": float(confidence_model["valuation_confidence"]["expected_error_pct"]["p50"]),
+        "expected_valuation_error_band": dict(confidence_model["valuation_confidence"]["expected_error_pct"]),
+        "pattern_match": pattern_name,
+        "pattern_match_score": round(pattern_score, 2),
+        "feature_vector": [round(float(feature_vector.get(name, 0.0)), 6) for name in FEATURE_NAMES],
+        "symbol_brain": symbol_features.to_public_dict(),
+        "analogs": analog_payload,
+        "global_learning": global_learning,
+        "relationship_graph": relationship_graph,
+        "layered_learning": layered_learning,
+        "margin_normalisation": margin_normalisation,
+        "scenario_width_multiplier": float(uncertainty.get("scenario_width_multiplier") or margin_normalisation["scenario_width_multiplier"]),
+        "confidence_model": confidence_model,
+        "calibration_diagnostics": calibrated.calibration_diagnostics.to_dict() if getattr(calibrated, "calibration_diagnostics", None) else {},
+        "explainability": explainability,
+        "memory_hierarchy": memory_hierarchy,
+        "revenue_growth_near": refined_growth,
+        "terminal_growth": refined_terminal_growth,
+        "ebit_margin_target": refined_margin_target,
+        "beta": smoothed_beta,
+        "wacc": refined_wacc,
+        "tax_rate_pct": refined_tax_pct,
+        "da_pct": refined_da_pct,
+        "capex_pct": refined_capex_pct,
+        "sbc_pct": refined_sbc_pct,
+        "dso": refined_dso,
+        "dio": refined_dio,
+        "dpo": refined_dpo,
+        "assumption_weights": assumption_weights,
+    }

@@ -1,0 +1,304 @@
+{% extends "base.html" %}
+{% block title %}DCF Valuation Engine — Institutional-Grade Equity Analysis{% endblock %}
+
+{% block content %}
+<main class="landing">
+  <!-- Hero section -->
+  <section class="landing-hero">
+    <div class="landing-hero__eyebrow">
+      <span>⚡</span> Institutional-Grade DCF
+    </div>
+    <h1 class="landing-hero__title">
+      Value any company.<br>
+      <span>In seconds.</span>
+    </h1>
+    <p class="landing-hero__desc">
+      Enter any public company ticker. Our engine automatically pulls financial data,
+      builds a 7-year UFCF DCF model, runs comps, generates AI-powered insights,
+      and produces a full Excel workbook — the same way top-tier analysts do it.
+    </p>
+
+    <!-- Search card -->
+    <div class="search-card">
+      <form class="search-form" action="/valuate" method="POST" id="valuationForm">
+        <div class="form-group">
+          <label class="form-label" for="ticker">Company Name Or Ticker</label>
+          <div class="ticker-search-shell">
+            <input
+              class="form-input ticker-input"
+              type="text"
+              id="ticker"
+              name="ticker"
+              placeholder="e.g. Alphabet, Samsung, GOOGL, 005930"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              maxlength="80"
+              required
+              aria-autocomplete="list"
+              aria-expanded="false"
+              aria-controls="tickerSuggestions"
+            >
+            <input type="hidden" id="selectedTicker" name="selected_ticker">
+            <div class="ticker-suggestions" id="tickerSuggestions" hidden></div>
+          </div>
+          <div class="ticker-helper">Search by company name or ticker across all available exchanges.</div>
+          <div class="ticker-examples">
+            Try:
+            <span onclick="setTicker('NKE')">NKE</span>
+            <span onclick="setTicker('AAPL')">AAPL</span>
+            <span onclick="setTicker('TSLA')">TSLA</span>
+            <span onclick="setTicker('MSFT')">MSFT</span>
+            <span onclick="setTicker('AMZN')">AMZN</span>
+          </div>
+        </div>
+
+        <div class="search-form__row">
+          <div class="form-group">
+            <label class="form-label" for="exchange">Exchange</label>
+            <select class="form-select" id="exchange" name="exchange">
+              <option value="auto">Auto-detect</option>
+              <option value="NYSE">NYSE</option>
+              <option value="NASDAQ">NASDAQ</option>
+              <option value="LSE">LSE</option>
+              <option value="TSE">TSE</option>
+              <option value="HKEX">HKEX</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="currency">Currency</label>
+            <select class="form-select" id="currency" name="currency">
+              <option value="USD">USD ($)</option>
+              <option value="EUR">EUR (€)</option>
+              <option value="GBP">GBP (£)</option>
+              <option value="JPY">JPY (¥)</option>
+              <option value="HKD">HKD (HK$)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="years">Historical Years</label>
+            <select class="form-select" id="years" name="years">
+              <option value="5">5 years</option>
+              <option value="10" selected>10 years</option>
+              <option value="15">15 years</option>
+            </select>
+          </div>
+        </div>
+
+        <button class="btn--cta" type="submit" id="submitBtn">
+          Generate Valuation →
+        </button>
+      </form>
+    </div>
+
+    <div class="feature-card" style="margin-top:1rem;text-align:left;">
+      <div class="feature-card__icon">🧠</div>
+      <div class="feature-card__title">Global Brain Watchlist</div>
+      <div class="feature-card__desc">Pinned ideas persist between sessions and get enrolled into the shared universe before you even open the dashboard again.</div>
+      <div data-watchlist-panel style="margin-top:.8rem;display:grid;gap:.45rem;"></div>
+    </div>
+  </section>
+
+  <!-- Feature cards -->
+  <section>
+    <div class="feature-grid">
+      <div class="feature-card">
+        <div class="feature-card__icon">📊</div>
+        <div class="feature-card__title">7-Year DCF Model</div>
+        <div class="feature-card__desc">UFCF-based forecast with WACC, terminal growth, and sensitivity analysis using industry-standard NIKE convention.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-card__icon">🔍</div>
+        <div class="feature-card__title">Live Comps</div>
+        <div class="feature-card__desc">EV/EBITDA, EV/EBIT, EV/Revenue, P/E and P/FCF vs. up to 8 peer companies with football field visualisation.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-card__icon">🌡️</div>
+        <div class="feature-card__title">Sensitivity Tables</div>
+        <div class="feature-card__desc">5×5 WACC vs. terminal-growth heatmap with colour-coded intrinsic values and base-case highlight.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-card__icon">⚙️</div>
+        <div class="feature-card__title">Override Assumptions</div>
+        <div class="feature-card__desc">Switch any driver from auto-computed to manual override. The model recomputes instantly via AJAX.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-card__icon">🤖</div>
+        <div class="feature-card__title">AI Analyst Panel</div>
+        <div class="feature-card__desc">Structured valuation commentary, key assumption analysis, model risks, and a verification checklist before use.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-card__icon">📥</div>
+        <div class="feature-card__title">Excel Export</div>
+        <div class="feature-card__desc">Full workbook with income statement, DCF schedule, sensitivity table, comps tab, and assumptions sheet.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-card__icon">🎭</div>
+        <div class="feature-card__title">Scenario Analysis</div>
+        <div class="feature-card__desc">Bull, base, and bear case with distinct WACC, margin, and growth assumptions — side-by-side comparison.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-card__icon">⚠️</div>
+        <div class="feature-card__title">Validation Flags</div>
+        <div class="feature-card__desc">15+ model health checks: WACC–g spread, TV concentration, SBC dilution, coverage ratios, and more.</div>
+      </div>
+    </div>
+  </section>
+</main>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function setTicker(ticker) {
+  const tickerInput = document.getElementById('ticker');
+  const selectedTickerInput = document.getElementById('selectedTicker');
+  tickerInput.value = ticker;
+  selectedTickerInput.value = ticker;
+  tickerInput.focus();
+}
+
+(function () {
+  const form = document.getElementById('valuationForm');
+  const tickerInput = document.getElementById('ticker');
+  const exchangeInput = document.getElementById('exchange');
+  const submitBtn = document.getElementById('submitBtn');
+  const selectedTickerInput = document.getElementById('selectedTicker');
+  const suggestionsEl = document.getElementById('tickerSuggestions');
+
+  let suggestions = [];
+  let activeIndex = -1;
+  let debounceHandle = null;
+  let requestToken = 0;
+
+  function hideSuggestions() {
+    suggestions = [];
+    activeIndex = -1;
+    suggestionsEl.hidden = true;
+    suggestionsEl.innerHTML = '';
+    tickerInput.setAttribute('aria-expanded', 'false');
+  }
+
+  function selectSuggestion(item) {
+    tickerInput.value = item.name || item.ticker;
+    selectedTickerInput.value = item.ticker;
+    hideSuggestions();
+  }
+
+  function renderSuggestions() {
+    if (!suggestions.length) {
+      hideSuggestions();
+      return;
+    }
+    suggestionsEl.hidden = false;
+    tickerInput.setAttribute('aria-expanded', 'true');
+    suggestionsEl.innerHTML = suggestions.map((item, index) => {
+      const meta = [item.ticker, item.exchange, item.country].filter(Boolean).join(' · ');
+      const activeClass = index === activeIndex ? ' active' : '';
+      return `
+        <button type="button" class="ticker-suggestion${activeClass}" data-index="${index}">
+          <span class="ticker-suggestion__name">${item.name}</span>
+          <span class="ticker-suggestion__meta">${meta}</span>
+        </button>
+      `;
+    }).join('');
+  }
+
+  async function fetchSuggestions(query) {
+    const currentToken = ++requestToken;
+    const trimmed = query.trim();
+    if (trimmed.length < 2) {
+      hideSuggestions();
+      return;
+    }
+
+    const url = new URL('/api/ticker-search', window.location.origin);
+    url.searchParams.set('q', trimmed);
+    url.searchParams.set('exchange', exchangeInput.value || 'auto');
+    url.searchParams.set('limit', '12');
+
+    try {
+      const response = await fetch(url.toString(), { headers: { 'Accept': 'application/json' } });
+      if (!response.ok) {
+        hideSuggestions();
+        return;
+      }
+      const payload = await response.json();
+      if (currentToken !== requestToken) {
+        return;
+      }
+      suggestions = Array.isArray(payload.results) ? payload.results : [];
+      activeIndex = suggestions.length ? 0 : -1;
+      renderSuggestions();
+    } catch (_error) {
+      hideSuggestions();
+    }
+  }
+
+  tickerInput.addEventListener('input', function () {
+    selectedTickerInput.value = '';
+    clearTimeout(debounceHandle);
+    debounceHandle = setTimeout(() => fetchSuggestions(tickerInput.value), 150);
+  });
+
+  tickerInput.addEventListener('keydown', function (event) {
+    if (!suggestions.length) {
+      return;
+    }
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      activeIndex = (activeIndex + 1) % suggestions.length;
+      renderSuggestions();
+      return;
+    }
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      activeIndex = activeIndex <= 0 ? suggestions.length - 1 : activeIndex - 1;
+      renderSuggestions();
+      return;
+    }
+    if (event.key === 'Enter' && activeIndex >= 0) {
+      event.preventDefault();
+      selectSuggestion(suggestions[activeIndex]);
+      return;
+    }
+    if (event.key === 'Escape') {
+      hideSuggestions();
+    }
+  });
+
+  suggestionsEl.addEventListener('mousedown', function (event) {
+    event.preventDefault();
+  });
+
+  suggestionsEl.addEventListener('click', function (event) {
+    const button = event.target.closest('.ticker-suggestion');
+    if (!button) {
+      return;
+    }
+    const index = Number(button.dataset.index || '-1');
+    if (index >= 0 && suggestions[index]) {
+      selectSuggestion(suggestions[index]);
+    }
+  });
+
+  exchangeInput.addEventListener('change', function () {
+    if (tickerInput.value.trim().length >= 2) {
+      fetchSuggestions(tickerInput.value);
+    }
+  });
+
+  tickerInput.addEventListener('blur', function () {
+    window.setTimeout(hideSuggestions, 120);
+  });
+
+  form.addEventListener('submit', function () {
+    if (!selectedTickerInput.value.trim()) {
+      selectedTickerInput.value = tickerInput.value.trim();
+    }
+    submitBtn.textContent = 'Preparing model…';
+    submitBtn.disabled = true;
+    hideSuggestions();
+  });
+})();
+</script>
+{% endblock %}

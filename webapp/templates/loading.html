@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% set ticker_pill = ticker %}
+{% block title %}Valuing {{ ticker }} — DCF Engine{% endblock %}
+
+{% block content %}
+<div class="loading-page">
+  <div class="loading-box">
+    <div class="loading-box__ticker">{{ ticker }}</div>
+    <div class="loading-box__title">Building institutional-grade valuation model…</div>
+
+    <div class="step-list" id="stepList">
+      <div class="step-item pending" data-step="0">
+        <div class="step-icon">◉</div>
+        <span class="step-label">Resolving ticker &amp; exchange</span>
+      </div>
+      <div class="step-item pending" data-step="1">
+        <div class="step-icon">◉</div>
+        <span class="step-label">Pulling 10-year financial statements</span>
+      </div>
+      <div class="step-item pending" data-step="2">
+        <div class="step-icon">◉</div>
+        <span class="step-label">Normalising units &amp; currency</span>
+      </div>
+      <div class="step-item pending" data-step="3">
+        <div class="step-icon">◉</div>
+        <span class="step-label">Aligning fiscal year end</span>
+      </div>
+      <div class="step-item pending" data-step="4">
+        <div class="step-icon">◉</div>
+        <span class="step-label">Computing ratios &amp; margins</span>
+      </div>
+      <div class="step-item pending" data-step="5">
+        <div class="step-icon">◉</div>
+        <span class="step-label">Building revenue &amp; margin assumptions</span>
+      </div>
+      <div class="step-item pending" data-step="6">
+        <div class="step-icon">◉</div>
+        <span class="step-label">Calculating WACC (CAPM + Hamada)</span>
+      </div>
+      <div class="step-item pending" data-step="7">
+        <div class="step-icon">◉</div>
+        <span class="step-label">Forecasting 3-statement model</span>
+      </div>
+      <div class="step-item pending" data-step="8">
+        <div class="step-icon">◉</div>
+        <span class="step-label">Running DCF &amp; sensitivity analysis</span>
+      </div>
+      <div class="step-item pending" data-step="9">
+        <div class="step-icon">◉</div>
+        <span class="step-label">Pulling comparable companies</span>
+      </div>
+      <div class="step-item pending" data-step="10">
+        <div class="step-icon">◉</div>
+        <span class="step-label">Running validation checks</span>
+      </div>
+      <div class="step-item pending" data-step="11">
+        <div class="step-icon">◉</div>
+        <span class="step-label">Generating analyst insights</span>
+      </div>
+    </div>
+
+    <div class="loading-progress-bar">
+      <div class="loading-progress-bar__fill" id="progressFill" style="width: 0%"></div>
+    </div>
+
+    <div class="loading-cta" id="loadingCta">
+      <a href="/dashboard/{{ ticker }}" class="btn btn--primary btn--large">
+        View Dashboard →
+      </a>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+  const steps   = document.querySelectorAll('.step-item');
+  const fill    = document.getElementById('progressFill');
+  const cta     = document.getElementById('loadingCta');
+  const dashboardUrl = '/dashboard/{{ ticker }}';
+  const total   = steps.length;
+  // Step delays (ms) — intentionally fast for good UX
+  const delays  = [120, 200, 160, 140, 220, 300, 350, 400, 450, 250, 200, 350];
+  let current   = 0;
+
+  function advance() {
+    if (current > 0) {
+      const prev = steps[current - 1];
+      prev.classList.remove('active');
+      prev.classList.add('done');
+      prev.querySelector('.step-icon').textContent = '✓';
+    }
+    if (current < total) {
+      const cur = steps[current];
+      cur.classList.remove('pending');
+      cur.classList.add('active');
+      cur.innerHTML = cur.innerHTML + '<div class="step-spinner"></div>';
+      fill.style.width = ((current + 1) / total * 100) + '%';
+      current++;
+      setTimeout(advance, delays[current - 1] || 280);
+    } else {
+      // All done
+      fill.style.width = '100%';
+      cta.style.display = 'block';
+      setTimeout(function() {
+        window.location.assign(dashboardUrl);
+      }, 250);
+    }
+  }
+
+  setTimeout(advance, 300);
+})();
+</script>
+{% endblock %}
