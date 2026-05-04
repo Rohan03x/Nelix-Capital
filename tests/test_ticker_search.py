@@ -29,6 +29,7 @@ def test_search_tickers_keeps_same_code_across_multiple_exchanges(monkeypatch):
         ),
     )
     monkeypatch.setattr(ticker_search, "_live_search_items", lambda query: ())
+    monkeypatch.setattr(ticker_search, "_load_search_shard", lambda _letter: ())
 
     results = ticker_search.search_tickers("RIO", limit=10)
     tickers = [item["ticker"] for item in results]

@@ -27,6 +27,14 @@ from auto_valuation.learning.industry_taxonomy import industry_similarity, relat
 
 logger = logging.getLogger(__name__)
 
+# Minimum industry-similarity score a displayed peer must meet.
+# Learning bonuses may only reorder peers that have already cleared this gate.
+_PEER_MIN_INDUSTRY_FIT: float = 0.45
+
+# Max number of related-industry (not same-canonical) names allowed in the
+# displayed basket. Same-canonical names are not capped.
+_PEER_MAX_RELATED_FALLBACK: int = 3
+
 # ─── Peer group definitions ────────────────────────────────────────────────────
 
 # Companies with distinct business segments get a custom basket per segment
@@ -83,9 +91,13 @@ INDUSTRY_PEER_MAP: dict[str, list[str]] = {
     "Software—Application":       ["MSFT", "CRM", "ORCL", "SAP", "NOW", "ADBE", "WDAY", "HUBS"],
     "Software—Infrastructure":    ["MSFT", "GOOGL", "ORCL", "IBM", "CSCO", "PANW", "FTNT"],
     "Semiconductors":             ["NVDA", "AMD", "INTC", "QCOM", "AVGO", "TSM", "ASML", "AMAT", "KLAC"],
-    "Consumer Electronics":       ["AAPL", "MSFT", "GOOGL", "META", "SONY", "HPQ"],
+    # Note: MSFT/GOOGL/META removed – they are Software/Internet, not Consumer Electronics.
+    "Consumer Electronics":       ["AAPL", "SONY", "HPQ", "DELL", "1810.HK", "NTDOY"],
+    "Electrical Equipment":        ["AYI", "HUBB", "ETN", "LR.PA", "SU.PA", "ABBN.SW", "LIGHT.AS", "EMR"],
+    "Staffing & Employment Services": ["MAN", "ADEN.SW", "RAND.AS", "RHI", "KFY", "HSII"],
+    "Electronic Components (Original)":  ["HON", "TE", "APTV", "FLEX", "JBL"],  # kept with rename for legacy
     "Internet Content & Information": ["META", "GOOGL", "SNAP", "PINS", "RDDT", "TWTR"],
-    "Electronic Components":      ["HON", "TE", "APTV", "FLEX", "JBL"],
+    "Electronic Components":      ["TE", "APTV", "FLEX", "JBL", "AVX"],
     "Information Technology Services": ["INFY", "WIT", "ACN", "IBM", "CTSH", "TCS"],
     "Computer Hardware":          ["AAPL", "HPQ", "DELL", "HPE", "NTAP", "PSTG"],
     # Healthcare
@@ -444,6 +456,40 @@ def _curated_industry_for_ticker(ticker: str) -> str:
     return ""
 
 
+def _resolve_ticker_industry_metadata(
+    ticker: str,
+    profiles: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """Return best-effort {sector, industry, canonical_industry} for *ticker*.
+
+    Resolution order:
+    1. Local cached fund profile (most reliable, has real EODHD data)
+    2. Curated INDUSTRY_PEER_MAP reverse-lookup (covers international names not in cache)
+    3. Taxonomy inference from canonical_industry
+    """
+    if profiles is None:
+        profiles = {str(p.get("ticker") or ""): p for p in _load_cached_peer_profiles()}
+
+    candidate = str(ticker or "").upper()
+    profile = profiles.get(candidate) or {}
+    sector = str(profile.get("sector") or "").strip()
+    industry = str(profile.get("industry") or "").strip()
+
+    if not industry:
+        industry = _curated_industry_for_ticker(candidate)
+
+    if industry and not sector:
+        taxonomy = resolve_industry_taxonomy(industry)
+        sector = str(taxonomy.get("canonical_sector") or "").strip()
+
+    canonical_industry = ""
+    if industry:
+        taxonomy = resolve_industry_taxonomy(industry, sector)
+        canonical_industry = str(taxonomy.get("canonical_industry") or industry).strip()
+
+    return {"sector": sector, "industry": industry, "canonical_industry": canonical_industry}
+
+
 def _safe_universe_store() -> Any | None:
     try:
         from auto_valuation.learning.universe import SymbolUniverseStore
@@ -526,26 +572,46 @@ def _rank_peer_tickers(
     scored: list[tuple[float, int, str]] = []
     for index, ticker in enumerate(peer_tickers):
         candidate = str(ticker or "").upper()
-        profile = profiles.get(candidate)
-        candidate_sector = str((profile or {}).get("sector") or "")
-        candidate_industry = str((profile or {}).get("industry") or "")
+        # Resolve best-effort metadata: cached profile first, then curated map fallback.
+        meta = _resolve_ticker_industry_metadata(candidate, profiles)
+        candidate_sector = meta["sector"]
+        candidate_industry = meta["industry"]
+
         similarity = industry_similarity(
             industry,
             candidate_industry,
             subject_sector=sector,
             candidate_sector=candidate_sector,
         )
+
+        # ── Hard taxonomy gate ──────────────────────────────────────────────
+        # Learning bonuses may ONLY reorder peers that already pass the gate.
+        # Peers with no industry metadata or similarity below the minimum are
+        # excluded from the displayed basket entirely.
+        if similarity < _PEER_MIN_INDUSTRY_FIT:
+            logger.debug(
+                "Peer %s excluded (industry_similarity=%.3f < %.2f) for subject %s / %s",
+                candidate,
+                similarity,
+                _PEER_MIN_INDUSTRY_FIT,
+                ticker,
+                industry,
+            )
+            continue
+
         score = similarity * 60.0
 
-        candidate_exchange = str((profile or {}).get("exchange") or "")
+        candidate_exchange = str((profiles.get(candidate) or {}).get("exchange") or "")
         if subject_exchange and candidate_exchange and candidate_exchange == subject_exchange:
             score += 4.0
 
-        candidate_market_cap = float((profile or {}).get("market_cap_mln") or 0.0)
+        candidate_market_cap = float((profiles.get(candidate) or {}).get("market_cap_mln") or 0.0)
         if subject_market_cap > 0 and candidate_market_cap > 0:
             market_cap_gap = abs(math.log10(max(candidate_market_cap, 1.0) / max(subject_market_cap, 1.0)))
             score += max(0.0, 8.0 - market_cap_gap * 8.0)
 
+        # Learning bonuses applied AFTER the taxonomy gate — they reorder
+        # valid peers, never rescue invalid ones.
         if universe_store is not None:
             score += _peer_learning_bonus(universe_store.get_symbol(candidate))
 
@@ -610,6 +676,11 @@ def _enrich_peer_rows(
         pair_context = _pair_relationship_context(target_ticker, ticker, discovery_store)
         row["canonical_industry"] = str(taxonomy.get("canonical_industry") or row["industry"] or "")
         row["industry_family"] = str(taxonomy.get("family") or "")
+        same_canonical = bool(
+            target_taxonomy.get("canonical_industry")
+            and target_taxonomy.get("canonical_industry") == taxonomy.get("canonical_industry")
+            and str(taxonomy.get("canonical_industry") or "").strip()
+        )
         row["same_industry_cluster"] = bool(
             target_taxonomy.get("cluster_id")
             and target_taxonomy.get("cluster_id") == taxonomy.get("cluster_id")
@@ -630,6 +701,31 @@ def _enrich_peer_rows(
         row["base_peer_learning_score"] = round(row["industry_fit_score"] + row["global_peer_score"], 4)
         row["peer_learning_score"] = round(row["base_peer_learning_score"] + row["pair_strength_score"], 4)
         row["peer_rank"] = int(order_map.get(ticker, len(order_map)))
+
+        # ── Audit fields ─────────────────────────────────────────────────────
+        industry_sim = row["industry_similarity"]
+        has_industry_meta = bool(row["industry"]) and bool(row["sector"])
+        if not has_industry_meta:
+            row["peer_valid"] = False
+            row["peer_classification"] = "cross-sector-analog"
+            row["pass_reason"] = "missing-metadata"
+            row["fallback_reason"] = "sector or industry metadata could not be resolved"
+        elif industry_sim >= 0.85 and same_canonical:
+            row["peer_valid"] = True
+            row["peer_classification"] = "competitor"
+            row["pass_reason"] = "same-canonical-industry"
+            row["fallback_reason"] = ""
+        elif industry_sim >= _PEER_MIN_INDUSTRY_FIT:
+            row["peer_valid"] = True
+            row["peer_classification"] = "related-reaction"
+            row["pass_reason"] = "related-industry" if not same_canonical else "same-canonical-industry"
+            row["fallback_reason"] = "" if same_canonical else "related-industry fallback"
+        else:
+            row["peer_valid"] = False
+            row["peer_classification"] = "cross-sector-analog"
+            row["pass_reason"] = "failed-taxonomy-gate"
+            row["fallback_reason"] = f"industry_similarity={industry_sim:.3f} below minimum {_PEER_MIN_INDUSTRY_FIT}"
+
         enriched.append(row)
 
     enriched.sort(
@@ -658,13 +754,19 @@ def get_peers_for_ticker(
 ) -> list[str]:
     """Return peer tickers for *ticker*.
 
-    Priority: multi-segment override → same-industry cached peers + industry map
-    → sector fallback.
+    Priority: multi-segment override → same-canonical-industry cached peers +
+    curated industry map → related-industry fallback (capped at
+    _PEER_MAX_RELATED_FALLBACK) → sector fallback.
+
+    The taxonomy gate in _rank_peer_tickers ensures every returned ticker has
+    an industry similarity score ≥ _PEER_MIN_INDUSTRY_FIT.  Tickers that fail
+    the gate are silently excluded — they never reach the displayed basket.
+
     Self-ticker is always removed.  Max 12 unique peers returned.
     """
     ticker = ticker.upper()
 
-    # 1. Multi-segment override
+    # 1. Multi-segment override (no taxonomy gate applied — basket is curated).
     if ticker in MULTI_SEGMENT_PEERS:
         seen: set[str] = set()
         peers: list[str] = []
@@ -675,31 +777,38 @@ def get_peers_for_ticker(
                     peers.append(p)
         return peers[:12]
 
-    # 2. Cached same-industry discovery + curated industry map.
+    # 2. Same-canonical-industry: cached discovery + curated map (primary basket).
     cached_industry_peers = _discover_cached_peers(ticker, sector, industry, max_peers=12, include_related=False)
     curated_industry_peers = _industry_peers(industry, include_related=False)
     industry_peers = _dedupe_preserve(
         cached_industry_peers + curated_industry_peers,
         exclude=_ticker_variants(ticker),
-        limit=10,
+        limit=12,
     )
-    if len(industry_peers) >= 6:
-        return _rank_peer_tickers(industry_peers, subject_ticker=ticker, sector=sector, industry=industry)
+    ranked = _rank_peer_tickers(industry_peers, subject_ticker=ticker, sector=sector, industry=industry)
+    if len(ranked) >= 4:
+        return ranked
 
-    related_cached_peers = _discover_cached_peers(ticker, sector, industry, max_peers=12, include_related=True)
-    related_curated_peers = _industry_peers(industry, include_related=True)
-    industry_peers = _dedupe_preserve(
-        industry_peers + related_cached_peers + related_curated_peers,
+    # 3. Related-industry fallback — capped so unrelated names cannot flood the basket.
+    related_cached_peers = _discover_cached_peers(ticker, sector, industry, max_peers=8, include_related=True)
+    # Separate same-canonical from related-only curated peers so we can cap the
+    # related portion independently.
+    curated_same = set(curated_industry_peers)
+    all_related_curated = _industry_peers(industry, include_related=True)
+    related_only_curated = [p for p in all_related_curated if p not in curated_same][:_PEER_MAX_RELATED_FALLBACK]
+    combined = _dedupe_preserve(
+        industry_peers + related_cached_peers + related_only_curated,
         exclude=_ticker_variants(ticker),
-        limit=10,
+        limit=12,
     )
-    if industry_peers:
-        return _rank_peer_tickers(industry_peers, subject_ticker=ticker, sector=sector, industry=industry)
+    ranked_combined = _rank_peer_tickers(combined, subject_ticker=ticker, sector=sector, industry=industry)
+    if ranked_combined:
+        return ranked_combined
 
     if str(industry or "").strip():
         return []
 
-    # 3. Sector fallback.
+    # 4. Sector fallback — only when no industry was supplied at all.
     sector_peers = _dedupe_preserve(_sector_peers(sector), exclude=_ticker_variants(ticker), limit=8)
     if sector_peers:
         return _rank_peer_tickers(sector_peers, subject_ticker=ticker, sector=sector, industry=industry)
@@ -810,6 +919,8 @@ def fetch_peer_metrics(
             target_sector=target_sector,
             target_industry=target_industry,
         )
+        # Invalidate stale invalid rows so they don't persist in the displayed basket.
+        peers = [p for p in peers if p.get("subject") or p.get("peer_valid", True)]
         peer_median = _compute_median(peers, target_ticker)
         return peers, peer_median
 
@@ -871,10 +982,21 @@ def fetch_peer_metrics(
         target_sector=target_sector,
         target_industry=target_industry,
     )
-    _save_cache(cache_key, peers)
+    # Filter out invalid peers before caching and returning.
+    # Subject row is always kept regardless of validity flag.
+    valid_peers = [p for p in peers if p.get("subject") or p.get("peer_valid", True)]
+    if len(valid_peers) < len(peers):
+        excluded = [p["ticker"] for p in peers if not p.get("subject") and not p.get("peer_valid", True)]
+        logger.info(
+            "fetch_peer_metrics: excluded %d invalid peer(s) for %s: %s",
+            len(peers) - len(valid_peers),
+            target_ticker,
+            excluded,
+        )
+    _save_cache(cache_key, valid_peers)
 
-    peer_median = _compute_median(peers, target_ticker)
-    return peers, peer_median
+    peer_median = _compute_median(valid_peers, target_ticker)
+    return valid_peers, peer_median
 
 
 def _compute_median(peers: list[dict], target_ticker: str) -> dict:

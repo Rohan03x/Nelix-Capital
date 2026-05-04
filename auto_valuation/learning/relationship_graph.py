@@ -437,6 +437,16 @@ def build_relationship_graph(
     if not signals:
         return _disabled_graph()
 
+    def _industry_fit(sig_sector: str, sig_industry: str) -> float:
+        """Return 1.0 when sector/industry is populated, lower for blank/Other."""
+        industry_val = str(sig_industry or "").strip()
+        sector_val = str(sig_sector or "").strip()
+        if not industry_val or industry_val.lower() in {"other", "n/a", "unknown"}:
+            return 0.60
+        if not sector_val or sector_val.lower() in {"other", "n/a", "unknown"}:
+            return 0.80
+        return 1.0
+
     nodes = [
         {
             "ticker": subject_ticker,
@@ -444,10 +454,12 @@ def build_relationship_graph(
             "industry": industry,
             "role": "subject",
             "score": 1.0,
+            "industry_fit": 1.0,
             "label": "Subject ticker",
         }
     ]
     for signal in signals:
+        fit = _industry_fit(signal.sector, signal.industry)
         nodes.append(
             {
                 "ticker": signal.ticker,
@@ -457,19 +469,31 @@ def build_relationship_graph(
                 "score": round(signal.strength, 3),
                 "similarity": round(signal.similarity, 3),
                 "usefulness": round(signal.predictive_usefulness, 2),
+                "industry_fit": round(fit, 3),
+                "peer_classification": (
+                    "operating-analog" if signal.role == "analog" else "realized-spillover"
+                ),
                 "rationale": signal.rationale,
             }
         )
 
     edges: list[dict[str, Any]] = []
     for signal in signals:
-        edge_weight = _clamp(0.55 * signal.similarity + 0.45 * signal.strength, 0.0, 1.0)
+        fit = _industry_fit(signal.sector, signal.industry)
+        # Reduce edge weight for nodes with blank/Other industry metadata.
+        edge_weight = _clamp(
+            (0.55 * signal.similarity + 0.45 * signal.strength) * fit,
+            0.0,
+            1.0,
+        )
+        relationship = "analog-fingerprint" if signal.role == "analog" else "realized-spillover"
         edges.append(
             {
                 "source": subject_ticker,
                 "target": signal.ticker,
                 "weight": round(edge_weight, 3),
-                "relationship": "analog-fingerprint" if signal.role == "analog" else "realized-spillover",
+                "relationship": relationship,
+                "industry_fit": round(fit, 3),
                 "rationale": signal.rationale,
             }
         )
@@ -479,9 +503,14 @@ def build_relationship_graph(
             pair_similarity = _safe_similarity(left_signal.feature_vector, right_signal.feature_vector)
             if pair_similarity < 0.72:
                 continue
+            pair_fit = min(
+                _industry_fit(left_signal.sector, left_signal.industry),
+                _industry_fit(right_signal.sector, right_signal.industry),
+            )
             pair_weight = _clamp(
                 pair_similarity
-                * (0.55 + 0.25 * min(left_signal.predictive_usefulness, right_signal.predictive_usefulness)),
+                * (0.55 + 0.25 * min(left_signal.predictive_usefulness, right_signal.predictive_usefulness))
+                * pair_fit,
                 0.0,
                 1.0,
             )
@@ -491,6 +520,7 @@ def build_relationship_graph(
                     "target": right_signal.ticker,
                     "weight": round(pair_weight, 3),
                     "relationship": "peer-cluster",
+                    "industry_fit": round(pair_fit, 3),
                     "rationale": "Connected through a similar operating fingerprint inside the broader symbol graph.",
                 }
             )

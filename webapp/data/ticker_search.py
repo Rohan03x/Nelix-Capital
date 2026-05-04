@@ -30,6 +30,7 @@ def _resolve_cache_dir() -> Path:
 
 
 _CACHE_DIR = _resolve_cache_dir()
+_PREBUILT_INDEX_PATH = _CACHE_DIR / "search_index_prebuilt.json"
 _SPACE_RE = re.compile(r"[^A-Z0-9]+")
 _SEARCH_TTL_SEC = 43_200
 _SEED_HEALTH_STALE_HOURS = 72
@@ -350,13 +351,44 @@ def _live_search_items(query: str) -> tuple[dict[str, object], ...]:
     return tuple(items)
 
 
+
+@lru_cache(maxsize=28)
+def _load_search_shard(letter: str) -> tuple[dict[str, object], ...]:
+    shard_path = _CACHE_DIR / ("search_shard_" + letter + ".json")
+    if shard_path.exists():
+        try:
+            data = json.loads(shard_path.read_text(encoding="utf-8"))
+            if isinstance(data, list) and data:
+                return tuple(data)
+        except (OSError, json.JSONDecodeError):
+            pass
+    return ()
+
+
+def _matched_candidates(query_key: str, items) -> list[dict[str, object]]:
+    results: dict[str, dict[str, object]] = {}
+    for item in items:
+        if _match_score(query_key, item) is not None:
+            ticker = str(item["ticker"])
+            results.setdefault(ticker, item)
+    return list(results.values())
+
+
 def _search_candidates(query: str) -> list[dict[str, object]]:
-    candidates: dict[str, dict[str, object]] = {}
-    for item in _live_search_items(query):
-        candidates[str(item["ticker"])] = item
-    for item in _ticker_search_index():
-        candidates.setdefault(str(item["ticker"]), item)
-    return list(candidates.values())
+    query_key = _normalise_search_text(query)
+    if not query_key:
+        return []
+    first = query_key[0].lower() if query_key[0].isalpha() else "misc"
+    shard = _load_search_shard(first)
+    if shard:
+        local_matches = _matched_candidates(query_key, shard)
+        if local_matches:
+            return local_matches
+        return _matched_candidates(query_key, _live_search_items(query))
+    local_matches = _matched_candidates(query_key, _ticker_search_index())
+    if local_matches:
+        return local_matches
+    return _matched_candidates(query_key, _live_search_items(query))
 
 
 def _iter_cached_search_items() -> tuple[dict[str, object], ...]:
@@ -403,6 +435,13 @@ def invalidate_ticker_search_index() -> None:
 
 @lru_cache(maxsize=1)
 def _ticker_search_index() -> tuple[dict[str, object], ...]:
+    if _PREBUILT_INDEX_PATH.exists():
+        try:
+            data = json.loads(_PREBUILT_INDEX_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, list) and data:
+                return tuple(data)
+        except (OSError, json.JSONDecodeError):
+            pass
     items: list[dict[str, object]] = []
     seen_tickers: set[str] = set()
 

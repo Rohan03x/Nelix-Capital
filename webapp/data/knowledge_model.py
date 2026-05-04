@@ -1419,6 +1419,8 @@ def _global_cross_symbol_overlay(
     market_cap_regime: str,
     macro_regime: str,
     subject_structural_break_like: bool = False,
+    subject_sector: str = "",
+    subject_industry: str = "",
 ) -> dict[str, Any]:
     if not observations:
         return {
@@ -1510,7 +1512,27 @@ def _global_cross_symbol_overlay(
         }
     )
     confidence = _clamp(min(1.0, len(selected) / 18.0) * min(1.0, sector_span / 4.0), 0.15, 1.0)
-    damping = _clamp(0.10 + 0.20 * confidence, 0.10, 0.30)
+
+    # Taxonomy-aware damping: if the subject has a known industry and no
+    # observations in the selected cohort share that industry (or even sector),
+    # the overlay is broad-regime evidence only and should carry less weight.
+    taxonomy_damping_scale = 1.0
+    if subject_industry or subject_sector:
+        same_industry_count = 0
+        same_sector_count = 0
+        for obs in selected:
+            obs_industry = str(_obs_value(obs, "industry", "") or "").strip()
+            obs_sector = str(_obs_value(obs, "sector", "") or "").strip()
+            if subject_industry and obs_industry and obs_industry.lower() == subject_industry.lower():
+                same_industry_count += 1
+            if subject_sector and obs_sector and obs_sector.lower() == subject_sector.lower():
+                same_sector_count += 1
+        if same_industry_count == 0 and same_sector_count == 0:
+            taxonomy_damping_scale = 0.45  # pure broad-regime: sharply reduced
+        elif same_industry_count == 0:
+            taxonomy_damping_scale = 0.70  # same sector but not same industry: moderate reduction
+
+    damping = _clamp((0.10 + 0.20 * confidence) * taxonomy_damping_scale, 0.04, 0.30)
     revenue_growth_adj_pp = round(
         _clamp(
             _safe_mean(
@@ -1625,6 +1647,12 @@ def _global_cross_symbol_overlay(
             if subject_structural_break_like
             else " matched to stable histories."
         )
+    if taxonomy_damping_scale < 1.0:
+        note += (
+            " Overlay is low-confidence (broad-regime only — no same-industry anchor in cohort)"
+            if taxonomy_damping_scale <= 0.45
+            else " Overlay moderately dampened (same sector but no same-industry anchor in cohort)."
+        )
 
     return {
         "enabled": True,
@@ -1632,6 +1660,7 @@ def _global_cross_symbol_overlay(
         "cohort_size": len(selected),
         "sector_span": sector_span,
         "confidence": round(confidence, 2),
+        "taxonomy_confidence": round(taxonomy_damping_scale, 2),
         "regime_filter": "matched" if matched_regime else "mixed",
         "revenue_growth_adj_pp": revenue_growth_adj_pp,
         "ebit_margin_adj_pp": ebit_margin_adj_pp,
@@ -1864,6 +1893,8 @@ def refine_live_assumptions(
         market_cap_regime=market_cap_regime,
         macro_regime="neutral",
         subject_structural_break_like=subject_structural_break_like,
+        subject_sector=sector,
+        subject_industry=industry,
     )
     analog_overlay_eligible = bool(analog_learning.get("enabled")) and len(analog_set.analogs) >= 2
     global_learning = analog_learning if analog_overlay_eligible else fallback_global_learning

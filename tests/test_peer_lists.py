@@ -304,16 +304,26 @@ def test_fetch_peer_metrics_normalizes_eodhd_suffixes_for_yfinance(monkeypatch):
                 "totalCash": 50_000_000,
             }
 
+    # Provide cached profiles so the taxonomy gate can evaluate industry similarity.
+    # All three test tickers are treated as Staffing & Employment Services to match
+    # ADEN.SW's industry and pass the _PEER_MIN_INDUSTRY_FIT gate.
+    _mock_profiles = [
+        {"ticker": t, "sector": "Industrials", "industry": "Staffing & Employment Services"}
+        for t in ("G14.XETRA", "70GD.LSE", "JBGS.US")
+    ]
+
     monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(Ticker=_FakeTicker))
     monkeypatch.setattr(peer_lists, "_load_cache", lambda _key: None)
     monkeypatch.setattr(peer_lists, "_save_cache", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(peer_lists, "_load_cached_peer_profiles", lambda: ())
+    monkeypatch.setattr(peer_lists, "_load_cached_peer_profiles", lambda: _mock_profiles)
     monkeypatch.setattr(peer_lists, "_safe_universe_store", lambda: None)
     monkeypatch.setattr(peer_lists, "_safe_discovery_store", lambda: None)
 
     peers, peer_median = peer_lists.fetch_peer_metrics(
         ["G14.XETRA", "70GD.LSE", "JBGS.US"],
         "ADEN.SW",
+        target_sector="Industrials",
+        target_industry="Staffing & Employment Services",
     )
 
     assert requested == ["G14.DE", "70GD.L", "JBGS"]
