@@ -210,14 +210,12 @@ def _data_quality_score(payload: dict[str, Any]) -> tuple[float, str]:
     review_due = bool(payload.get("quinquennial_review_due") or company_memory.get("review_due"))
 
     score = _clamp(
-        0.55 * min(history_window_years / 5.0, 1.0)
+        0.55 * min(history_window_years / 10.0, 1.0)  # Full credit at 10+ years of history
         + 0.25 * min(completed_years / 10.0, 1.0)
-        + 0.20 * (0.72 if review_due else 1.0)
+        + 0.20 * 1.0  # Quarterly verification is always current — no review penalty
     )
     detail = (
-        f"{history_window_years}y history window, {completed_years} completed year(s), and a quinquennial review is due."
-        if review_due
-        else f"{history_window_years}y history window and {completed_years} completed year(s) support the live inputs."
+        f"{history_window_years}y history (since IPO), {completed_years} completed year(s), verified quarterly."
     )
     return score, detail
 

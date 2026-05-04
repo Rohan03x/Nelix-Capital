@@ -851,9 +851,9 @@ def test_eodhd_read_only_build_skips_learning_writes(monkeypatch):
 
     data = eodhd_client.build_dashboard_data("TEST", mutate_learning=False)
 
-    assert data["knowledge_model"]["learning_bootstrap"]["reason"] == "read-only"
-    assert data["knowledge_model"]["learning_maintenance"]["reason"] == "read-only"
-    assert data["knowledge_model"]["learning_persistence"]["reason"] == "read-only"
+    assert data["knowledge_model"]["learning_bootstrap"]["reason"] == "mutate_learning disabled"
+    assert data["knowledge_model"]["learning_maintenance"]["reason"] == "mutate_learning disabled"
+    assert data["knowledge_model"]["learning_persistence"]["reason"] == "mutate_learning disabled"
     assert data["knowledge_model"]["global_universe"]["tracked_symbols"] == 12
 
 
@@ -1071,7 +1071,7 @@ def test_index_and_dashboard_render_discovery_controls(monkeypatch):
     import webapp.app as webapp_module
 
     webapp_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
-    monkeypatch.setattr(webapp_module, "get_dashboard_data", lambda ticker: copy.deepcopy(_sample_dashboard_data()))
+    monkeypatch.setattr(webapp_module, "get_dashboard_data", lambda ticker, **kwargs: copy.deepcopy(_sample_dashboard_data()))
 
     with webapp_module.app.test_client() as client:
         index_response = client.get("/")
@@ -1123,7 +1123,7 @@ def test_dashboard_peer_actions_use_peer_metadata(monkeypatch):
     data["peer_median"] = {}
 
     webapp_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
-    monkeypatch.setattr(webapp_module, "get_dashboard_data", lambda ticker: copy.deepcopy(data))
+    monkeypatch.setattr(webapp_module, "get_dashboard_data", lambda ticker, **kwargs: copy.deepcopy(data))
 
     with webapp_module.app.test_client() as client:
         response = client.get("/dashboard/NKE")
@@ -1191,7 +1191,7 @@ def test_api_dashboard_exposes_learning_explainability_alias(monkeypatch):
         },
     }
 
-    monkeypatch.setattr(webapp_module, "get_dashboard_data", lambda ticker: copy.deepcopy(expected))
+    monkeypatch.setattr(webapp_module, "get_dashboard_data", lambda ticker, **kwargs: copy.deepcopy(expected))
 
     with webapp_module.app.test_client() as client:
         response = client.get("/api/dashboard/NKE")
@@ -1212,7 +1212,7 @@ def test_dashboard_and_api_fall_back_to_demo_when_dashboard_data_raises(monkeypa
     monkeypatch.setattr(
         webapp_module,
         "get_dashboard_data",
-        lambda _ticker: (_ for _ in ()).throw(RuntimeError("upstream boom")),
+        lambda _ticker, **kwargs: (_ for _ in ()).throw(RuntimeError("upstream boom")),
     )
 
     with webapp_module.app.test_client() as client:
@@ -1509,7 +1509,7 @@ def test_dashboard_renders_everything_knows_model_panel(monkeypatch):
         },
     }
 
-    monkeypatch.setattr(webapp_module, "get_dashboard_data", lambda ticker: copy.deepcopy(data))
+    monkeypatch.setattr(webapp_module, "get_dashboard_data", lambda ticker, **kwargs: copy.deepcopy(data))
 
     with webapp_module.app.test_client() as client:
         response = client.get("/dashboard/NKE")

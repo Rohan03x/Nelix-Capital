@@ -35,6 +35,33 @@ _PEER_MIN_INDUSTRY_FIT: float = 0.45
 # displayed basket. Same-canonical names are not capped.
 _PEER_MAX_RELATED_FALLBACK: int = 3
 
+# Cross-listing exclusion map: when searching peers for key ticker, always
+# exclude these tickers because they are the SAME company on a different exchange.
+# Format: "SUBJECT_TICKER" → {cross-listed variants to exclude}
+_CROSS_LISTED_EXCLUSIONS: dict[str, set[str]] = {
+    # Signify N.V.: PHPPY / PHPPY.US (OTC ADR) = LIGHT.AS (Euronext Amsterdam)
+    "PHPPY.US": {"LIGHT.AS", "LIGHT"},
+    "PHPPY":    {"LIGHT.AS", "LIGHT"},
+    "LIGHT.AS": {"PHPPY.US", "PHPPY"},
+    # Unilever: UL (OTC ADR) = ULVR.L (LSE) = UNA.AS (Euronext)
+    "UL":       {"ULVR.L", "UNA.AS"},
+    "ULVR.L":   {"UL", "UNA.AS"},
+    "UNA.AS":   {"UL", "ULVR.L"},
+    # Shell: SHEL = SHELL.AS
+    "SHEL":     {"SHELL.AS", "RDSA.L", "RDSB.L"},
+    "SHELL.AS": {"SHEL"},
+    # BP
+    "BP":       {"BP.L"},
+    "BP.L":     {"BP"},
+    # ASML
+    "ASML":     {"ASML.AS"},
+    "ASML.AS":  {"ASML"},
+    # ABB: ABBNY (OTC) = ABBN.SW (SIX)
+    "ABBNY":    {"ABBN.SW"},
+    "ABBN.SW":  {"ABBNY"},
+}
+
+
 # ─── Peer group definitions ────────────────────────────────────────────────────
 
 # Companies with distinct business segments get a custom basket per segment
@@ -93,7 +120,11 @@ INDUSTRY_PEER_MAP: dict[str, list[str]] = {
     "Semiconductors":             ["NVDA", "AMD", "INTC", "QCOM", "AVGO", "TSM", "ASML", "AMAT", "KLAC"],
     # Note: MSFT/GOOGL/META removed – they are Software/Internet, not Consumer Electronics.
     "Consumer Electronics":       ["AAPL", "SONY", "HPQ", "DELL", "1810.HK", "NTDOY"],
-    "Electrical Equipment":        ["AYI", "HUBB", "ETN", "LR.PA", "SU.PA", "ABBN.SW", "LIGHT.AS", "EMR"],
+    # Electrical Equipment & Parts: lighting, switchgear, power management (canonical matches EODHD/yfinance)
+    # LIGHT.AS (Signify NV Euronext) intentionally excluded — it is a cross-listing of PHPPY.US
+    # Both keys maintained: "Electrical Equipment" (yfinance legacy) and "Electrical Equipment & Parts" (EODHD canonical)
+    "Electrical Equipment":            ["AYI", "HUBB", "ETN", "LR.PA", "ABBN.SW", "EMR", "WOLF", "LYTS", "AMSAG.SW", "ZAG.VI"],
+    "Electrical Equipment & Parts":    ["AYI", "HUBB", "ETN", "LR.PA", "ABBN.SW", "EMR", "WOLF", "LYTS", "AMSAG.SW", "ZAG.VI"],
     "Staffing & Employment Services": ["MAN", "ADEN.SW", "RAND.AS", "RHI", "KFY", "HSII"],
     "Electronic Components (Original)":  ["HON", "TE", "APTV", "FLEX", "JBL"],  # kept with rename for legacy
     "Internet Content & Information": ["META", "GOOGL", "SNAP", "PINS", "RDDT", "TWTR"],
@@ -183,6 +214,17 @@ INDUSTRY_ALIAS_MAP: dict[str, str] = {
     "software infrastructure": "Software—Infrastructure",
     "drug manufacturers general": "Drug Manufacturers—General",
     "drug manufacturers specialty generic": "Drug Manufacturers—Specialty & Generic",
+    # Electrical Equipment old key (legacy) → canonical
+    "electrical equipment": "Electrical Equipment & Parts",
+    "electrical components": "Electrical Equipment & Parts",
+    "electrical equipment parts": "Electrical Equipment & Parts",
+    "electronic equipment": "Electrical Equipment & Parts",
+    "lighting": "Electrical Equipment & Parts",
+    "lighting equipment": "Electrical Equipment & Parts",
+    # Staffing variants
+    "staffing": "Staffing & Employment Services",
+    "employment services": "Staffing & Employment Services",
+    "staffing employment": "Staffing & Employment Services",
 }
 
 _INDUSTRY_STOPWORDS = {
@@ -765,6 +807,8 @@ def get_peers_for_ticker(
     Self-ticker is always removed.  Max 12 unique peers returned.
     """
     ticker = ticker.upper()
+    # Build the full exclusion set: self-ticker variants + known cross-listed same-company tickers
+    _self_exclude = _ticker_variants(ticker) | _CROSS_LISTED_EXCLUSIONS.get(ticker, set())
 
     # 1. Multi-segment override (no taxonomy gate applied — basket is curated).
     if ticker in MULTI_SEGMENT_PEERS:
@@ -772,7 +816,7 @@ def get_peers_for_ticker(
         peers: list[str] = []
         for seg_peers in MULTI_SEGMENT_PEERS[ticker].values():
             for p in seg_peers:
-                if p not in seen and p != ticker:
+                if p.upper() not in _self_exclude and p not in seen:
                     seen.add(p)
                     peers.append(p)
         return peers[:12]
@@ -782,7 +826,7 @@ def get_peers_for_ticker(
     curated_industry_peers = _industry_peers(industry, include_related=False)
     industry_peers = _dedupe_preserve(
         cached_industry_peers + curated_industry_peers,
-        exclude=_ticker_variants(ticker),
+        exclude=_self_exclude,
         limit=12,
     )
     ranked = _rank_peer_tickers(industry_peers, subject_ticker=ticker, sector=sector, industry=industry)
@@ -798,7 +842,7 @@ def get_peers_for_ticker(
     related_only_curated = [p for p in all_related_curated if p not in curated_same][:_PEER_MAX_RELATED_FALLBACK]
     combined = _dedupe_preserve(
         industry_peers + related_cached_peers + related_only_curated,
-        exclude=_ticker_variants(ticker),
+        exclude=_self_exclude,
         limit=12,
     )
     ranked_combined = _rank_peer_tickers(combined, subject_ticker=ticker, sector=sector, industry=industry)
@@ -809,7 +853,7 @@ def get_peers_for_ticker(
         return []
 
     # 4. Sector fallback — only when no industry was supplied at all.
-    sector_peers = _dedupe_preserve(_sector_peers(sector), exclude=_ticker_variants(ticker), limit=8)
+    sector_peers = _dedupe_preserve(_sector_peers(sector), exclude=_self_exclude, limit=8)
     if sector_peers:
         return _rank_peer_tickers(sector_peers, subject_ticker=ticker, sector=sector, industry=industry)
 

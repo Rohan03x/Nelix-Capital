@@ -393,6 +393,7 @@ def build_relationship_graph(
     subject_vector = getattr(subject_features, "vector", None) or subject_features
     max_neighbors = max(3, int(max_neighbors or 6))
     observation_rows = list(observations or [])
+    subject_sector = str(sector or "").strip().lower()
 
     analog_pool = [_signal_from_match(match) for match in list(analog_set.analogs or [])]
     seen_tickers = {subject_ticker}
@@ -405,6 +406,21 @@ def build_relationship_graph(
             continue
         if signal.similarity < min_similarity:
             continue
+        # ── Sector/industry relevance filter ───────────────────────────────────
+        # Only include realized peers from the same sector. When sector metadata
+        # is unavailable for either party, fall back to similarity-only gating
+        # with a raised bar (0.80) to prevent cross-sector noise.
+        candidate_sector = str(signal.sector or "").strip().lower()
+        if subject_sector and candidate_sector:
+            if candidate_sector != subject_sector:
+                # Cross-sector: only allow if exceptionally similar (direct competitor
+                # operating in adjacent sector, e.g. industrial-tech hybrids)
+                if signal.similarity < 0.82:
+                    continue
+        elif subject_sector and not candidate_sector:
+            # No metadata on candidate: require higher similarity to admit
+            if signal.similarity < 0.80:
+                continue
         seen_tickers.add(signal.ticker.upper())
         realized_pool.append(signal)
 

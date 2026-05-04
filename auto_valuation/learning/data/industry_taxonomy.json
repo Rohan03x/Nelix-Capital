@@ -105,8 +105,40 @@
       "canonical_industry": "Specialty Industrial Machinery",
       "sector": "Industrials",
       "aliases": ["specialty industrial machinery", "industrial machinery"],
-      "related_industries": ["Industrial Conglomerates"],
+      "related_industries": ["Industrial Conglomerates", "Electrical Equipment & Parts"],
       "keywords": ["industrial", "machinery", "automation", "equipment"]
+    },
+    {
+      "id": "electrical-equipment-parts",
+      "family": "industrials",
+      "canonical_industry": "Electrical Equipment & Parts",
+      "sector": "Industrials",
+      "aliases": [
+        "electrical equipment parts", "electrical equipment and parts",
+        "electrical equipment", "electrical components", "electrical manufacturing",
+        "electronic equipment", "lighting", "lighting equipment",
+        "lighting and electrical", "electrical power equipment"
+      ],
+      "related_industries": ["Specialty Industrial Machinery", "Industrial Conglomerates", "Electronic Components"],
+      "keywords": ["electrical", "equipment", "lighting", "power", "components", "wiring", "switchgear"]
+    },
+    {
+      "id": "aerospace-defense",
+      "family": "industrials",
+      "canonical_industry": "Aerospace & Defense",
+      "sector": "Industrials",
+      "aliases": ["aerospace defense", "aerospace and defense", "defense", "defense contractors"],
+      "related_industries": ["Industrial Conglomerates"],
+      "keywords": ["aerospace", "defense", "military", "aircraft", "missile", "weapons"]
+    },
+    {
+      "id": "staffing-employment",
+      "family": "industrials",
+      "canonical_industry": "Staffing & Employment Services",
+      "sector": "Industrials",
+      "aliases": ["staffing employment services", "staffing", "staffing employment", "staffing services", "employment services", "human resources services"],
+      "related_industries": ["Industrial Conglomerates"],
+      "keywords": ["staffing", "employment", "recruiting", "workforce", "temporary", "placement"]
     }
   ]
 }

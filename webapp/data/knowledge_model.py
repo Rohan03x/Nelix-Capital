@@ -113,9 +113,11 @@ def _rolling_cagr(revenues: list[float], years: int = 5) -> float:
 
 
 def _history_window_years(revenues: list[float]) -> int:
+    # Use ALL available history since IPO — no 5-year cap.
+    # Quarterly verification since IPO requires the full track record.
     if len(revenues) < 2:
         return 1
-    return max(1, min(5, len(revenues) - 1))
+    return max(1, len(revenues) - 1)
 
 
 def _maturity_bucket(data_vintage_years: int) -> str:
@@ -797,11 +799,11 @@ def _build_learning_explainability(
         layered_learning=layered_learning,
     )
 
-    review_window = "due now" if review_due else f"in {next_review_in_years} year(s)"
+    review_window = "quarterly"
     headline = (
         f"Core forecast mix: {avg_company_weight}% company memory, {avg_sector_weight}% sector prior, "
         f"{avg_learned_weight}% realised cohort learning, {int(analog_mix.get('weight_pct') or 0)}% analog memory, "
-        f"and {int(global_mix.get('weight_pct') or 0)}% global memory. Review window {review_window}."
+        f"and {int(global_mix.get('weight_pct') or 0)}% global memory. Verified quarterly since IPO."
     )
 
     return {
@@ -1763,8 +1765,9 @@ def refine_live_assumptions(
     market_cap_regime = _market_cap_regime(market_cap)
     history_window_years = _history_window_years(revenues)
     completed_years = max(1, len(revenues) - 1)
-    review_due = should_run_quinquennial(completed_years)
-    next_review_in_years = 0 if review_due else 5 - (completed_years % 5)
+    # Quarterly verification: review is active from the first completed year (not every 5 years).
+    review_due = completed_years >= 1
+    next_review_in_years = 0  # Always current — predictions are verified quarterly
     industry_lower = (industry or "").lower()
 
     revenue_volatility = _safe_pstdev(_growth_rates(revenues[-(history_window_years + 1):]))

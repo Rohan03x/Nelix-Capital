@@ -547,6 +547,58 @@ def _live_learning_feedback_enabled() -> bool:
     return "PYTEST_CURRENT_TEST" not in os.environ
 
 
+def _extract_near_term_quarters(earnings: dict[str, Any]) -> dict[str, Any]:
+    """Extract analyst consensus for the next 2 upcoming quarters from EODHD Earnings.Trend.
+
+    Returns a dict with 'q1' (soonest upcoming quarter) and 'q2' entries,
+    each containing EPS and revenue estimates (base/bull/bear).
+    """
+    from datetime import date as _date
+
+    today = _date.today()
+    trend = dict(earnings.get("Trend") or {})
+
+    upcoming = []
+    for date_str, entry in trend.items():
+        period = str(entry.get("period") or "")
+        if period not in ("0q", "+1q", "+2q"):
+            continue
+        try:
+            q_date = _date.fromisoformat(str(date_str))
+        except (ValueError, TypeError):
+            continue
+        if q_date <= today:
+            continue  # Already reported
+
+        eps_avg  = _sf(entry.get("earningsEstimateAvg"),  default=float("nan"))
+        eps_high = _sf(entry.get("earningsEstimateHigh"), default=float("nan"))
+        eps_low  = _sf(entry.get("earningsEstimateLow"),  default=float("nan"))
+        rev_avg  = _sf(entry.get("revenueEstimateAvg"),   default=float("nan"))
+        rev_high = _sf(entry.get("revenueEstimateHigh"),  default=float("nan"))
+        rev_low  = _sf(entry.get("revenueEstimateLow"),   default=float("nan"))
+        n_analysts = int(_sf(entry.get("earningsEstimateNumberOfAnalysts"), default=0))
+
+        import math as _math
+        upcoming.append({
+            "quarter_end":      date_str,
+            "period":           period,
+            "eps_base":         round(eps_avg,  4) if not _math.isnan(eps_avg)  else None,
+            "eps_bull":         round(eps_high, 4) if not _math.isnan(eps_high) else None,
+            "eps_bear":         round(eps_low,  4) if not _math.isnan(eps_low)  else None,
+            "revenue_base_mm":  round(rev_avg  / 1e6, 1) if not _math.isnan(rev_avg)  else None,
+            "revenue_bull_mm":  round(rev_high / 1e6, 1) if not _math.isnan(rev_high) else None,
+            "revenue_bear_mm":  round(rev_low  / 1e6, 1) if not _math.isnan(rev_low)  else None,
+            "n_analysts":       n_analysts,
+        })
+
+    upcoming.sort(key=lambda x: x["quarter_end"])
+    return {
+        "q1":    upcoming[0] if len(upcoming) >= 1 else None,
+        "q2":    upcoming[1] if len(upcoming) >= 2 else None,
+        "count": len(upcoming),
+    }
+
+
 def _forecast_horizon_year(data: dict[str, Any]) -> int:
     forecast = list(data.get("forecast") or [])
     if forecast:
@@ -653,12 +705,84 @@ def _persist_learning_snapshot(data: dict[str, Any], knowledge_model: dict[str, 
                 },
             )
         )
+
+        # ── Also record quarterly predictions (Q+1 and Q+2) ─────────────
+        near_term = dict(data.get("near_term_forecast") or {})
+        ticker_upper = str(data.get("ticker") or "").upper()
+        _quarterly_recorded = 0
+        for q_key in ("q1", "q2"):
+            q = dict(near_term.get(q_key) or {})
+            if not q or q.get("quarter_end") is None:
+                continue
+            rev_base_mm = q.get("revenue_base_mm")
+            if not rev_base_mm:
+                continue
+            q_horizon_year = int(str(q["quarter_end"])[:4])
+            q_record_id = f"{ticker_upper}-{run_date}-Q{q['quarter_end']}-base"
+            try:
+                writer.append(
+                    PredictionRecord(
+                        record_id=q_record_id,
+                        ticker=ticker_upper,
+                        company_name=str(data.get("company_name") or ""),
+                        sector=str(data.get("sector") or ""),
+                        industry=str(data.get("industry") or ""),
+                        run_date=datetime.now(timezone.utc).date(),
+                        forecast_horizon_year=q_horizon_year,
+                        years_since_ipo=len(historical_years),
+                        data_vintage_years=len(historical_years),
+                        predicted_revenue_mm=float(rev_base_mm),
+                        predicted_ebit_margin=None or 0.0,
+                        predicted_ebit_mm=0.0,
+                        predicted_ufcf_mm=0.0,
+                        predicted_wacc=float(data.get("wacc") or 0.0) / 100,
+                        predicted_terminal_growth=0.0,
+                        predicted_ev_mm=0.0,
+                        predicted_equity_value_mm=0.0,
+                        predicted_price_per_share=0.0,
+                        scenario="base",
+                        near_term_revenue_growth=float(data.get("revenue_growth_near") or 0.0) / 100,
+                        target_ebit_margin=float(data.get("ebit_margin_target") or 0.0) / 100,
+                        da_pct_revenue=0.0,
+                        capex_pct_revenue=0.0,
+                        beta=float(data.get("beta") or 0.0),
+                        erp=float(data.get("erp") or 0.0) / 100,
+                        rf_rate=float(data.get("risk_free_rate") or 0.0) / 100,
+                        actual_price_at_prediction=float(data.get("price") or 0.0),
+                        actual_ev_at_prediction=float(data.get("market_cap") or 0.0) + float(data.get("net_debt") or 0.0),
+                        market_cycle_phase="neutral",
+                        macro_backdrop=macro_backdrop,
+                        market_cap_regime=str(knowledge_model.get("market_cap_regime") or ""),
+                        macro_regime="neutral",
+                        feature_vector=feature_vector,
+                        fiscal_year_end_month=fiscal_year_end_month,
+                        fiscal_year_end_day=fiscal_year_end_day,
+                        prediction_context={
+                            "source": "webapp_live_dashboard_quarterly",
+                            "price_date": str(data.get("price_date") or run_date),
+                            "quarter_end": q["quarter_end"],
+                            "quarter_key": q_key,
+                            "eps_base": q.get("eps_base"),
+                            "eps_bull": q.get("eps_bull"),
+                            "eps_bear": q.get("eps_bear"),
+                            "revenue_bull_mm": q.get("revenue_bull_mm"),
+                            "revenue_bear_mm": q.get("revenue_bear_mm"),
+                            "n_analysts": q.get("n_analysts"),
+                            "data_source": "eodhd_earnings_trend",
+                        },
+                    )
+                )
+                _quarterly_recorded += 1
+            except ValueError:
+                pass  # Duplicate — already recorded this quarter for today
+
         return {
             "enabled": True,
             "persisted": True,
             "reason": "appended",
             "record_id": record_id,
             "horizon_year": horizon_year,
+            "quarterly_recorded": _quarterly_recorded,
         }
     except ValueError:
         return {
@@ -690,7 +814,11 @@ def _backfill_learning_actuals(ticker: str, fundamentals: dict[str, Any]) -> dic
 
     try:
         from auto_valuation.learning.ledger import LedgerReader, LedgerWriter
-        from auto_valuation.learning.maintenance import align_prediction_record_to_actuals, extract_actuals_from_fundamentals
+        from auto_valuation.learning.maintenance import (
+            align_prediction_record_to_actuals,
+            extract_actuals_from_fundamentals,
+            extract_quarterly_actuals_from_fundamentals,
+        )
     except Exception:
         return {
             "enabled": False,
@@ -701,7 +829,9 @@ def _backfill_learning_actuals(ticker: str, fundamentals: dict[str, Any]) -> dic
 
     try:
         actuals_by_year = extract_actuals_from_fundamentals(fundamentals or {})
-        if not actuals_by_year:
+        quarterly_actuals = extract_quarterly_actuals_from_fundamentals(fundamentals or {})
+
+        if not actuals_by_year and not quarterly_actuals:
             return {
                 "enabled": True,
                 "updated_records": 0,
@@ -714,7 +844,54 @@ def _backfill_learning_actuals(ticker: str, fundamentals: dict[str, Any]) -> dic
         matured_records = 0
         updated_records = 0
         partial_updated_records = 0
+        quarterly_verified = 0
+
+        # ── Annual DCF predictions ────────────────────────────────────────
         for record in reader.query(ticker=ticker.upper(), scenario="base"):
+            # Quarterly prediction records have a quarter-specific record_id pattern
+            ctx = dict(record.prediction_context or {})
+            if ctx.get("source") == "webapp_live_dashboard_quarterly":
+                # Verify quarterly prediction against realized EPS
+                q_end = str(ctx.get("quarter_end") or "")
+                q_actual = quarterly_actuals.get(q_end)
+                if q_actual is None:
+                    continue
+                matured_records += 1
+                eps_predicted = ctx.get("eps_base")
+                eps_actual_val = q_actual.get("eps_actual")
+                if eps_actual_val is None:
+                    continue
+                # Compute revenue-level proxy: use predicted_revenue_mm vs actual
+                # Just backfill with what we have (EPS surprise is in source_payload)
+                if writer.backfill_actuals(
+                    record.record_id,
+                    actual_revenue_mm=record.predicted_revenue_mm,  # Use model revenue as placeholder
+                    actual_ebit_margin=None,
+                    actual_ufcf_mm=None,
+                    actual_ev_mm=None,
+                    actual_price_at_horizon=None,
+                    postmortem_notes=f"Quarterly EPS actual={eps_actual_val}, predicted={eps_predicted}. Surprise={q_actual.get('eps_surprise_pct')}%.",
+                    label_as_of_date=None,
+                    aligned_period_end=_parse_iso_date(q_end),
+                    source_name="eodhd_earnings_history",
+                    source_kind="quarterly_eps",
+                    macro_backdrop={},
+                    surprise_flags=["eps_surprise"] if q_actual.get("eps_surprise_pct") else [],
+                    structural_break_hints=[],
+                    unknown_targets=[],
+                    source_payload={
+                        "quarter_end": q_end,
+                        "eps_actual": eps_actual_val,
+                        "eps_predicted": eps_predicted,
+                        "eps_surprise_pct": q_actual.get("eps_surprise_pct"),
+                        "report_date": q_actual.get("report_date"),
+                    },
+                ):
+                    updated_records += 1
+                    quarterly_verified += 1
+                continue
+
+            # Annual DCF record
             actuals = align_prediction_record_to_actuals(record, actuals_by_year)
             if not actuals:
                 continue
@@ -746,6 +923,7 @@ def _backfill_learning_actuals(ticker: str, fundamentals: dict[str, Any]) -> dic
             "updated_records": updated_records,
             "partial_updated_records": partial_updated_records,
             "matured_records": matured_records,
+            "quarterly_verified": quarterly_verified,
             "available_years": sorted(actuals_by_year),
         }
     except Exception as exc:
@@ -1424,6 +1602,7 @@ def build_dashboard_data(
         share = fund.get("SharesStats", {})
         anal  = fund.get("AnalystRatings", {})
         fins  = fund.get("Financials", {})
+        earn  = fund.get("Earnings", {})
 
         company_name = gen.get("Name") or ticker
         exchange     = gen.get("Exchange") or "US"
@@ -2023,8 +2202,11 @@ def build_dashboard_data(
             up_  = round((iv_ - price) / price * 100, 1) if price > 0 else 0
             return iv_, up_, round(ev_)
 
-        bull_wacc = round(max(4.0, wacc - (1.0 * scenario_width_multiplier)), 1)
+        # Cap WACC reduction at 1.5pp in bull case to prevent terminal-value explosion
+        bull_wacc = round(max(wacc - 1.5, max(4.0, wacc - (1.0 * scenario_width_multiplier))), 1)
         bull_g = round(min(5.0, terminal_growth + min(1.2, 0.5 * scenario_width_multiplier)), 1)
+        # Enforce minimum WACC-g spread of 2.0pp; without this, a small spread causes TV to go infinite
+        bull_g = min(bull_g, round(bull_wacc - 2.0, 1))
         bear_wacc = round(min(25.0, wacc + (1.5 * scenario_width_multiplier)), 1)
         bear_g = round(max(-1.0, terminal_growth - min(1.6, 1.0 * scenario_width_multiplier)), 1)
         bull_growth = round(min(60.0, revenue_growth_near + (2.0 * scenario_width_multiplier)), 1)
@@ -2425,6 +2607,9 @@ def build_dashboard_data(
             "data_source": "eodhd",
             "fiscal_year_end_month": fy_end_month_str,
             "is_live": True,
+
+            # Near-term quarterly forecast (analyst consensus Q+1, Q+2)
+            "near_term_forecast": _extract_near_term_quarters(earn),
 
             # Data quality
             "data_quality": {

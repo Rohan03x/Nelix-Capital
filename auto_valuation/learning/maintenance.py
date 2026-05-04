@@ -181,6 +181,45 @@ def extract_actuals_from_fundamentals(
     return actuals
 
 
+def extract_quarterly_actuals_from_fundamentals(
+    fundamentals: dict[str, Any],
+    *,
+    as_of_date: date | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Extract realized quarterly EPS actuals from EODHD Earnings.History.
+
+    Returns a dict keyed by quarter_end date string (e.g. '2025-09-30') containing
+    realized EPS data used to verify quarterly predictions in the ledger.
+    """
+    cutoff = as_of_date or date.today()
+    earnings = dict(fundamentals.get("Earnings") or {})
+    history = dict(earnings.get("History") or {})
+
+    quarterly: dict[str, dict[str, Any]] = {}
+    for date_str, entry in history.items():
+        try:
+            q_date = date.fromisoformat(str(date_str))
+        except (ValueError, TypeError):
+            continue
+        if q_date > cutoff:
+            continue  # Future quarter, not yet reported
+        eps_actual = entry.get("epsActual")
+        if eps_actual is None:
+            continue
+        try:
+            eps_actual = float(eps_actual)
+        except (ValueError, TypeError):
+            continue
+        quarterly[date_str] = {
+            "quarter_end": date_str,
+            "eps_actual": eps_actual,
+            "eps_estimate": entry.get("epsEstimate"),
+            "eps_surprise_pct": entry.get("surprisePercent"),
+            "report_date": entry.get("reportDate"),
+        }
+    return quarterly
+
+
 def run_live_evidence_bootstrap(*args: Any, **kwargs: Any) -> Any:
     from .live_evidence_bootstrap import run_live_evidence_bootstrap as _run_live_evidence_bootstrap
 
