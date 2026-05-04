@@ -105,16 +105,6 @@ function _moneyCompactMillions(value, symbol = '$') {
   return `${symbol}${amount.toFixed(0)}M`;
 }
 
-function _csrfToken() {
-  const node = document.querySelector('meta[name="csrf-token"]');
-  return node ? node.getAttribute('content') || '' : '';
-}
-
-function _withCsrfHeaders(headers = {}) {
-  const token = _csrfToken();
-  return token ? { ...headers, 'X-CSRF-Token': token } : { ...headers };
-}
-
 /* ── Charts ──────────────────────────────────────────────── */
 let _charts = {};
 
@@ -611,7 +601,7 @@ function recomputeModel() {
 
   fetch('/api/recompute', {
     method: 'POST',
-    headers: _withCsrfHeaders({ 'Content-Type': 'application/json' }),
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ticker, overrides }),
   })
   .then(r => r.json())
@@ -872,12 +862,7 @@ function _mergeManualCompareItems(subjectTicker, serverItems, deviceItems) {
 
 async function _fetchJson(url, options) {
   try {
-    const requestOptions = { ...(options || {}) };
-    const method = String(requestOptions.method || 'GET').toUpperCase();
-    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
-      requestOptions.headers = _withCsrfHeaders(requestOptions.headers || {});
-    }
-    const response = await fetch(url, requestOptions);
+    const response = await fetch(url, options);
     const payload = await response.json();
     return { ok: response.ok, payload };
   } catch (_error) {

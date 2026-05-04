@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -591,41 +591,6 @@ class DiscoveryStore:
             if len(items) >= max(int(limit or 8), 1):
                 break
         return items
-
-    def purge_user_workflow_data(self) -> dict[str, int]:
-        """Delete anonymous workflow state while preserving public/company data."""
-        deleted = {
-            "watchlist_items": self._execute("DELETE FROM watchlist_items"),
-            "search_impressions": self._execute("DELETE FROM search_impressions"),
-            "manual_compare_events": self._execute("DELETE FROM manual_compare_events"),
-            "peer_relationships": self._execute("DELETE FROM peer_relationships"),
-        }
-        return deleted
-
-    def purge_stale_user_workflow_data(self, *, max_age_days: int = 730) -> dict[str, int | str]:
-        """Delete anonymous workflow rows older than the retention window."""
-        retention_days = max(int(max_age_days or 730), 1)
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
-        deleted: dict[str, int | str] = {
-            "cutoff": cutoff,
-            "watchlist_items": self._execute(
-                "DELETE FROM watchlist_items WHERE last_touched_at < :cutoff",
-                {"cutoff": cutoff},
-            ),
-            "search_impressions": self._execute(
-                "DELETE FROM search_impressions WHERE created_at < :cutoff",
-                {"cutoff": cutoff},
-            ),
-            "manual_compare_events": self._execute(
-                "DELETE FROM manual_compare_events WHERE created_at < :cutoff",
-                {"cutoff": cutoff},
-            ),
-            "peer_relationships": self._execute(
-                "DELETE FROM peer_relationships WHERE last_seen_at < :cutoff",
-                {"cutoff": cutoff},
-            ),
-        }
-        return deleted
 
 
 __all__ = ["DISCOVERY_DB_PATH", "DiscoveryStore"]

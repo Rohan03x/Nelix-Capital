@@ -930,9 +930,9 @@ def get_dashboard_data(
 
     Priority:
       1. EODHD    — primary live source; 10–20+ years of annual history
-            2. FMP       — fallback source (requires FMP_API_KEY env var)
-            3. REGISTRY  — hardcoded NKE/AAPL/TSLA samples
-            4. NKE demo  — last-resort fallback for unknown tickers
+      2. FMP       — second fallback (requires FMP_API_KEY env var)
+      3. REGISTRY  — hardcoded NKE/AAPL/TSLA samples
+      4. NKE demo  — last-resort fallback for unknown tickers
     """
     from webapp.data.eodhd_client import (
         build_dashboard_data as eodhd_build,
@@ -956,7 +956,7 @@ def get_dashboard_data(
         if source == "unavailable-demo":
             record_seed_symbol_health(ticker, available=False, source=source, note=str(payload.get("demo_note") or ""))
             return
-        if source in {"eodhd", "fmp"} and not bool(payload.get("is_demo")):
+        if source in {"eodhd", "yfinance", "fmp"} and not bool(payload.get("is_demo")):
             record_seed_symbol_health(ticker, available=True, source=source)
 
     def _try_provider(name: str, builder, *args, **kwargs):
@@ -974,10 +974,7 @@ def get_dashboard_data(
     if data is None and fmp_available():
         data = _try_provider("fmp", fmp_build, ticker)
 
-    if isinstance(data, dict) and data.get("data_source") == "unavailable-demo" and ticker in REGISTRY:
-        data = None
-
-    # 3. Fallback to hardcoded sample for NKE/AAPL/TSLA
+    # 4. Fallback to hardcoded sample for NKE/AAPL/TSLA
     if data is None and ticker in REGISTRY:
         data = copy.deepcopy(REGISTRY[ticker])
         data["is_demo"] = True
@@ -990,7 +987,7 @@ def get_dashboard_data(
         data = _build_unavailable_demo(ticker)
 
     if overrides:
-        # Only apply override scaling for sample/FMP data.
+        # Only apply override scaling for sample/fmp data.
         # When EODHD builds the data, overrides are already applied inside
         # build_dashboard_data() before running the DCF, so we skip this.
         if data.get("data_source") != "eodhd":
@@ -1027,12 +1024,6 @@ def get_dashboard_data(
             conf = score_confidence(data)
             data["confidence_score"] = conf.total
             data["confidence_breakdown"] = conf.as_dict()
-        data.setdefault("knowledge_model", {
-            "summary": "Weighted knowledge model active for curated sample fallback.",
-            "confidence_model": {
-                "dashboard_breakdown": data.get("confidence_breakdown") or {},
-            }
-        })
     except Exception as exc:
         logger.warning("Confidence scoring failed for %s: %s", ticker, exc)
         data["confidence_score"] = 50

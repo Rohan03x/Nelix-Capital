@@ -101,7 +101,7 @@ MULTI_SEGMENT_PEERS: dict[str, dict[str, list[str]]] = {
     },
 }
 
-# Industry-level peer lists (industry label → peer tickers)
+# Industry-level peer lists (canonical industry string → peer tickers)
 INDUSTRY_PEER_MAP: dict[str, list[str]] = {
     # Consumer Cyclical
     "Internet Retail":            ["WMT", "COST", "BABA", "MELI", "EBAY", "SHOP", "JD", "TGT", "AMZN"],
@@ -120,9 +120,9 @@ INDUSTRY_PEER_MAP: dict[str, list[str]] = {
     "Semiconductors":             ["NVDA", "AMD", "INTC", "QCOM", "AVGO", "TSM", "ASML", "AMAT", "KLAC"],
     # Note: MSFT/GOOGL/META removed – they are Software/Internet, not Consumer Electronics.
     "Consumer Electronics":       ["AAPL", "SONY", "HPQ", "DELL", "1810.HK", "NTDOY"],
-    # Electrical Equipment & Parts: lighting, switchgear, power management (EODHD canonical)
+    # Electrical Equipment & Parts: lighting, switchgear, power management (canonical matches EODHD/yfinance)
     # LIGHT.AS (Signify NV Euronext) intentionally excluded — it is a cross-listing of PHPPY.US
-    # Both keys maintained: "Electrical Equipment" and "Electrical Equipment & Parts" (EODHD canonical)
+    # Both keys maintained: "Electrical Equipment" (yfinance legacy) and "Electrical Equipment & Parts" (EODHD canonical)
     "Electrical Equipment":            ["AYI", "HUBB", "ETN", "LR.PA", "ABBN.SW", "EMR", "WOLF", "LYTS", "AMSAG.SW", "ZAG.VI"],
     "Electrical Equipment & Parts":    ["AYI", "HUBB", "ETN", "LR.PA", "ABBN.SW", "EMR", "WOLF", "LYTS", "AMSAG.SW", "ZAG.VI"],
     "Staffing & Employment Services": ["MAN", "ADEN.SW", "RAND.AS", "RHI", "KFY", "HSII"],
@@ -240,7 +240,7 @@ _INDUSTRY_STOPWORDS = {
     "specialty",
 }
 
-_EXCHANGE_DISPLAY_SUFFIX = {
+_EXCHANGE_SUFFIX_MAP = {
     "AMEX": "",
     "ARCA": "",
     "AS": ".AS",
@@ -338,18 +338,18 @@ def _ticker_variants(ticker: str) -> set[str]:
     return {symbol, base}
 
 
-def _to_display_ticker(code: str, exchange: str) -> str | None:
+def _normalize_exchange_ticker(code: str, exchange: str) -> str | None:
     symbol = (code or "").upper().strip()
     venue = (exchange or "").upper().strip()
     if not symbol:
         return None
     if "." in symbol:
         base, dotted_exchange = symbol.split(".", 1)
-        suffix = _EXCHANGE_DISPLAY_SUFFIX.get(dotted_exchange)
+        suffix = _EXCHANGE_SUFFIX_MAP.get(dotted_exchange)
         if suffix is None:
             return symbol
         return f"{base}{suffix}"
-    suffix = _EXCHANGE_DISPLAY_SUFFIX.get(venue)
+    suffix = _EXCHANGE_SUFFIX_MAP.get(venue)
     if suffix is None:
         return symbol if venue in {"", "OTC", "PINK"} else None
     return f"{symbol}{suffix}"
@@ -372,7 +372,7 @@ def _load_cached_peer_profiles() -> tuple[dict[str, Any], ...]:
         highlights = payload.get("Highlights") or {}
         code = general.get("Code") or path.stem.replace("eodhd_fund_", "").replace("_", ".")
         exchange = general.get("Exchange") or ""
-        ticker = _to_display_ticker(str(code), str(exchange))
+        ticker = _normalize_exchange_ticker(str(code), str(exchange))
         if not ticker:
             continue
 
@@ -949,7 +949,7 @@ def _build_eodhd_multiples_index() -> dict[str, dict[str, Any]]:
     {ticker_variant → multiples_dict} index.
 
     Used by fetch_peer_metrics so that international peers (e.g. ABBN.SW,
-    LR.PA) get real multiples from EODHD instead of empty public-web responses.
+    LR.PA) get real multiples from EODHD instead of empty yfinance responses.
 
     ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (M4) — pickled to disk so cold starts
     skip the multi-thousand-file JSON scan when the snapshot is fresh.
@@ -1067,7 +1067,7 @@ def fetch_peer_metrics(
 
     Data source priority:
       1. EODHD fundamentals cache (covers all international tickers)
-    2. N/A row for any ticker not in the EODHD cache
+      2. N/A (no secondary provider for tickers not in the EODHD cache)
 
     Returns:
         peers       — list of peer dicts (one per ticker, sorted by mkt cap desc)
@@ -1094,7 +1094,7 @@ def fetch_peer_metrics(
     eodhd_index = _build_eodhd_multiples_index()
     profiles = {str(profile.get("ticker") or ""): profile for profile in _load_cached_peer_profiles()}
 
-    # Legacy public-web fallback removed — see ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (P3).
+    # yfinance fallback removed — see ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (P3).
     # Tickers missing from the EODHD index are surfaced with N/A multiples.
 
     peers: list[dict] = []
@@ -1130,7 +1130,7 @@ def fetch_peer_metrics(
                 })
                 continue
 
-            # ── 2. Not in EODHD index → mark as N/A ──
+            # ── 2. Not in EODHD index → mark as N/A (no yfinance fallback) ──
             peers.append({
                 "ticker":     ticker_text,
                 "name":       ticker_text,

@@ -4,16 +4,17 @@ webapp/data/eodhd_client.py
 EODHD (End of Day Historical Data) API client.
 
 Provides up to 20+ years of audited annual financial history — far more
-than the legacy 4-year fallback limit.
+than yfinance's 4-year limit.
 
-API key:  read from EODHD_API_KEY (or EOD_API_KEY) environment variable
+API key:  691aca08424c26.36039280  (default; override with EODHD_API_KEY env var)
 Base URL: https://eodhd.com/api
 
 Endpoints used:
   GET /real-time/{TICKER}.US?api_token=…&fmt=json     → live price   (5-min  cache)
   GET /fundamentals/{TICKER}.US?api_token=…&fmt=json  → fundamentals (6-hour cache)
 
-Returns the dashboard dict schema consumed by templates and API routes.
+Returns the same dict schema as yfinance_client.build_dashboard_data()
+so it is a drop-in replacement in the data pipeline.
 """
 
 from __future__ import annotations
@@ -31,11 +32,10 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 from auto_valuation.config import LEARNING_CONFIG
-from auto_valuation.assumptions.wacc import compute_pre_tax_cost_of_debt
-from auto_valuation.data.macro import compute_crp, compute_size_premium, fetch_damodaran_erp
 from auto_valuation.learning.confidence import build_ranked_confidence_model
 
 # ── API configuration ─────────────────────────────────────────────────────────
+_EODHD_KEY_DEFAULT = "691aca08424c26.36039280"
 _EODHD_BASE        = "https://eodhd.com/api"
 
 # ── Disk-cache directory ──────────────────────────────────────────────────────
@@ -83,15 +83,8 @@ def _macro_regime_from_rf(rf_rate_decimal: float) -> str:
 # ── Optional dependency check ─────────────────────────────────────────────────
 try:
     import requests as _req
-    from requests.adapters import HTTPAdapter
-
-    _SESSION = _req.Session()
-    _ADAPTER = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0)
-    _SESSION.mount("https://", _ADAPTER)
-    _SESSION.mount("http://", _ADAPTER)
     _REQUESTS_OK = True
 except ImportError:
-    _SESSION = None
     _REQUESTS_OK = False
     logger.warning("requests not installed — EODHD client unavailable.")
 
@@ -109,10 +102,7 @@ except ImportError:
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _api_key() -> str:
-    key = (os.environ.get("EODHD_API_KEY") or os.environ.get("EOD_API_KEY") or "").strip()
-    if not key and (os.environ.get("VERCEL") or os.environ.get("FLASK_ENV") == "production"):
-        raise RuntimeError("EODHD_API_KEY is required in production.")
-    return key
+    return os.environ.get("EODHD_API_KEY", _EODHD_KEY_DEFAULT)
 
 
 def _sf(val: Any, default: float = 0.0) -> float:
@@ -319,19 +309,12 @@ def _historical_ebit_margin_anchor(ebit_margins: list[float], fallback: float) -
 
 def _get(endpoint: str, params: dict | None = None) -> Any | None:
     """HTTP GET against EODHD API. Returns parsed JSON or None on failure."""
-    if not _REQUESTS_OK or _SESSION is None:
+    if not _REQUESTS_OK:
         return None
-    try:
-        key = _api_key()
-    except RuntimeError:
-        raise
-    if not key:
-        logger.warning("EODHD API key missing; live EODHD request skipped for %s", endpoint)
-        return None
-    p = {"api_token": key, "fmt": "json", **(params or {})}
+    p = {"api_token": _api_key(), "fmt": "json", **(params or {})}
     url = f"{_EODHD_BASE}/{endpoint}"
     try:
-        r = _SESSION.get(url, params=p, timeout=15)
+        r = _req.get(url, params=p, timeout=15)
         r.raise_for_status()
         return r.json()
     except Exception as exc:
@@ -1948,8 +1931,8 @@ def build_dashboard_data(
 ) -> dict | None:  # noqa: C901
     """
     Fetch live data from EODHD and run a full 7-year DCF.
-    Returns the complete dashboard dict, or None on any failure so the caller
-    can fall back to the next configured provider.
+    Returns the complete dashboard dict (same schema as yfinance_client),
+    or None on any failure so the caller can fall back to yfinance.
 
     *overrides* (optional): dict of user-supplied parameters that replace
     auto-computed assumptions before the DCF is run.  Recognised keys:
@@ -2310,25 +2293,14 @@ def build_dashboard_data(
         beta = max(0.3, min(3.0, beta if beta != 0 else 1.0))
 
         rf_rate = _get_risk_free_rate()
-        try:
-            erp = round(fetch_damodaran_erp() * 100, 1)
-        except Exception:
-            erp = 5.5
-        country_iso2 = gen.get("CountryISO") or gen.get("CountryCode") or gen.get("Country")
-        country_name = gen.get("CountryName") or gen.get("Country") or "United States"
-        crp = round(compute_crp(country_iso2=country_iso2, exchange_country=country_name) * 100, 1)
-        size_premium = round(compute_size_premium(market_cap) * 100, 1)
+        erp     = 5.2
         # Blume (1971) adjustment pulls extreme betas toward 1.0: β_adj = 0.67·β + 0.33
         # Bloomberg and most sell-side models apply this by default.
         beta_adj = 0.67 * beta + 0.33
-        ke      = rf_rate + beta_adj * erp + size_premium + crp
+        ke      = rf_rate + beta_adj * erp
 
-        kd_pre  = compute_pre_tax_cost_of_debt(
-            interest_expense,
-            total_debt,
-            rf_rate / 100,
-            credit_spread=0.015,
-        ) * 100
+        kd_pre  = (interest_expense / total_debt * 100) if total_debt > 1 and interest_expense > 0 else max(2.0, min(8.0, rf_rate + 1.5))
+        kd_pre  = max(2.0, min(12.0, kd_pre))
 
         statutory_tax_rate = _statutory_tax_rate(gen.get("CountryName") or gen.get("Country") or "")
         if pretax_income > 1 and tax_prov > 0:
@@ -2487,7 +2459,7 @@ def build_dashboard_data(
             scenario_width_multiplier = max(1.0, float(knowledge_model_payload.get("scenario_width_multiplier") or 1.0))
 
             beta_adj = 0.67 * beta + 0.33
-            ke = rf_rate + beta_adj * erp + size_premium + crp
+            ke = rf_rate + beta_adj * erp
             kd_post = kd_pre * (1 - tax_rate_pct / 100)
             capex_steady_pct = min(capex_pct, da_pct + 3.0)
             if capex_pct > da_pct * 1.5:
@@ -2594,7 +2566,7 @@ def build_dashboard_data(
             if "beta" in _ov and _ov["beta"] is not None:
                 beta = max(0.3, min(3.0, float(_ov["beta"])))
                 beta_adj = 0.67 * beta + 0.33
-                ke = rf_rate + beta_adj * erp + size_premium + crp
+                ke = rf_rate + beta_adj * erp
                 kd_post = kd_pre * (1 - tax_rate_pct / 100)
                 total_cap = market_cap + total_debt
                 e_wt = market_cap / total_cap * 100 if total_cap > 0 else 85.0
@@ -2756,7 +2728,7 @@ def build_dashboard_data(
         )
         margin_source, margin_warn = _assumption_meta("ebit_margin_target", ebit_margin_target_source)
         beta_source, beta_warn = _assumption_meta("beta", "EODHD Technicals")
-        wacc_source, wacc_warn = _assumption_meta("wacc", f"CAPM: Rf {round(rf_rate,1)}% + β {round(beta,2)} × ERP {erp}% + size {size_premium}% + CRP {crp}%")
+        wacc_source, wacc_warn = _assumption_meta("wacc", f"CAPM: Rf {round(rf_rate,1)}% + β {round(beta,2)} × ERP {erp}%")
         tax_source, tax_warn = _assumption_meta("tax_rate_pct", "LTM effective tax rate")
         da_source, da_warn = _assumption_meta("da_pct", "LTM D&A / Revenue")
         capex_source, capex_warn = _assumption_meta("capex_pct", "LTM CapEx / Revenue")
@@ -2771,8 +2743,6 @@ def build_dashboard_data(
             {"driver": "EBIT Margin (Base)",         "auto": round(ebit_margin_base_pct, 1),  "active": round(ebit_margin_base_pct, 1),  "unit": "%", "mode": "AUTO", "source": "LTM EBIT / Revenue", "warn": None},
             {"driver": "EBIT Margin (Target Y7)",    "auto": round(ebit_margin_target, 1),    "active": round(ebit_margin_target, 1),    "unit": "%", "mode": "AUTO", "source": margin_source, "warn": margin_warn},
             {"driver": "WACC",                       "auto": wacc,  "active": wacc,  "unit": "%", "mode": "AUTO", "source": wacc_source, "warn": wacc_warn},
-            {"driver": "Size Premium",               "auto": size_premium, "active": size_premium, "unit": "%", "mode": "AUTO", "source": "Kroll/Duff & Phelps market-cap ladder", "warn": None},
-            {"driver": "Country Risk Premium",        "auto": crp, "active": crp, "unit": "%", "mode": "AUTO", "source": f"Damodaran CRP table: {country_name}", "warn": None},
             {"driver": "Cost of Debt (Pre-Tax)",     "auto": round(kd_pre, 1), "active": round(kd_pre, 1), "unit": "%", "mode": "AUTO", "source": "Interest expense / total debt", "warn": None},
             {"driver": "Beta (Levered)",             "auto": round(beta, 2),   "active": round(beta, 2),   "unit": "×",  "mode": "AUTO", "source": beta_source, "warn": beta_warn},
             {"driver": "Tax Rate",                   "auto": round(tax_rate_pct, 1), "active": round(tax_rate_pct, 1), "unit": "%", "mode": "AUTO", "source": tax_source, "warn": tax_warn},
@@ -2790,7 +2760,7 @@ def build_dashboard_data(
         flags = [
             {"name": "Data Freshness",  "status": "pass", "message": f"EODHD: {n} years of annual financials ({fy_years_asc[0]}–{fy_years_asc[-1]})."},
             {"name": "Revenue Sanity",  "status": "pass" if revenue_base > 10 else "warn", "message": f"Latest annual revenue: ${revenue_base:,.0f}M."},
-            {"name": "WACC Range",      "status": "pass", "message": f"WACC {wacc}% (β={beta:.2f}, Rf={rf_rate:.1f}%, ERP={erp}%, size={size_premium}%, CRP={crp}%)."},
+            {"name": "WACC Range",      "status": "pass", "message": f"WACC {wacc}% (β={beta:.2f}, Rf={rf_rate:.1f}%, ERP={erp}%)."},
             {"name": "WACC–g Spread",   "status": "pass" if wacc - terminal_growth >= 0.5 else "fail",
              "message": f"Spread {wacc - terminal_growth:.1f}pp {'above' if wacc - terminal_growth >= 0.5 else 'below'} 50bp minimum."},
             {"name": "TV % of EV",      "status": "warn" if tv_pct > 70 else "pass", "message": f"Terminal value = {tv_pct}% of EV."},
@@ -2879,8 +2849,7 @@ def build_dashboard_data(
             "beta":              round(beta, 2),
             "risk_free_rate":    round(rf_rate, 1),
             "erp":               erp,
-            "size_premium":      size_premium,
-            "country_risk_premium": crp,
+            "size_premium":      0.0,
             "equity_weight":     round(e_wt, 1),
             "debt_weight":       round(d_wt, 1),
             "equity_weight_pct": round(e_wt, 1),

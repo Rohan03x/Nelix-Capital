@@ -6,11 +6,8 @@ from __future__ import annotations
 import copy
 import logging
 import os
-import secrets
 import sys
 import json
-import time
-from collections import defaultdict, deque
 from pathlib import Path
 
 # Load .env file if present (local dev)
@@ -35,150 +32,14 @@ from webapp.data.ticker_search import resolve_search_input, search_tickers
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.jinja_env.autoescape = True
 
 # Make enumerate available in Jinja2 templates
 app.jinja_env.globals.update(enumerate=enumerate)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
-_RATE_LIMIT_BUCKETS: dict[tuple[str, str], deque[float]] = defaultdict(deque)
-
-_EU_COUNTRY_CODES = {
-    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
-    "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE",
-    "IS", "LI", "NO", "GB", "UK",
-}
-
-
-def _csrf_enabled() -> bool:
-    if app.config.get("TESTING"):
-        return bool(app.config.get("CSRF_ENABLED", False))
-    return os.environ.get("NELIX_DISABLE_CSRF") != "1"
-
-
-def _rate_limit_enabled() -> bool:
-    if app.config.get("TESTING"):
-        return bool(app.config.get("RATELIMIT_ENABLED", False))
-    return os.environ.get("NELIX_DISABLE_RATE_LIMIT") != "1"
-
-
-def _csrf_token() -> str:
-    token = session.get("_csrf_token")
-    if not token:
-        token = secrets.token_urlsafe(32)
-        session["_csrf_token"] = token
-    return str(token)
-
-
-def _client_ip() -> str:
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        return forwarded.split(",", 1)[0].strip()
-    return request.remote_addr or "unknown"
-
-
-def _rate_limit_for_path(path: str) -> tuple[str, int, int] | None:
-    if path == "/valuate":
-        return ("valuate", 1, 60)
-    if path.startswith("/api/dashboard"):
-        return ("api-dashboard", 10, 60)
-    if path.startswith("/api/ticker-search") or path.startswith("/api/search"):
-        return ("api-search", 60, 60)
-    if path.startswith("/api/"):
-        return ("api", 60, 60)
-    return None
-
-
-def _country_code_from_request() -> str:
-    configured = str(app.config.get("GEO_COUNTRY_CODE") or "").strip().upper()
-    if configured:
-        return configured
-    for header in ("CF-IPCountry", "X-Vercel-IP-Country", "X-Country-Code", "X-Geo-Country"):
-        value = str(request.headers.get(header) or "").strip().upper()
-        if value:
-            return value
-    return ""
-
-
-def _is_eu_country(country_code: str) -> bool:
-    return str(country_code or "").strip().upper() in _EU_COUNTRY_CODES
-
-
-def _suitability_gate_enabled() -> bool:
-    return bool(app.config.get("SUITABILITY_GATE_ENABLED", True))
-
-
-def _suitability_exempt_path(path: str) -> bool:
-    return (
-        path.startswith("/static/")
-        or path.startswith("/api/internal/")
-        or path in {"/terms", "/disclosures", "/privacy", "/suitability", "/api/me", "/favicon.ico"}
-    )
-
-
-def _suitability_required() -> bool:
-    if not _suitability_gate_enabled() or session.get("mifid_suitability_complete"):
-        return False
-    if _suitability_exempt_path(request.path):
-        return False
-    return _is_eu_country(_country_code_from_request())
-
-
-def _safe_next_url(value: str | None) -> str:
-    candidate = str(value or "").strip()
-    if not candidate.startswith("/") or candidate.startswith("//"):
-        return url_for("index")
-    if candidate.startswith("/api/") or candidate.startswith("/static/"):
-        return url_for("index")
-    return candidate
-
-
-@app.context_processor
-def _inject_security_context() -> dict[str, object]:
-    return {"csrf_token": _csrf_token}
-
-
-@app.before_request
-def _security_before_request():
-    if _rate_limit_enabled():
-        spec = _rate_limit_for_path(request.path)
-        if spec is not None:
-            bucket_name, limit, window = spec
-            now = time.monotonic()
-            key = (_client_ip(), bucket_name)
-            bucket = _RATE_LIMIT_BUCKETS[key]
-            while bucket and now - bucket[0] >= window:
-                bucket.popleft()
-            if len(bucket) >= limit:
-                return jsonify({"ok": False, "reason": "rate_limited"}), 429
-            bucket.append(now)
-
-    if _suitability_required():
-        if request.path.startswith("/api/"):
-            return jsonify({"ok": False, "reason": "suitability_required"}), 403
-        next_url = request.full_path if request.query_string else request.path
-        return redirect(url_for("suitability", next=next_url))
-
-    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
-        return None
-    if not _csrf_enabled() or request.path.startswith("/api/internal/"):
-        return None
-
-    expected = session.get("_csrf_token")
-    supplied = (
-        request.headers.get("X-CSRF-Token")
-        or request.headers.get("X-CSRFToken")
-        or request.form.get("_csrf_token")
-    )
-    if not expected or not supplied or not secrets.compare_digest(str(expected), str(supplied)):
-        return jsonify({"ok": False, "reason": "csrf_required"}), 400
-    return None
-
 
 def _maybe_start_background_runner() -> None:
     if os.environ.get("VERCEL"):
-        return
-    if "pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST"):
         return
     try:
         from auto_valuation.learning.background_runner import start_learning_background_runner
@@ -229,15 +90,6 @@ def _safe_discovery_store():
         return DiscoveryStore()
     except Exception:
         return None
-
-
-def _cleanup_stale_workflow_data(*, retention_days: int = 730) -> dict[str, object]:
-    store = _safe_discovery_store()
-    if store is None:
-        return {"ok": False, "reason": "discovery-unavailable"}
-    deleted = store.purge_stale_user_workflow_data(max_age_days=retention_days)
-    sync = _persist_external_learning_state(force=True)
-    return {"ok": True, "retention_days": retention_days, "deleted": deleted, "sync": sync}
 
 
 def _seed_watchlist(limit: int = 30) -> list[dict]:
@@ -319,54 +171,6 @@ def _safe_dashboard_data(
 @app.route("/")
 def index():
     return render_template("index.html", supported=SUPPORTED_TICKERS)
-
-
-# ─── Compliance pages ────────────────────────────────────────────────────────
-
-@app.route("/terms")
-def terms():
-    return render_template("terms.html")
-
-
-@app.route("/disclosures")
-def disclosures():
-    return render_template("disclosures.html")
-
-
-@app.route("/privacy")
-def privacy():
-    return render_template("privacy.html")
-
-
-@app.route("/suitability", methods=["GET", "POST"])
-def suitability():
-    next_url = _safe_next_url(request.values.get("next") or url_for("index"))
-    country_code = _country_code_from_request()
-    if request.method == "POST":
-        if request.form.get("acknowledge_non_advice") != "on":
-            return render_template(
-                "suitability.html",
-                next_url=next_url,
-                country_code=country_code,
-                error="Please acknowledge that Nelix Capital is not investment advice.",
-            ), 400
-
-        session["mifid_suitability_complete"] = True
-        session["mifid_suitability_profile"] = {
-            "country_code": country_code,
-            "experience": request.form.get("experience", ""),
-            "risk_tolerance": request.form.get("risk_tolerance", ""),
-            "horizon": request.form.get("horizon", ""),
-            "completed_at": int(time.time()),
-        }
-        return redirect(next_url)
-
-    return render_template(
-        "suitability.html",
-        next_url=next_url,
-        country_code=country_code,
-        error=None,
-    )
 
 
 # ─── Valuation entry point ───────────────────────────────────────────────────
@@ -509,26 +313,6 @@ def api_manual_compare():
     return jsonify({"ok": True, **result})
 
 
-@app.route("/api/me", methods=["DELETE"])
-def api_delete_me():
-    store = _safe_discovery_store()
-    if store is None:
-        return jsonify({"ok": False, "reason": "discovery-unavailable"}), 503
-
-    deleted = store.purge_user_workflow_data()
-    session.clear()
-    sync = _persist_external_learning_state(force=True)
-    return jsonify({
-        "ok": True,
-        "deleted": deleted,
-        "client_storage_keys": [
-            "nelix-device-watchlist-v1",
-            "nelix-device-manual-compare-v1",
-        ],
-        "sync": sync,
-    })
-
-
 @app.route("/api/internal/learning/status", methods=["GET"])
 def api_internal_learning_status():
     payload: dict = {}
@@ -611,18 +395,8 @@ def api_internal_learning_cron():
     from auto_valuation.learning.background_runner import run_background_learning_cycle
 
     cycle = run_background_learning_cycle()
-    privacy_cleanup = _cleanup_stale_workflow_data(retention_days=730)
     sync_out = _persist_external_learning_state(force=True)
-    return jsonify({"ok": True, "sync_in": sync_in, "cycle": cycle, "privacy_cleanup": privacy_cleanup, "sync_out": sync_out})
-
-
-@app.route("/api/internal/privacy/cleanup", methods=["GET", "POST"])
-def api_internal_privacy_cleanup():
-    authorized, reason = _cron_authorized()
-    if not authorized:
-        status = 503 if reason == "cron-secret-missing" else 401
-        return jsonify({"ok": False, "reason": reason}), status
-    return jsonify(_cleanup_stale_workflow_data(retention_days=730))
+    return jsonify({"ok": True, "sync_in": sync_in, "cycle": cycle, "sync_out": sync_out})
 
 
 # ─── API: recompute with overrides ───────────────────────────────────────────
