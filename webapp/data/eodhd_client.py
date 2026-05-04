@@ -1765,7 +1765,39 @@ def build_dashboard_data(
         _bs_asc = list(reversed(_bs_p_aligned))
         _cf_asc = list(reversed(_cf_p_aligned))
 
-        M = 1e6   # divisor → $M
+        M = 1e6   # divisor → local-currency millions
+
+        # ── BDR / Cross-listing mislabeled currency fix ───────────────────
+        # EODHD stores the US parent company's USD financial statements for
+        # Brazilian BDRs (exchange=SA) and similar cross-listed instruments, but
+        # labels the IS currency_symbol as BRL (or ARS for BA).  All the IS/BS/CF
+        # figures therefore need to be multiplied by the USD→local FX rate to
+        # produce correct local-currency values.
+        # Detection: SA/BA exchange AND ticker code follows the BDR naming pattern
+        # (e.g. NIKE34, MSFT34, AAPL34 end with "34"; some end with "33" or "11B").
+        _bdr_code = eodhd_code.split(".")[0].upper()
+        _is_bdr = (
+            exchange in {"SA", "BA"}
+            and reporting_currency not in {"USD", ""}
+            and (
+                _bdr_code.endswith("34")
+                or _bdr_code.endswith("33")
+                or _bdr_code.endswith("11B")
+                or _bdr_code.endswith("32")
+            )
+        )
+        if _is_bdr:
+            # _get_fx_rate returns USD per 1 local unit (e.g. BRL = 0.2013 USD/BRL).
+            # To convert USD_raw → local CCY millions: USD_raw * (1/usd_per_local) / 1e6
+            #                                         = USD_raw / (1e6 * usd_per_local)
+            # So correct M = 1e6 * usd_per_local
+            _usd_per_local = _get_fx_rate(reporting_currency) / max(_get_fx_rate("USD"), 1e-9)
+            if _usd_per_local < 0.9:  # Only when local ccy is weaker than USD (BRL≈0.2, ARS≈0.001)
+                M = 1e6 * _usd_per_local  # e.g. BRL: M = 1e6 * 0.2013 = 201,300
+                logger.debug(
+                    "EODHD BDR currency fix: %s exchange=%s USD→%s usd_per_local=%.4f new_M=%.0f",
+                    ticker, exchange, reporting_currency, _usd_per_local, M,
+                )
 
         def _is_v(i: int, field: str) -> float:
             return _sf(_is_asc[i].get(field)) / M
