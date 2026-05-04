@@ -646,14 +646,7 @@ def _build_data_gaps(
             }
         )
 
-    if review_due:
-        gaps.append(
-            {
-                "title": "Company history review is due",
-                "detail": "The quinquennial review window is open, so older history should be treated with more caution than usual.",
-                "severity": "amber",
-            }
-        )
+    # Quarterly verification is always active — no gap to flag for review cadence.
 
     return gaps
 
@@ -1694,9 +1687,7 @@ def _assumption_source(
         source += f"; pattern {pattern_name} {pattern_overlay_pp:+.1f}pp"
 
     warn = None
-    if review_due:
-        warn = "Quinquennial review window is due for this company history."
-    elif cohort_size < 5:
+    if cohort_size < 5:
         warn = "Learning cohort is still thin; sector priors carry more weight."
     return source, warn
 
@@ -2197,7 +2188,7 @@ def refine_live_assumptions(
         analog_text = f" Nearest analogs: {', '.join(match.analog.ticker for match in analog_set.analogs[:3])}."
     summary = (
         "Weighted knowledge model active: company history blended with sector priors, realised cohorts, analog history, "
-        f"macro regime memory, and global cross-symbol patterns. Quinquennial review {review_text}. "
+        f"macro regime memory, and global cross-symbol patterns. Quarterly verification active since IPO. "
         f"Cohort size: {calibrated.calibration_cohort_size}.{pattern_text}{margin_text}{global_text}{relationship_text}{uncertainty_text}{analog_text}"
     )
 
@@ -2370,7 +2361,7 @@ def refine_live_assumptions(
             "learning_confidence": round(float(uncertainty.get("effective_confidence") or calibrated.calibration_confidence or 0.0), 2),
             "calibration_cohort_size": calibrated.calibration_cohort_size,
             "history_window_years": history_window_years,
-            "quinquennial_review_due": review_due,
+            "quarterly_review_active": True,
             "pattern_match_score": round(pattern_score, 2),
             "scenario_width_multiplier": float(uncertainty.get("scenario_width_multiplier") or margin_normalisation["scenario_width_multiplier"]),
             "wacc": refined_wacc,
@@ -2401,7 +2392,7 @@ def refine_live_assumptions(
         "review_cadence_years": 5,
         "history_window_years": history_window_years,
         "market_cap_regime": market_cap_regime,
-        "quinquennial_review_due": review_due,
+        "quarterly_review_active": True,
         "next_review_in_years": next_review_in_years,
         "calibration_cohort_size": calibrated.calibration_cohort_size,
         "calibration_confidence": round(calibrated.calibration_confidence, 2),
