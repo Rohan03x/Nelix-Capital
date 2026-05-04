@@ -7,6 +7,7 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -64,20 +65,61 @@ class _TokenBucket:
             _time.sleep(wait)
 
 
-# EODHD paid plan: 1,000 req/min = 16.67 req/sec.
-# Use 15 req/sec to leave 10% headroom for dashboard/UI requests.
-_EODHD_RATE_LIMITER = _TokenBucket(rate=15.0, capacity=20.0)
+# EODHD paid plan: 100,000 req/day; tested ceiling ~19 req/sec at 100 concurrent.
+# 18 req/sec with burst=32 comfortably supports 16 concurrent workers.
+_EODHD_RATE_LIMITER = _TokenBucket(rate=18.0, capacity=32.0)
+
+# Number of concurrent workers for parallel fundamentals pre-fetching.
+_CONCURRENT_WORKERS: int = 16
 
 
 def _default_fundamentals_provider(ticker: str) -> dict[str, Any] | None:
-    _EODHD_RATE_LIMITER.acquire()
     try:
-        from webapp.data.eodhd_client import _eodhd_code, _fetch_fundamentals
+        from webapp.data.eodhd_client import (
+            _TTL_FUND_SEC,
+            _cache_read,
+            _eodhd_code,
+            _fetch_fundamentals,
+        )
 
-        return _fetch_fundamentals(_eodhd_code(ticker))
+        code = _eodhd_code(ticker)
+        cache_key = f"fund_{code.replace('.', '_')}"
+        # Only rate-limit actual network requests — not disk-cache hits.
+        if not _cache_read(cache_key, _TTL_FUND_SEC):
+            _EODHD_RATE_LIMITER.acquire()
+        return _fetch_fundamentals(code)
     except Exception as exc:
         logger.debug("Background fundamentals fetch failed for %s: %s", ticker, exc)
         return None
+
+
+def _prefetch_fundamentals_parallel(
+    tickers: list[str],
+    *,
+    provider: Callable[[str], dict[str, Any] | None],
+    max_workers: int = 16,
+) -> dict[str, dict[str, Any]]:
+    """Fetch fundamentals for *tickers* concurrently with *max_workers* threads.
+
+    Returns a ticker→data mapping.  As a side-effect, each successful fetch
+    also writes to the on-disk cache so subsequent provider calls are instant
+    cache hits (no API call or rate-limit wait).
+    """
+    if not tickers:
+        return {}
+    workers = max(1, min(int(max_workers), _CONCURRENT_WORKERS))
+    results: dict[str, dict[str, Any]] = {}
+    lock = threading.Lock()
+
+    def _fetch(ticker: str) -> None:
+        data = provider(ticker)
+        if isinstance(data, dict) and data:
+            with lock:
+                results[ticker.upper()] = data
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bg-fund") as pool:
+        list(pool.map(_fetch, tickers))
+    return results
 
 
 def _safe_tracked_symbol_count() -> int:
@@ -402,12 +444,22 @@ def run_background_learning_cycle(
     _restore_background_runner_cursors(state_path)
     provider = fundamentals_provider or _default_fundamentals_provider
     seed_refresh = _refresh_background_seed_cache()
-    bootstrap_max_tickers = int(LEARNING_CONFIG.get("background_runner_bootstrap_max_tickers", 100))
+    bootstrap_max_tickers = int(LEARNING_CONFIG.get("background_runner_bootstrap_max_tickers", 500))
     bootstrap_tickers = _build_background_bootstrap_tickers(bootstrap_max_tickers)
+
+    # Pre-fetch all bootstrap tickers concurrently so the sequential bootstrap
+    # loop only touches the disk cache (fast, no API rate-limit waits).
+    n_workers = int(LEARNING_CONFIG.get("background_runner_concurrent_workers", _CONCURRENT_WORKERS))
+    prefetched = _prefetch_fundamentals_parallel(bootstrap_tickers, provider=provider, max_workers=n_workers)
+    _prefetch_map = {k.upper(): v for k, v in prefetched.items()}
+
+    def _cached_provider(ticker: str) -> dict[str, Any] | None:
+        return _prefetch_map.get(ticker.upper()) or provider(ticker)
+
     bootstrap = run_live_evidence_bootstrap(
         tickers=bootstrap_tickers or None,
-        fundamentals_provider=provider,
-        interval_hours=int(LEARNING_CONFIG.get("background_runner_bootstrap_interval_hours", 6)),
+        fundamentals_provider=_cached_provider,
+        interval_hours=int(LEARNING_CONFIG.get("background_runner_bootstrap_interval_hours", 1)),
         max_tickers=bootstrap_max_tickers,
         max_replay_predictions_per_ticker=int(LEARNING_CONFIG.get("auto_bootstrap_replay_predictions_per_ticker", 5)),
         replay_enabled=True,
@@ -470,6 +522,90 @@ def run_background_learning_cycle(
         "replay": replay,
         "seed_refresh": seed_refresh,
         "state": state_payload,
+    }
+
+
+def run_bulk_universe_seed(
+    *,
+    max_workers: int | None = None,
+    fundamentals_provider: Callable[[str], dict[str, Any] | None] | None = None,
+    daily_budget: int | None = None,
+) -> dict[str, Any]:
+    """One-shot: fetch fundamentals for every universe symbol not yet on disk.
+
+    Designed to run in a daemon thread on app startup.  Respects *daily_budget*
+    (default 80,000) to stay safely below the 100,000/day EODHD plan limit.
+    At 16 concurrent workers the full 3,800-symbol universe takes ~10 minutes.
+    """
+    workers = max(
+        1,
+        min(
+            int(max_workers or LEARNING_CONFIG.get("background_runner_concurrent_workers", _CONCURRENT_WORKERS)),
+            _CONCURRENT_WORKERS,
+        ),
+    )
+    budget = int(daily_budget or LEARNING_CONFIG.get("bulk_seed_daily_budget", 80_000))
+    provider = fundamentals_provider or _default_fundamentals_provider
+
+    try:
+        from auto_valuation.learning.universe import SymbolUniverseStore
+        symbols = SymbolUniverseStore().list_symbols()
+        all_tickers = [s["ticker"] for s in symbols if s.get("ticker")]
+    except Exception as exc:
+        logger.warning("Bulk seed: could not load universe symbols: %s", exc)
+        return {"enabled": True, "ran": False, "reason": "universe_error", "error": str(exc)}
+
+    if not all_tickers:
+        return {"enabled": True, "ran": False, "reason": "no_universe_tickers"}
+
+    # Filter to tickers whose fundamentals are NOT yet on disk.
+    try:
+        from webapp.data.eodhd_client import _TTL_FUND_SEC, _cache_read, _eodhd_code
+        uncached: list[str] = []
+        for ticker in all_tickers:
+            code = _eodhd_code(ticker)
+            cache_key = f"fund_{code.replace('.', '_')}"
+            if not _cache_read(cache_key, _TTL_FUND_SEC):
+                uncached.append(ticker)
+    except Exception as exc:
+        logger.warning("Bulk seed: cache-check failed: %s", exc)
+        uncached = list(all_tickers)
+
+    if not uncached:
+        logger.info("Bulk seed: all %d universe symbols already cached.", len(all_tickers))
+        return {"enabled": True, "ran": False, "reason": "all_cached", "universe_size": len(all_tickers)}
+
+    to_fetch = uncached[:budget]
+    logger.info(
+        "Bulk seed: fetching %d/%d uncached symbols with %d workers …",
+        len(to_fetch), len(uncached), workers,
+    )
+
+    fetched = 0
+    failed = 0
+    fetch_lock = threading.Lock()
+
+    def _do_fetch(ticker: str) -> None:
+        nonlocal fetched, failed
+        data = provider(ticker)
+        with fetch_lock:
+            if isinstance(data, dict) and data:
+                fetched += 1
+            else:
+                failed += 1
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bulk-seed") as pool:
+        list(pool.map(_do_fetch, to_fetch))
+
+    logger.info("Bulk seed complete: %d fetched, %d failed.", fetched, failed)
+    return {
+        "enabled": True,
+        "ran": True,
+        "universe_size": len(all_tickers),
+        "uncached_found": len(uncached),
+        "fetched": fetched,
+        "failed": failed,
+        "workers": workers,
     }
 
 
@@ -542,6 +678,15 @@ def start_learning_background_runner() -> LearningBackgroundRunner | None:
         if _RUNNER is None:
             _RUNNER = LearningBackgroundRunner().start()
             atexit.register(stop_learning_background_runner)
+            # Kick off a one-shot bulk seed in a daemon thread so the app
+            # fills the fundamentals cache for all universe symbols on startup.
+            if bool(LEARNING_CONFIG.get("bulk_seed_on_startup", True)):
+                _seed_thread = threading.Thread(
+                    target=run_bulk_universe_seed,
+                    daemon=True,
+                    name="bulk-universe-seed",
+                )
+                _seed_thread.start()
         elif not _RUNNER.running:
             _RUNNER.start()
         return _RUNNER
@@ -584,6 +729,7 @@ __all__ = [
     "get_daily_stats",
     "read_background_runner_state",
     "run_background_learning_cycle",
+    "run_bulk_universe_seed",
     "start_learning_background_runner",
     "stop_learning_background_runner",
 ]

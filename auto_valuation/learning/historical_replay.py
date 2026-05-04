@@ -511,7 +511,7 @@ def get_all_observations(
     if not fund_files:
         return []
 
-    workers = max(1, min(max_workers or (os.cpu_count() or 4), 8))
+    workers = max(1, min(max_workers or (os.cpu_count() or 4), 16))
     all_obs: list[CalibrationObservation] = []
 
     def _process(path: Path) -> list[CalibrationObservation]:
