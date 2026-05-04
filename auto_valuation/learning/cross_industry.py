@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field, replace
 from datetime import date
 from typing import Any, Iterable
@@ -28,12 +29,48 @@ except ImportError:
     }
 
 
+_COMPANY_NAME_TOKEN_RE = re.compile(r"[^A-Z0-9]+")
+_COMPANY_NAME_STOPWORDS = frozenset(
+    {
+        "INC",
+        "INCORPORATED",
+        "CORP",
+        "CORPORATION",
+        "CO",
+        "COMPANY",
+        "LIMITED",
+        "LTD",
+        "PLC",
+        "AG",
+        "SA",
+        "SE",
+        "NV",
+        "BV",
+        "AB",
+        "ASA",
+        "ADR",
+        "ADS",
+        "GDR",
+        "HOLDING",
+        "HOLDINGS",
+        "GROUP",
+        "CLASS",
+        "CL",
+        "ORD",
+        "ORDINARY",
+        "SHARES",
+        "SHARE",
+    }
+)
+
+
 @dataclass(frozen=True)
 class AnalogObservation:
     ticker: str
     sector: str
     industry: str
     vintage_year: int
+    company_name: str = ""
     feature_vector: tuple[float, ...] | None = None
     outcome_revenue_cagr_5y: float = 0.0
     outcome_margin_change_bps: float = 0.0
@@ -247,6 +284,59 @@ def cosine_similarity(
     return dot / (left_norm * right_norm)
 
 
+def _normalize_company_name(value: str) -> str:
+    tokens = [
+        token
+        for token in _COMPANY_NAME_TOKEN_RE.sub(" ", str(value or "").upper()).split()
+        if token and token not in _COMPANY_NAME_STOPWORDS
+    ]
+    return " ".join(tokens)
+
+
+def _normalized_listing_ticker(ticker: str) -> str:
+    ticker_text = str(ticker or "").strip().upper()
+    if not ticker_text:
+        return ""
+    try:
+        from webapp.data.eodhd_client import normalize_requested_ticker
+
+        return str(normalize_requested_ticker(ticker_text) or ticker_text).strip().upper()
+    except Exception:
+        return ticker_text
+
+
+def _analog_identity_keys(ticker: str, company_name: str = "") -> tuple[str, ...]:
+    keys: list[str] = []
+    company_key = _normalize_company_name(company_name)
+    if company_key:
+        keys.append(f"name:{company_key}")
+    ticker_key = _normalized_listing_ticker(ticker)
+    if ticker_key:
+        keys.append(f"ticker:{ticker_key}")
+    return tuple(keys)
+
+
+def _same_issuer_bridge_bonus(subject_identity_keys: set[str], candidate: AnalogObservation) -> float:
+    if not subject_identity_keys:
+        return 0.0
+    candidate_keys = set(_analog_identity_keys(candidate.ticker, candidate.company_name))
+    if not candidate_keys:
+        return 0.0
+    if any(key.startswith("name:") and key in subject_identity_keys for key in candidate_keys):
+        return 0.14
+    if any(key.startswith("ticker:") and key in subject_identity_keys for key in candidate_keys):
+        return 0.08
+    return 0.0
+
+
+def _analog_candidate_dedupe_key(candidate: AnalogObservation) -> str:
+    company_key = _normalize_company_name(candidate.company_name)
+    if company_key:
+        return f"name:{company_key}"
+    ticker_key = _normalized_listing_ticker(candidate.ticker)
+    return f"ticker:{ticker_key or str(candidate.ticker or '').strip().upper()}"
+
+
 def sector_distance(subject_sector: str, analog_sector: str, subject_industry: str = "", analog_industry: str = "") -> int:
     if subject_industry and analog_industry and subject_industry == analog_industry:
         return 1
@@ -404,6 +494,7 @@ def build_analog_observations(records: Iterable[Any]) -> list[AnalogObservation]
         observations.append(
             AnalogObservation(
                 ticker=getattr(record, "ticker", ""),
+                company_name=getattr(record, "company_name", ""),
                 sector=getattr(record, "sector", ""),
                 industry=getattr(record, "industry", ""),
                 vintage_year=max(int(getattr(record, "data_vintage_years", 0) or 0), 1),
@@ -499,6 +590,7 @@ def find_analogs(
     feature_vector: SymbolFeatures | dict[str, float] | tuple[float, ...] | list[float],
     candidates: list[AnalogObservation],
     *,
+    subject_company_name: str = "",
     subject_sector: str = "",
     subject_industry: str = "",
     subject_vintage_year: int = 0,
@@ -524,6 +616,7 @@ def find_analogs(
         observation_year=observation_year,
     )
     pattern_name, pattern_score, _ = match_pattern_library(subject_features)
+    subject_identity_keys = set(_analog_identity_keys(ticker, subject_company_name))
 
     matches: list[AnalogMatch] = []
     for candidate in candidates:
@@ -549,14 +642,27 @@ def find_analogs(
         static_similarity = cosine_similarity(subject_features, analog_features)
         regime_similarity = _regime_similarity(subject_features, analog_features, subject_vintage_year, candidate.vintage_year)
         similarity = 0.72 * static_similarity + 0.28 * regime_similarity
-        if similarity < min_similarity:
+        identity_bonus = _same_issuer_bridge_bonus(subject_identity_keys, candidate)
+        if similarity + identity_bonus < min_similarity:
             continue
         recency_weight = _recency_weight(subject_features.as_of_year, candidate.as_of_year)
         quality_weight = _clamp(candidate.data_quality_score or analog_features.data_quality_score, 0.35, 1.0)
         sample_weight = _sample_weight(candidate.sample_size or analog_features.sample_size)
         usefulness_weight = _clamp(candidate.predictive_usefulness or analog_features.predictive_usefulness, 0.25, 1.0)
         distance = sector_distance(subject_sector, candidate.sector, subject_industry, candidate.industry)
-        analog_score = similarity * recency_weight * quality_weight * sample_weight * usefulness_weight * (1.0 / distance)
+        evidence = _top_evidence(subject_features, analog_features)
+        if identity_bonus > 0:
+            evidence = (
+                {
+                    "dimension": "issuer_identity",
+                    "label": "Issuer mapping",
+                    "similarity": 1.0,
+                    "subject": subject_company_name or ticker,
+                    "analog": candidate.company_name or candidate.ticker,
+                    "bucket": "same_issuer",
+                },
+            ) + evidence
+        analog_score = (similarity + identity_bonus) * recency_weight * quality_weight * sample_weight * usefulness_weight * (1.0 / distance)
         matches.append(
             AnalogMatch(
                 analog=candidate,
@@ -569,17 +675,17 @@ def find_analogs(
                 quality_weight=quality_weight,
                 sample_weight=sample_weight,
                 usefulness_weight=usefulness_weight,
-                evidence=_top_evidence(subject_features, analog_features),
+                evidence=evidence,
             )
         )
 
     matches.sort(key=lambda item: item.analog_score, reverse=True)
     deduped_matches: dict[str, AnalogMatch] = {}
     for match in matches:
-        ticker_key = str(match.analog.ticker or "").strip().upper()
-        current = deduped_matches.get(ticker_key)
+        dedupe_key = _analog_candidate_dedupe_key(match.analog)
+        current = deduped_matches.get(dedupe_key)
         if current is None or match.analog_score > current.analog_score:
-            deduped_matches[ticker_key] = match
+            deduped_matches[dedupe_key] = match
 
     matches = sorted(deduped_matches.values(), key=lambda item: item.analog_score, reverse=True)[:max_results]
     weighted_outcomes = {

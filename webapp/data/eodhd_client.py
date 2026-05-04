@@ -1796,6 +1796,7 @@ def build_dashboard_data(
 
             knowledge_model_payload = refine_live_assumptions(
                 ticker=ticker,
+                company_name=company_name,
                 sector=sector,
                 industry=industry,
                 market_cap=market_cap,

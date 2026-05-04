@@ -1673,6 +1673,7 @@ def _assumption_source(
 def refine_live_assumptions(
     *,
     ticker: str,
+    company_name: str = "",
     sector: str,
     industry: str,
     market_cap: float,
@@ -1811,6 +1812,7 @@ def refine_live_assumptions(
             ticker,
             symbol_features,
             analog_candidates,
+            subject_company_name=company_name,
             subject_sector=sector,
             subject_industry=industry,
             subject_vintage_year=len(revenues),
