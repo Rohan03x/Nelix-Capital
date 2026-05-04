@@ -33,24 +33,62 @@ from webapp.data.knowledge_model import refine_live_assumptions
 
 WEBAPP_CACHE_DIR = Path(__file__).resolve().parents[2] / "webapp" / "data" / "cache"
 DEFAULT_BOOTSTRAP_TICKERS = (
+    # ── US mega-cap tech ──────────────────────────────────────────────────
     "AAPL",
     "MSFT",
     "NVDA",
     "AMZN",
     "GOOGL",
     "META",
+    "TSLA",
+    "ORCL",
+    "CSCO",
+    "IBM",
+    # ── US financials & energy ────────────────────────────────────────────
     "JPM",
+    "BRK-B",
     "XOM",
+    "CVX",
+    "BAC",
+    "WFC",
+    "GS",
+    # ── US healthcare & consumer ──────────────────────────────────────────
     "LLY",
+    "JNJ",
+    "UNH",
     "PG",
     "KO",
+    "WMT",
+    "COST",
+    "MCD",
     "NKE",
+    # ── US industrials & materials ────────────────────────────────────────
+    "CAT",
+    "DE",
+    "HON",
+    "GE",
+    "MMM",
+    "LIN",
+    # ── European blue-chips ───────────────────────────────────────────────
     "ASML",
     "SAP",
-    "TM",
-    "005930.KO",
     "NESN.SW",
+    "NOVN.SW",
+    "OR.PA",           # L'Oréal
+    "MC.PA",           # LVMH
+    "SIE.XETRA",       # Siemens
+    "AIR.PA",          # Airbus
+    "SAN.MC",          # Santander
+    "ULVR.LSE",        # Unilever
+    "BP.LSE",
     "RIO.LSE",
+    # ── Asia-Pacific ──────────────────────────────────────────────────────
+    "TM",              # Toyota
+    "7203.T",          # Toyota (local)
+    "005930.KO",       # Samsung
+    "BHP.AU",          # BHP Group
+    "9988.HK",         # Alibaba
+    "700.HK",          # Tencent
 )
 REALIZED_VALUE_TARGETS = {
     "actual_revenue_mm",

@@ -1600,7 +1600,7 @@ def _global_cross_symbol_overlay(
     damping = _clamp((0.10 + 0.20 * confidence) * taxonomy_damping_scale, 0.04, 0.30)
     revenue_growth_adj_pp = round(
         _clamp(
-            _safe_mean(
+            _trimmed_mean(
                 [
                     float(actual) - float(predicted)
                     for observation in selected
@@ -1622,7 +1622,7 @@ def _global_cross_symbol_overlay(
     )
     ebit_margin_adj_pp = round(
         _clamp(
-            _safe_mean(
+            _trimmed_mean(
                 [
                     float(actual) - float(predicted)
                     for observation in selected
@@ -1644,7 +1644,7 @@ def _global_cross_symbol_overlay(
     )
     wacc_adj_pp = round(
         _clamp(
-            _safe_mean(
+            _trimmed_mean(
                 [
                     float(actual) - float(predicted)
                     for observation in selected
@@ -1663,7 +1663,7 @@ def _global_cross_symbol_overlay(
     )
     terminal_growth_adj_pp = round(
         _clamp(
-            _safe_mean(
+            _trimmed_mean(
                 [
                     float(actual) - float(predicted)
                     for observation in selected
@@ -1685,7 +1685,7 @@ def _global_cross_symbol_overlay(
     )
     beta_adj = round(
         _clamp(
-            _safe_mean(
+            _trimmed_mean(
                 [
                     float(actual) - float(predicted)
                     for observation in selected
