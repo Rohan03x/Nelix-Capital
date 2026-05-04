@@ -1865,7 +1865,8 @@ def refine_live_assumptions(
         macro_regime="neutral",
         subject_structural_break_like=subject_structural_break_like,
     )
-    global_learning = analog_learning if analog_learning.get("enabled") else fallback_global_learning
+    analog_overlay_eligible = bool(analog_learning.get("enabled")) and len(analog_set.analogs) >= 2
+    global_learning = analog_learning if analog_overlay_eligible else fallback_global_learning
 
     growth_weights = _normalise_weights(
         _clamp(0.48 + 0.04 * history_window_years - 0.30 * min(revenue_volatility, 0.50), 0.38, 0.72),
