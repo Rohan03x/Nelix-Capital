@@ -23,7 +23,7 @@ try:
     from auto_valuation.config import LEARNING_CONFIG as _LEARNING_CONFIG
 except ImportError:
     _LEARNING_CONFIG = {
-        "min_analog_similarity": 0.75,
+        "min_analog_similarity": 0.60,
         "max_analogs_returned": 10,
         "cross_sector_only": True,
     }

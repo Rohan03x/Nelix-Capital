@@ -25,7 +25,6 @@ REALIZED_VALUE_FIELDS = (
     "actual_revenue_mm",
     "actual_ebit_margin",
     "actual_ufcf_mm",
-    "actual_ev_mm",
     "actual_price_at_horizon",
 )
 

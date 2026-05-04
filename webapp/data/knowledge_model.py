@@ -92,6 +92,68 @@ def _learning_pool_limit(default: int = 1000) -> int:
         return default
 
 
+def _classify_macro_regime(rf_rate: float) -> str:
+    """Classify macro regime from risk-free rate (as a decimal, e.g. 0.045 = 4.5%).
+
+    Used when persisting predictions and when blending observations so that the
+    learning pipeline can distinguish rate environments.
+    """
+    r = float(rf_rate or 0.0)
+    if r >= 0.045:
+        return "rising_rates"
+    if r <= 0.020:
+        return "low_rates"
+    return "neutral"
+
+
+def _derive_actual_wacc(
+    predicted_wacc: float | None,
+    actual_ufcf_margin: float | None,
+    predicted_ufcf_margin: float | None,
+    revenue_delta: float,
+) -> float:
+    """Infer realized WACC from cash-flow and revenue performance vs. prediction.
+
+    Companies that deliver more free cash flow than predicted effectively had
+    lower financing risk (lower observed WACC).  Companies that miss deliver
+    higher implied risk.  This proxy breaks the always-zero residual that
+    occurs when actual_wacc == predicted_wacc.
+    """
+    pw = float(predicted_wacc or 0.10)
+    ufcf_delta = 0.0
+    if actual_ufcf_margin is not None and predicted_ufcf_margin is not None:
+        ufcf_delta = float(actual_ufcf_margin) - float(predicted_ufcf_margin)
+    # UFCF outperformance → risk was lower → actual WACC < predicted WACC
+    ufcf_adj = _clamp(ufcf_delta * 0.40, -0.020, 0.020)
+    # Revenue outperformance → additional risk compression
+    rev_adj = _clamp(revenue_delta * 0.03, -0.015, 0.015)
+    return round(_clamp(pw - ufcf_adj - rev_adj, 0.04, 0.30), 4)
+
+
+def _derive_actual_terminal_growth(
+    predicted_terminal_growth: float | None,
+    revenue_delta: float,
+) -> float:
+    """Infer realized implied terminal growth from revenue performance vs. prediction.
+
+    Companies that consistently beat revenue forecasts suggest slightly higher
+    long-run sustainable growth than originally predicted.
+    """
+    ptg = float(predicted_terminal_growth or 0.025)
+    adj = _clamp(revenue_delta * 0.015, -0.010, 0.010)
+    return round(_clamp(ptg + adj, 0.005, 0.055), 4)
+
+
+def _derive_actual_beta(predicted_beta: float, revenue_delta: float) -> float:
+    """Infer realized beta from revenue outperformance/underperformance.
+
+    Consistent outperformers have lower realized systematic risk (beta
+    compression); underperformers exhibit higher sensitivity to market moves.
+    """
+    adj = _clamp(revenue_delta * 0.20, -0.15, 0.15)
+    return round(_clamp(predicted_beta - adj, 0.20, 3.0), 2)
+
+
 def _growth_rates(revenues: list[float]) -> list[float]:
     rates: list[float] = []
     for idx in range(1, len(revenues)):
@@ -316,10 +378,8 @@ def _build_layered_learning_snapshot(
         observation
         for observation in observations
         if _knowledge_sector(str(_obs_value(observation, "sector", "") or "")) == sector
-        and (not industry or str(_obs_value(observation, "industry", "") or "") in ("", industry))
         and _maturity_bucket(int(_obs_value(observation, "data_vintage_years", 0) or 0)) == target_bucket
         and str(_obs_value(observation, "market_cap_regime", "") or "") == market_cap_regime
-        and str(_obs_value(observation, "macro_regime", "") or "") == macro_regime
     ]
     sector_observations = [
         observation
@@ -1316,6 +1376,16 @@ def _load_learning_cohort(limit: int | None = None) -> list[Any]:
         if record.actual_revenue_mm is not None and record.predicted_revenue_mm:
             revenue_delta = (record.actual_revenue_mm - record.predicted_revenue_mm) / max(abs(record.predicted_revenue_mm), 1.0)
 
+        # Derive macro regime: use stored value if non-neutral, otherwise
+        # re-classify from the rf_rate in macro_backdrop (backfills old "neutral" records).
+        _stored_regime = (record.macro_regime or "").strip()
+        _rf_from_backdrop = float((record.macro_backdrop or {}).get("rf_rate") or 0.0)
+        _obs_macro_regime = (
+            _stored_regime
+            if _stored_regime and _stored_regime != "neutral"
+            else _classify_macro_regime(_rf_from_backdrop)
+        )
+
         observations.append(
             {
                 "ticker": getattr(record, "ticker", "") or "",
@@ -1323,17 +1393,17 @@ def _load_learning_cohort(limit: int | None = None) -> list[Any]:
                 "industry": record.industry or "",
                 "data_vintage_years": max(1, int(record.data_vintage_years or 1)),
                 "market_cap_regime": record.market_cap_regime or "large",
-                "macro_regime": record.macro_regime or "neutral",
+                "macro_regime": _obs_macro_regime,
                 "predicted_revenue_growth": predicted_revenue_growth,
                 "actual_revenue_growth": predicted_revenue_growth + revenue_delta,
                 "predicted_ebit_margin": predicted_margin,
                 "actual_ebit_margin": _as_decimal(record.actual_ebit_margin) if record.actual_ebit_margin is not None else predicted_margin,
                 "predicted_wacc": predicted_wacc or 0.10,
-                "actual_wacc": predicted_wacc or 0.10,
+                "actual_wacc": _derive_actual_wacc(predicted_wacc, actual_ufcf_margin, predicted_ufcf_margin, revenue_delta),
                 "predicted_terminal_growth": predicted_terminal_growth or 0.025,
-                "actual_terminal_growth": predicted_terminal_growth or 0.025,
+                "actual_terminal_growth": _derive_actual_terminal_growth(predicted_terminal_growth, revenue_delta),
                 "predicted_beta": predicted_beta,
-                "actual_beta": predicted_beta,
+                "actual_beta": _derive_actual_beta(predicted_beta, revenue_delta),
                 "predicted_ufcf_margin": predicted_ufcf_margin,
                 "actual_ufcf_margin": actual_ufcf_margin,
                 "predicted_reinvestment_rate": predicted_reinvestment_rate,
@@ -1754,6 +1824,9 @@ def refine_live_assumptions(
 
     knowledge_sector = _knowledge_sector(sector)
     market_cap_regime = _market_cap_regime(market_cap)
+    # Classify current macro environment from the live risk-free rate so that
+    # observations and blending use a meaningful regime label instead of always "neutral".
+    current_macro_regime = _classify_macro_regime(rf_rate / 100)
     history_window_years = _history_window_years(revenues)
     completed_years = max(1, len(revenues) - 1)
     # Quarterly verification: review is active from the first completed year (not every 5 years).
@@ -1782,7 +1855,7 @@ def refine_live_assumptions(
         tax_rate_pct=tax_rate_pct,
         market_cap=market_cap,
         market_cap_regime=market_cap_regime,
-        macro_regime="neutral",
+        macro_regime=current_macro_regime,
         observation_year=completed_years,
     )
     feature_vector = dict(symbol_features.feature_map)
@@ -1820,7 +1893,7 @@ def refine_live_assumptions(
         industry,
         len(revenues),
         market_cap_regime,
-        "neutral",
+        current_macro_regime,
         observations=observations,
         base_wacc=wacc / 100,
         base_terminal_growth=terminal_growth / 100,
@@ -1840,7 +1913,7 @@ def refine_live_assumptions(
             subject_industry=industry,
             subject_vintage_year=len(revenues),
             subject_market_cap_regime=market_cap_regime,
-            subject_macro_regime="neutral",
+            subject_macro_regime=current_macro_regime,
             observation_year=completed_years,
             max_results=max_analog_results,
             cross_sector_only=False,
@@ -1885,7 +1958,7 @@ def refine_live_assumptions(
         observations,
         data_vintage_years=len(revenues),
         market_cap_regime=market_cap_regime,
-        macro_regime="neutral",
+        macro_regime=current_macro_regime,
         subject_structural_break_like=subject_structural_break_like,
         subject_sector=sector,
         subject_industry=industry,
@@ -2030,7 +2103,7 @@ def refine_live_assumptions(
         industry=industry,
         data_vintage_years=len(revenues),
         market_cap_regime=market_cap_regime,
-        macro_regime="neutral",
+        macro_regime=current_macro_regime,
         feature_vector=feature_vector,
         observations=observations,
         analog_set=analog_set,

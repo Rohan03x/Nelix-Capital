@@ -70,6 +70,16 @@ _TTL_EOD_HISTORY_SEC = 86_400 * 7  # 7  days
 import time as _time
 _MEM_CACHE: dict[str, tuple[Any, float]] = {}
 
+
+def _macro_regime_from_rf(rf_rate_decimal: float) -> str:
+    """Classify the macro regime from the risk-free rate (decimal, e.g. 0.045)."""
+    r = float(rf_rate_decimal or 0.0)
+    if r >= 0.045:
+        return "rising_rates"
+    if r <= 0.020:
+        return "low_rates"
+    return "neutral"
+
 # ── Optional dependency check ─────────────────────────────────────────────────
 try:
     import requests as _req
@@ -751,7 +761,7 @@ def _persist_learning_snapshot(data: dict[str, Any], knowledge_model: dict[str, 
                 market_cycle_phase="neutral",
                 macro_backdrop=macro_backdrop,
                 market_cap_regime=str(knowledge_model.get("market_cap_regime") or ""),
-                macro_regime="neutral",
+                macro_regime=_macro_regime_from_rf(float(data.get("risk_free_rate") or 0.0) / 100),
                 feature_vector=feature_vector,
                 fiscal_year_end_month=fiscal_year_end_month,
                 fiscal_year_end_day=fiscal_year_end_day,
@@ -812,7 +822,7 @@ def _persist_learning_snapshot(data: dict[str, Any], knowledge_model: dict[str, 
                         market_cycle_phase="neutral",
                         macro_backdrop=macro_backdrop,
                         market_cap_regime=str(knowledge_model.get("market_cap_regime") or ""),
-                        macro_regime="neutral",
+                        macro_regime=_macro_regime_from_rf(float(data.get("risk_free_rate") or 0.0) / 100),
                         feature_vector=feature_vector,
                         fiscal_year_end_month=fiscal_year_end_month,
                         fiscal_year_end_day=fiscal_year_end_day,
