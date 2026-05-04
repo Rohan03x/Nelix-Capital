@@ -198,10 +198,15 @@ def _enroll_background_seed_items(items: list[dict[str, object]]) -> int:
             company_name=str(item.get("name") or ticker),
             exchange=str(item.get("exchange") or ""),
             country=str(item.get("country") or ""),
+            sector=str(item.get("sector") or ""),
+            industry=str(item.get("industry") or ""),
             source="background-seed-cache",
+            fundamentals_cached=bool(item.get("has_fundamentals")),
             metadata={
                 "background_seed_source": str(item.get("source") or "exchange-cache"),
                 "background_seed_exchange": str(item.get("exchange") or ""),
+                "background_seed_market_cap": float(item.get("market_cap") or 0.0),
+                "background_seed_history_years": int(item.get("history_years") or 0),
             },
             metadata_increments={"background_seed_hits": 1},
         )

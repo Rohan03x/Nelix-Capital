@@ -283,3 +283,86 @@ def test_find_analogs_deduplicates_same_ticker_candidates():
 
     assert tickers.count("DUPL") == 1
     assert set(tickers) == {"DUPL", "UNIQ"}
+
+
+def test_find_analogs_bridges_same_company_cross_listing_when_similarity_is_borderline():
+    subject = (0.30, 0.18, 0.68, 0.03, 1.10, 0.72, 0.70, 0.55, 0.18, 0.02)
+    candidate = AnalogObservation(
+        ticker="9988.HK",
+        company_name="Alibaba Group Holding Ltd",
+        sector="Technology",
+        industry="Hardware",
+        vintage_year=6,
+        feature_vector=(0.05, 0.05, 0.20, 0.12, 0.80, 0.30, 2.00, 0.10, 0.40, -0.02),
+        predictive_usefulness=0.88,
+        as_of_year=2024,
+    )
+
+    without_bridge = find_analogs(
+        "BABA.US",
+        subject,
+        [candidate],
+        subject_sector="Technology",
+        subject_industry="Hardware",
+        subject_vintage_year=6,
+        min_similarity=0.75,
+        max_results=5,
+        cross_sector_only=False,
+    )
+    with_bridge = find_analogs(
+        "BABA.US",
+        subject,
+        [candidate],
+        subject_company_name="Alibaba Group Holding Limited",
+        subject_sector="Technology",
+        subject_industry="Hardware",
+        subject_vintage_year=6,
+        min_similarity=0.75,
+        max_results=5,
+        cross_sector_only=False,
+    )
+
+    assert without_bridge.analogs == []
+    assert with_bridge.analogs[0].analog.ticker == "9988.HK"
+    assert with_bridge.analogs[0].evidence[0]["dimension"] == "issuer_identity"
+
+
+def test_find_analogs_deduplicates_normalized_listing_aliases():
+    subject = _subject_features()
+    candidates = [
+        AnalogObservation(
+            ticker="005930.KS",
+            sector="Technology",
+            industry="Hardware",
+            vintage_year=6,
+            feature_map=dict(subject.feature_map),
+            predictive_usefulness=0.72,
+            as_of_year=2024,
+        ),
+        AnalogObservation(
+            ticker="005930.KO",
+            sector="Technology",
+            industry="Hardware",
+            vintage_year=6,
+            feature_map=dict(subject.feature_map),
+            predictive_usefulness=0.91,
+            as_of_year=2024,
+        ),
+    ]
+
+    analog_set = find_analogs(
+        "SUBJ",
+        subject,
+        candidates,
+        subject_sector="Technology",
+        subject_industry="Hardware",
+        subject_vintage_year=6,
+        subject_market_cap_regime="mid",
+        subject_macro_regime="neutral",
+        observation_year=2024,
+        min_similarity=0.5,
+        max_results=5,
+        cross_sector_only=False,
+    )
+
+    assert [match.analog.ticker for match in analog_set.analogs] == ["005930.KO"]

@@ -289,6 +289,125 @@ def test_seedable_tickers_skips_recently_unavailable_symbols(monkeypatch):
     assert tickers == ["AAPL.US"]
 
 
+def test_seedable_tickers_prefers_live_success_and_richer_cached_fundamentals(monkeypatch):
+    monkeypatch.setattr(
+        ticker_search,
+        "_ticker_search_index",
+        lambda: (
+            ticker_search._build_search_item(
+                ticker="THIN.SE",
+                code="THIN",
+                name="Thin Search Cache",
+                exchange="SE",
+                country="Sweden",
+                source="search-cache",
+                instrument_type="Common Stock",
+                is_primary=True,
+            ),
+            ticker_search._build_search_item(
+                ticker="RICH.US",
+                code="RICH",
+                name="Rich Fundamentals Inc",
+                exchange="US",
+                country="USA",
+                source="cache",
+                instrument_type="Common Stock",
+                is_primary=True,
+                sector="Technology",
+                industry="Software",
+                market_cap=9_500_000_000,
+                history_years=10,
+                has_fundamentals=True,
+            ),
+            ticker_search._build_search_item(
+                ticker="LIVE.US",
+                code="LIVE",
+                name="Live Success Corp",
+                exchange="US",
+                country="USA",
+                source="cache",
+                instrument_type="Common Stock",
+                is_primary=True,
+                sector="Industrials",
+                industry="Machinery",
+                market_cap=1_200_000_000,
+                history_years=7,
+                has_fundamentals=True,
+            ),
+        ),
+    )
+    monkeypatch.setattr(ticker_search, "_cached_primary_listing_hints", lambda: {})
+    monkeypatch.setattr(
+        ticker_search,
+        "_recent_seed_symbol_health",
+        lambda: {"LIVE.US": {"available": True, "source": "eodhd"}},
+    )
+
+    tickers = ticker_search.seedable_tickers(limit=5, common_stock_only=True)
+
+    assert tickers == ["LIVE.US", "RICH.US", "THIN.SE"]
+
+
+def test_seedable_tickers_skips_cached_dcf_unsuitable_sectors(monkeypatch):
+    monkeypatch.setattr(
+        ticker_search,
+        "_ticker_search_index",
+        lambda: (
+            ticker_search._build_search_item(
+                ticker="GOOD.US",
+                code="GOOD",
+                name="Gladstone Commercial Corporation",
+                exchange="US",
+                country="USA",
+                source="cache",
+                instrument_type="Common Stock",
+                is_primary=True,
+                sector="Real Estate",
+                industry="Specialty REIT",
+                market_cap=850_000_000,
+                history_years=10,
+                has_fundamentals=True,
+            ),
+            ticker_search._build_search_item(
+                ticker="LOB.US",
+                code="LOB",
+                name="Live Oak Bancshares, Inc.",
+                exchange="US",
+                country="USA",
+                source="cache",
+                instrument_type="Common Stock",
+                is_primary=True,
+                sector="Financial Services",
+                industry="Banks - Regional",
+                market_cap=1_000_000_000,
+                history_years=10,
+                has_fundamentals=True,
+            ),
+            ticker_search._build_search_item(
+                ticker="AAPL.US",
+                code="AAPL",
+                name="Apple Inc",
+                exchange="US",
+                country="USA",
+                source="cache",
+                instrument_type="Common Stock",
+                is_primary=True,
+                sector="Technology",
+                industry="Consumer Electronics",
+                market_cap=10_000_000_000,
+                history_years=10,
+                has_fundamentals=True,
+            ),
+        ),
+    )
+    monkeypatch.setattr(ticker_search, "_cached_primary_listing_hints", lambda: {})
+    monkeypatch.setattr(ticker_search, "_recent_seed_symbol_health", lambda: {})
+
+    tickers = ticker_search.seedable_tickers(limit=5, common_stock_only=True)
+
+    assert tickers == ["AAPL.US"]
+
+
 def test_refresh_exchange_symbol_cache_fetches_and_invalidates_index(monkeypatch):
     invalidations: list[str] = []
     cached_payloads: dict[str, object] = {}
