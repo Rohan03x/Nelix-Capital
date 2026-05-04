@@ -6,8 +6,18 @@ logs/
 output/
 tests/
 
-# Local caches — Vercel fetches live; these bloat the bundle
-webapp/data/cache/
+# Large/ephemeral cache files — excluded from bundle
+# Individual company fundamentals (fetched live per-request)
+webapp/data/cache/eodhd_fund_*.json
+# Redundant flat index (shards below are the canonical source)
+webapp/data/cache/search_index_prebuilt.json
+# Per-query search result caches (ephemeral, fetched live)
+webapp/data/cache/eodhd_ticker_search_*.json
+# Exchange symbol snapshots (re-fetched live as needed)
+webapp/data/cache/eodhd_exchange_symbols_*.json
+# All other eodhd_ raw data caches
+webapp/data/cache/eodhd_*.json
+# Learning DB (rebuilt from Supabase at runtime)
 auto_valuation/learning/db/
 overrides/
 
