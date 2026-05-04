@@ -164,18 +164,42 @@ function setTicker(ticker) {
   const submitBtn = document.getElementById('submitBtn');
   const selectedTickerInput = document.getElementById('selectedTicker');
   const suggestionsEl = document.getElementById('tickerSuggestions');
+  const searchShell = tickerInput.closest('.ticker-search-shell');
 
   let suggestions = [];
   let activeIndex = -1;
   let debounceHandle = null;
   let requestToken = 0;
+  let hideHandle = null;
+
+  function cancelHideSuggestions() {
+    if (hideHandle !== null) {
+      window.clearTimeout(hideHandle);
+      hideHandle = null;
+    }
+  }
+
+  function closeSuggestions() {
+    cancelHideSuggestions();
+    activeIndex = -1;
+    suggestionsEl.hidden = true;
+    tickerInput.setAttribute('aria-expanded', 'false');
+  }
 
   function hideSuggestions() {
     suggestions = [];
-    activeIndex = -1;
-    suggestionsEl.hidden = true;
     suggestionsEl.innerHTML = '';
-    tickerInput.setAttribute('aria-expanded', 'false');
+    closeSuggestions();
+  }
+
+  function scheduleSuggestionsClose() {
+    cancelHideSuggestions();
+    hideHandle = window.setTimeout(() => {
+      const activeElement = document.activeElement;
+      if (!activeElement || !searchShell.contains(activeElement)) {
+        closeSuggestions();
+      }
+    }, 180);
   }
 
   function selectSuggestion(item) {
@@ -189,6 +213,7 @@ function setTicker(ticker) {
       hideSuggestions();
       return;
     }
+    cancelHideSuggestions();
     suggestionsEl.hidden = false;
     tickerInput.setAttribute('aria-expanded', 'true');
     suggestionsEl.innerHTML = suggestions.map((item, index) => {
@@ -240,6 +265,17 @@ function setTicker(ticker) {
     debounceHandle = setTimeout(() => fetchSuggestions(tickerInput.value), 150);
   });
 
+  tickerInput.addEventListener('focus', function () {
+    cancelHideSuggestions();
+    if (suggestions.length) {
+      renderSuggestions();
+      return;
+    }
+    if (tickerInput.value.trim().length >= 2) {
+      fetchSuggestions(tickerInput.value);
+    }
+  });
+
   tickerInput.addEventListener('keydown', function (event) {
     if (!suggestions.length) {
       return;
@@ -288,7 +324,13 @@ function setTicker(ticker) {
   });
 
   tickerInput.addEventListener('blur', function () {
-    window.setTimeout(hideSuggestions, 120);
+    scheduleSuggestionsClose();
+  });
+
+  document.addEventListener('pointerdown', function (event) {
+    if (!searchShell.contains(event.target)) {
+      hideSuggestions();
+    }
   });
 
   form.addEventListener('submit', function () {

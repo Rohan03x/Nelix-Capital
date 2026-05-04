@@ -776,7 +776,156 @@ REGISTRY: dict[str, dict] = {
 SUPPORTED_TICKERS = list(REGISTRY.keys())
 
 
-def get_dashboard_data(ticker: str, overrides: dict | None = None) -> dict:
+def _build_unavailable_demo(ticker: str) -> dict:
+    data = copy.deepcopy(_NKE)
+    _symbol, _, exchange = ticker.partition(".")
+    data.update(
+        {
+            "ticker": ticker,
+            "company_name": ticker,
+            "exchange": exchange or "",
+            "currency": "USD",
+            "sector": "",
+            "industry": "",
+            "description": "Live market data is temporarily unavailable for this symbol.",
+            "price": 0.0,
+            "price_date": "",
+            "market_cap": 0.0,
+            "fifty_two_week_low": 0.0,
+            "fifty_two_week_high": 0.0,
+            "analyst_low": 0.0,
+            "analyst_high": 0.0,
+            "analyst_median": 0.0,
+            "intrinsic_value": 0.0,
+            "upside_pct": 0.0,
+            "recommendation": "Unavailable",
+            "recommendation_class": "amber",
+            "confidence_score": 10,
+            "data_freshness": "Unavailable",
+            "enterprise_value": 0.0,
+            "equity_value": 0.0,
+            "pv_ufcfs": 0.0,
+            "pv_terminal": 0.0,
+            "tv_pct": 0.0,
+            "diluted_shares": 1.0,
+            "terminal_ufcf": 0.0,
+            "wacc": 10.0,
+            "cost_of_equity": 10.0,
+            "cost_of_debt_pre": 0.0,
+            "cost_of_debt_post": 0.0,
+            "terminal_growth": 0.0,
+            "tax_rate": 0.0,
+            "beta": 1.0,
+            "risk_free_rate": 4.0,
+            "erp": 5.0,
+            "size_premium": 0.0,
+            "equity_weight": 100.0,
+            "debt_weight": 0.0,
+            "total_debt": 0.0,
+            "cash_equiv": 0.0,
+            "net_debt": 0.0,
+            "revenue_growth_near": 0.0,
+            "revenue_growth_term": 0.0,
+            "ebit_margin_base": 0.0,
+            "ebit_margin_target": 0.0,
+            "da_pct": 0.0,
+            "capex_pct": 0.0,
+            "sbc_pct": 0.0,
+            "dso": 0.0,
+            "dio": 0.0,
+            "dpo": 0.0,
+            "buyback_yield": 0.0,
+            "dividend_yield": 0.0,
+            "historical": {
+                "years": [],
+                "revenue": [],
+                "gross_margin": [],
+                "ebit_margin": [],
+                "net_income": [],
+                "fcf": [],
+                "capex": [],
+                "debt": [],
+                "roic": [],
+                "shares": [],
+            },
+            "forecast": [],
+            "analyst_view": {},
+            "peer_snapshot": [],
+            "scenarios": {
+                "base": {
+                    "label": "Base Case",
+                    "wacc": 10.0,
+                    "g": 0.0,
+                    "margin_target": 0.0,
+                    "rev_growth": 0.0,
+                    "iv": 0.0,
+                    "upside": 0.0,
+                    "ev": 0.0,
+                    "recommendation": "Unavailable",
+                },
+                "bull": {
+                    "label": "Bull Case",
+                    "wacc": 9.0,
+                    "g": 0.0,
+                    "margin_target": 0.0,
+                    "rev_growth": 0.0,
+                    "iv": 0.0,
+                    "upside": 0.0,
+                    "ev": 0.0,
+                    "recommendation": "Unavailable",
+                    "narrative": "Live market data is unavailable for this symbol.",
+                },
+                "bear": {
+                    "label": "Bear Case",
+                    "wacc": 11.0,
+                    "g": 0.0,
+                    "margin_target": 0.0,
+                    "rev_growth": 0.0,
+                    "iv": 0.0,
+                    "upside": 0.0,
+                    "ev": 0.0,
+                    "recommendation": "Unavailable",
+                    "narrative": "Live market data is unavailable for this symbol.",
+                },
+            },
+            "sensitivity": {
+                "wacc_labels": [],
+                "g_labels": [],
+                "iv_grid": [],
+                "base_wacc_idx": 0,
+                "base_g_idx": 0,
+            },
+            "confidence_breakdown": {
+                "total": 10,
+                "grade": "F",
+                "label": "Low Confidence",
+                "color": "red",
+                "dcf_suitable": False,
+                "suitability_note": "Live market data is unavailable for this symbol.",
+                "warnings": ["Live market data is unavailable for this symbol."],
+                "dimensions": [],
+            },
+            "reverse_dcf": None,
+            "ai_commentary": {},
+            "investment_memo": None,
+            "market_expectations": None,
+            "data_source": "unavailable-demo",
+            "is_demo": True,
+            "demo_note": (
+                f"Live data is temporarily unavailable for '{ticker}'. "
+                "Showing a generic placeholder instead of demo company data."
+            ),
+        }
+    )
+    return data
+
+
+def get_dashboard_data(
+    ticker: str,
+    overrides: dict | None = None,
+    *,
+    mutate_learning: bool = True,
+) -> dict:
     """Return dashboard data for *ticker*.
 
     Priority:
@@ -800,6 +949,21 @@ def get_dashboard_data(ticker: str, overrides: dict | None = None) -> dict:
     ticker = ticker.upper().strip()
     data = None
 
+    def _record_seed_health(payload: dict | None) -> None:
+        if not isinstance(payload, dict):
+            return
+        try:
+            from webapp.data.ticker_search import record_seed_symbol_health
+        except Exception:
+            return
+
+        source = str(payload.get("data_source") or "").strip()
+        if source == "unavailable-demo":
+            record_seed_symbol_health(ticker, available=False, source=source, note=str(payload.get("demo_note") or ""))
+            return
+        if source in {"eodhd", "yfinance", "fmp"} and not bool(payload.get("is_demo")):
+            record_seed_symbol_health(ticker, available=True, source=source)
+
     def _try_provider(name: str, builder, *args, **kwargs):
         try:
             return builder(*args, **kwargs)
@@ -809,7 +973,7 @@ def get_dashboard_data(ticker: str, overrides: dict | None = None) -> dict:
 
     # 1. Try EODHD first (best historical depth — 10–20+ years)
     if eodhd_available():
-        data = _try_provider("eodhd", eodhd_build, ticker, overrides=overrides)
+        data = _try_provider("eodhd", eodhd_build, ticker, overrides=overrides, mutate_learning=mutate_learning)
 
     # 2. Fallback to yfinance if EODHD failed
     if data is None and yf_available():
@@ -829,12 +993,7 @@ def get_dashboard_data(ticker: str, overrides: dict | None = None) -> dict:
 
     # 5. Final fallback: NKE demo for any unknown ticker
     if data is None:
-        data = copy.deepcopy(_NKE)
-        data["is_demo"] = True
-        data["demo_note"] = (
-            f"'{ticker}' not found. Showing Nike (NKE) demo data. "
-            "Check your internet connection for live data."
-        )
+        data = _build_unavailable_demo(ticker)
 
     if overrides:
         # Only apply override scaling for sample/yfinance/fmp data.
@@ -842,6 +1001,25 @@ def get_dashboard_data(ticker: str, overrides: dict | None = None) -> dict:
         # build_dashboard_data() before running the DCF, so we skip this.
         if data.get("data_source") != "eodhd":
             _apply_overrides(data, overrides)
+
+    if data.get("data_source") == "unavailable-demo":
+        data["confidence_score"] = 10
+        data["confidence_breakdown"] = {
+            "total": 10,
+            "grade": "F",
+            "label": "Low Confidence",
+            "color": "red",
+            "dcf_suitable": False,
+            "suitability_note": "Live market data is unavailable for this symbol.",
+            "warnings": ["Live market data is unavailable for this symbol."],
+            "dimensions": [],
+        }
+        data["reverse_dcf"] = None
+        data["ai_commentary"] = {}
+        data["investment_memo"] = None
+        data["market_expectations"] = None
+        _record_seed_health(data)
+        return data
 
     # ── Enrich with computed fields ───────────────────────────────────────────
     try:
@@ -895,6 +1073,8 @@ def get_dashboard_data(ticker: str, overrides: dict | None = None) -> dict:
     except Exception as exc:
         logger.warning("Market expectations failed for %s: %s", ticker, exc)
         data["market_expectations"] = None
+
+    _record_seed_health(data)
 
     return data
 

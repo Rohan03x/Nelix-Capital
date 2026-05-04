@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import tempfile
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
@@ -30,6 +31,7 @@ def _resolve_cache_dir() -> Path:
 _CACHE_DIR = _resolve_cache_dir()
 _SPACE_RE = re.compile(r"[^A-Z0-9]+")
 _SEARCH_TTL_SEC = 43_200
+_SEED_HEALTH_STALE_HOURS = 72
 
 
 def _normalise_search_text(value: str) -> str:
@@ -155,6 +157,79 @@ def _search_cache_key(query: str) -> str:
 def _exchange_cache_key(exchange: str) -> str:
     slug = re.sub(r"[^A-Z0-9]+", "_", str(exchange or "").upper()).strip("_")
     return f"exchange_symbols_{slug or 'UNKNOWN'}"
+
+
+def _seed_health_path() -> Path:
+    return _CACHE_DIR / "seed_symbol_health.json"
+
+
+def _parse_health_timestamp(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+@lru_cache(maxsize=1)
+def _recent_seed_symbol_health() -> dict[str, dict[str, object]]:
+    path = _seed_health_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+
+    stale_before = datetime.now(timezone.utc) - timedelta(hours=_SEED_HEALTH_STALE_HOURS)
+    recent: dict[str, dict[str, object]] = {}
+    for raw_ticker, raw_entry in (payload.items() if isinstance(payload, dict) else []):
+        if not isinstance(raw_entry, dict):
+            continue
+        checked_at = _parse_health_timestamp(raw_entry.get("checked_at"))
+        if checked_at is None or checked_at < stale_before:
+            continue
+        ticker = str(raw_ticker or "").strip().upper()
+        if not ticker:
+            continue
+        recent[ticker] = dict(raw_entry)
+    return recent
+
+
+def record_seed_symbol_health(ticker: str, *, available: bool, source: str = "", note: str = "") -> None:
+    ticker_text = str(ticker or "").strip().upper()
+    if not ticker_text:
+        return
+
+    path = _seed_health_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    payload[ticker_text] = {
+        "available": bool(available),
+        "source": str(source or "").strip(),
+        "note": str(note or "").strip(),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True), encoding="utf-8")
+    except OSError:
+        return
+    _recent_seed_symbol_health.cache_clear()
+
+
+def _seed_candidate_is_healthy(ticker: str) -> bool:
+    entry = _recent_seed_symbol_health().get(str(ticker or "").strip().upper())
+    if not entry:
+        return True
+    return bool(entry.get("available", True))
 
 
 def _live_search_items(query: str) -> tuple[dict[str, object], ...]:
@@ -354,6 +429,7 @@ def _seedable_issuer_key(item: dict[str, object], hints: dict[str, dict[str, str
 def invalidate_ticker_search_index() -> None:
     _ticker_search_index.cache_clear()
     _cached_primary_listing_hints.cache_clear()
+    _recent_seed_symbol_health.cache_clear()
 
 
 def seedable_symbol_items(limit: int | None = None, *, common_stock_only: bool = True) -> list[dict[str, object]]:
@@ -379,12 +455,15 @@ def seedable_symbol_items(limit: int | None = None, *, common_stock_only: bool =
     selected: list[dict[str, object]] = []
     seen: set[str] = set()
     seen_issuers: set[str] = set()
+    seen_companies: set[str] = set()
     available_tickers = {str(item.get("ticker") or "").strip().upper() for item in ranked_items}
     primary_hints = _cached_primary_listing_hints()
     max_items = int(limit) if limit is not None and int(limit) > 0 else None
     for item in ranked_items:
         ticker = str(item.get("ticker") or "").strip().upper()
         if not ticker or ticker in seen:
+            continue
+        if not _seed_candidate_is_healthy(ticker):
             continue
         instrument_type = str(item.get("instrument_type") or "").strip().lower()
         if common_stock_only and instrument_type not in allowed_types:
@@ -399,8 +478,13 @@ def seedable_symbol_items(limit: int | None = None, *, common_stock_only: bool =
         issuer_key = _seedable_issuer_key(item, primary_hints)
         if issuer_key in seen_issuers:
             continue
+        company_key = str(item.get("name_key") or "").strip()
+        if company_key and company_key in seen_companies:
+            continue
         seen.add(ticker)
         seen_issuers.add(issuer_key)
+        if company_key:
+            seen_companies.add(company_key)
         selected.append(dict(item))
         if max_items is not None and len(selected) >= max_items:
             break
@@ -513,6 +597,28 @@ def _match_score(query_key: str, item: dict[str, object]) -> tuple[int, int, str
     return None
 
 
+def _instrument_priority(item: dict[str, object]) -> int:
+    instrument_type = str(item.get("instrument_type") or "").strip().lower()
+    if instrument_type in {"common stock", "common shares", "ordinary shares"}:
+        return 0
+    if instrument_type in {"depositary receipt", "adr"}:
+        return 1
+    if not instrument_type:
+        return 2
+    return 3
+
+
+def _search_source_priority(item: dict[str, object]) -> int:
+    source = str(item.get("source") or "").strip().lower()
+    return {
+        "search-cache": 0,
+        "exchange-cache": 1,
+        "cache": 2,
+        "live": 3,
+        "supported": 4,
+    }.get(source, 9)
+
+
 def search_tickers(query: str, limit: int = 12, exchange: str = "auto") -> list[dict[str, str]]:
     query_key = _normalise_search_text(query)
     if not query_key:
@@ -535,7 +641,10 @@ def search_tickers(query: str, limit: int = 12, exchange: str = "auto") -> list[
                 exchange_penalty = 0 if item_exchange in {"TSE", "T"} else 1
             else:
                 exchange_penalty = 0 if item_exchange == exchange_key else 1
-        matches.append(((score[0], exchange_penalty, score[1], score[2]), item))
+        instrument_priority = _instrument_priority(item)
+        primary_penalty = 0 if bool(item.get("is_primary")) else 1
+        source_priority = _search_source_priority(item)
+        matches.append(((score[0], exchange_penalty, instrument_priority, primary_penalty, source_priority, score[1], score[2]), item))
 
     matches.sort(key=lambda pair: pair[0])
 

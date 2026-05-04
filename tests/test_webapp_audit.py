@@ -760,6 +760,103 @@ def test_eodhd_scenarios_expand_with_learning_uncertainty(monkeypatch):
     assert wide["scenarios"]["bull"]["margin_target"] - wide["scenarios"]["base"]["margin_target"] > narrow["scenarios"]["bull"]["margin_target"] - narrow["scenarios"]["base"]["margin_target"]
 
 
+def test_eodhd_read_only_build_skips_learning_writes(monkeypatch):
+    monkeypatch.setattr(eodhd_client, "_fetch_price", lambda _code: {"close": 100.0})
+    monkeypatch.setattr(eodhd_client, "_fetch_fundamentals", lambda _code: _mock_fundamentals())
+    monkeypatch.setattr(eodhd_client, "_get_risk_free_rate", lambda: 4.0)
+    monkeypatch.setattr(eodhd_client, "_PEERS_AVAILABLE", False)
+
+    def _knowledge_payload() -> dict:
+        return {
+            "summary": "Weighted knowledge model active.",
+            "global_learning": {"enabled": False, "scope": None, "cohort_size": 0, "sector_span": 0, "confidence": 0.0},
+            "assumption_weights": {"revenue_growth_near": {"source": "Knowledge model: test"}},
+            "layered_learning": {"uncertainty": {"scenario_width_multiplier": 1.0}},
+            "explainability": {
+                "headline": "Read-only dashboard build.",
+                "company_memory": {"weight_pct": 60, "history_window_years": 5, "review_due": False},
+                "sector_memory": {"weight_pct": 25, "records": 5, "confidence": 0.6},
+                "cohort_memory": {"weight_pct": 15, "records": 5, "confidence": 0.55},
+                "global_brain": {"enabled": False, "scope": None, "cohort_size": 0, "sector_span": 0, "confidence": 0.0},
+                "analog_evidence": {"enabled": False, "match_count": 0, "confidence": 0.0, "pattern_score": 0.0},
+                "relationship_graph": {"enabled": False, "node_count": 0, "edge_count": 0, "sector_span": 0, "confidence": 0.0},
+                "forecast_layers": [],
+                "data_gaps": [],
+            },
+            "memory_hierarchy": {"relational": {"score": 0}, "procedural": {"score": 50}},
+            "calibration_cohort_size": 5,
+            "scenario_width_multiplier": 1.0,
+            "revenue_growth_near": 7.0,
+            "terminal_growth": 2.5,
+            "ebit_margin_target": 12.0,
+            "beta": 1.0,
+            "wacc": 9.0,
+            "tax_rate_pct": 20.0,
+            "da_pct": 3.0,
+            "capex_pct": 3.5,
+            "sbc_pct": 0.5,
+            "dso": 35.0,
+            "dio": 50.0,
+            "dpo": 40.0,
+            "confidence_model": {
+                "valuation_confidence": {"score": 0.57, "score_100": 57, "expected_error_pct": {"p50": 10.0, "p75": 14.0, "p90": 18.0}},
+                "assumption_confidence": {"score": 0.61, "score_100": 61, "expected_error_index": 4.2},
+                "ranking_signal": 0.57,
+                "dashboard_breakdown": {
+                    "total": 57,
+                    "grade": "C",
+                    "label": "Guarded Confidence",
+                    "color": "amber",
+                    "dcf_suitable": True,
+                    "suitability_note": "",
+                    "warnings": [],
+                    "dimensions": [],
+                },
+            },
+        }
+
+    monkeypatch.setattr(knowledge_model_module, "refine_live_assumptions", lambda **_: _knowledge_payload())
+    monkeypatch.setattr(eodhd_client, "_global_universe_summary", lambda _store: {"enabled": True, "tracked_symbols": 12})
+    monkeypatch.setattr(eodhd_client, "_top_learned_peer_edges", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        eodhd_client,
+        "_register_global_universe_symbols",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("read-only build should not register symbols")),
+    )
+    monkeypatch.setattr(
+        eodhd_client,
+        "_record_peer_learning_signals",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("read-only build should not record peer signals")),
+    )
+    monkeypatch.setattr(
+        eodhd_client,
+        "_auto_bootstrap_current_ticker",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("read-only build should not bootstrap")),
+    )
+    monkeypatch.setattr(
+        eodhd_client,
+        "_backfill_learning_actuals",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("read-only build should not backfill")),
+    )
+    monkeypatch.setattr(
+        eodhd_client,
+        "_run_learning_maintenance",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("read-only build should not run maintenance")),
+    )
+    monkeypatch.setattr(
+        eodhd_client,
+        "_persist_learning_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("read-only build should not persist snapshots")),
+    )
+
+    data = eodhd_client.build_dashboard_data("TEST", mutate_learning=False)
+
+    assert data["knowledge_model"]["learning_bootstrap"]["reason"] == "read-only"
+    assert data["knowledge_model"]["learning_maintenance"]["reason"] == "read-only"
+    assert data["knowledge_model"]["learning_persistence"]["reason"] == "read-only"
+    assert data["knowledge_model"]["global_universe"]["tracked_symbols"] == 12
+
+
 def test_eodhd_high_margin_scenarios_stay_ordered(monkeypatch):
     monkeypatch.setattr(eodhd_client, "_fetch_price", lambda _code: {"close": 100.0})
     monkeypatch.setattr(eodhd_client, "_fetch_fundamentals", lambda _code: _mock_high_margin_fundamentals())

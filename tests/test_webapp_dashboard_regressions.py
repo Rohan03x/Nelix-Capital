@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 from io import BytesIO
 
@@ -378,6 +379,59 @@ def test_get_dashboard_data_survives_enrichment_failures(monkeypatch) -> None:
     assert data["market_expectations"] is None
 
 
+def test_get_dashboard_data_unknown_symbol_uses_generic_unavailable_fallback(monkeypatch) -> None:
+    monkeypatch.setattr(eodhd_client, "is_available", lambda: False)
+    monkeypatch.setattr(yfinance_client, "is_available", lambda: False)
+    monkeypatch.setattr(fmp_client, "is_available", lambda: False)
+
+    data = samples_module.get_dashboard_data("DIH.VN")
+
+    assert data["is_demo"] is True
+    assert data["data_source"] == "unavailable-demo"
+    assert data["ticker"] == "DIH.VN"
+    assert data["company_name"] == "DIH.VN"
+    assert data["confidence_score"] == 10
+    assert data["confidence_breakdown"]["label"] == "Low Confidence"
+    assert data["confidence_breakdown"]["dcf_suitable"] is False
+    assert data["scenarios"]["base"]["recommendation"] == "Unavailable"
+
+
+def test_eodhd_build_dashboard_data_accepts_mutate_learning_keyword() -> None:
+    parameter = inspect.signature(eodhd_client.build_dashboard_data).parameters["mutate_learning"]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is True
+
+
+def test_get_dashboard_data_records_seed_health_for_unavailable_symbol(monkeypatch) -> None:
+    recorded: list[dict[str, object]] = []
+
+    monkeypatch.setattr(eodhd_client, "is_available", lambda: False)
+    monkeypatch.setattr(yfinance_client, "is_available", lambda: False)
+    monkeypatch.setattr(fmp_client, "is_available", lambda: False)
+
+    import webapp.data.ticker_search as ticker_search_module
+
+    monkeypatch.setattr(
+        ticker_search_module,
+        "record_seed_symbol_health",
+        lambda ticker, *, available, source="", note="": recorded.append(
+            {"ticker": ticker, "available": available, "source": source, "note": note}
+        ),
+    )
+
+    samples_module.get_dashboard_data("DIH.VN")
+
+    assert recorded == [
+        {
+            "ticker": "DIH.VN",
+            "available": False,
+            "source": "unavailable-demo",
+            "note": "Live data is temporarily unavailable for 'DIH.VN'. Showing a generic placeholder instead of demo company data.",
+        }
+    ]
+
+
 def test_ebit_margin_target_respects_recent_profitable_regime_shift() -> None:
     target, source = _derive_ebit_margin_target(
         5.9,
@@ -597,3 +651,253 @@ def test_refine_live_assumptions_caps_bullish_memory_for_declining_structural_br
     assert result["beta"] >= 1.05
     assert "safeguard applied" in result["assumption_weights"]["ebit_margin_target"]["source"]
     assert "positive learned memory is capped" in result["assumption_weights"]["wacc"]["warn"]
+
+
+def test_refine_live_assumptions_caps_bullish_memory_when_margin_normalisation_is_active(monkeypatch) -> None:
+    class _Diagnostics:
+        def to_dict(self):
+            return {}
+
+    class _Calibrated:
+        revenue_growth_adj = 0.02
+        ebit_margin_adj = 0.16
+        beta_adj = -0.02
+        wacc_adj = -0.005
+        terminal_growth_adj = 0.003
+        calibration_confidence = 0.9
+        calibration_cohort_size = 18
+        scenario_width_multiplier = 1.6
+        calibration_diagnostics = _Diagnostics()
+
+    monkeypatch.setattr(knowledge_model_module, "calibrate", lambda *args, **kwargs: _Calibrated())
+    monkeypatch.setattr(
+        knowledge_model_module,
+        "_global_cross_symbol_overlay",
+        lambda *args, **kwargs: {
+            "enabled": True,
+            "scope": "regime",
+            "cohort_size": 12,
+            "sector_span": 4,
+            "confidence": 0.8,
+            "regime_filter": "matched",
+            "revenue_growth_adj_pp": 1.0,
+            "ebit_margin_adj_pp": 4.0,
+            "wacc_adj_pp": -0.4,
+            "terminal_growth_adj_pp": 0.2,
+            "beta_adj": -0.05,
+            "note": "Global cross-symbol learning active.",
+        },
+    )
+    monkeypatch.setattr(
+        knowledge_model_module,
+        "build_relationship_graph",
+        lambda **kwargs: {
+            "enabled": True,
+            "overlay": {
+                "revenue_growth_adj_pp": 1.0,
+                "ebit_margin_adj_pp": 3.0,
+                "wacc_adj_pp": -0.3,
+                "terminal_growth_adj_pp": 0.2,
+                "beta_adj": -0.03,
+            },
+            "node_count": 4,
+            "note": "Relationship graph learning active.",
+        },
+    )
+    monkeypatch.setattr(knowledge_model_module, "_load_analog_candidates", lambda limit=None: [])
+    monkeypatch.setattr(
+        knowledge_model_module,
+        "_build_layered_learning_snapshot",
+        lambda **kwargs: {
+            "learned_metrics": {"reinvestment_confidence": 0.0},
+            "uncertainty": {"scenario_width_multiplier": 1.8, "effective_confidence": 0.62, "weak_evidence": False},
+            "structural_break": {"detected": False, "score": 0.25, "note": None},
+            "layer_mix": {},
+        },
+    )
+    monkeypatch.setattr(
+        knowledge_model_module,
+        "match_pattern_library",
+        lambda features: ("VOLATILE_MARGIN", 0.85, {"revenue_growth_adj": 0.01, "ebit_margin_adj": 0.05}),
+    )
+    monkeypatch.setattr(knowledge_model_module, "_build_learning_explainability", lambda **kwargs: {"summary": "ok"})
+    monkeypatch.setattr(
+        knowledge_model_module,
+        "build_ranked_confidence_model",
+        lambda payload: {
+            "summary": "ok",
+            "dominant_risk": "margin",
+            "assumption_confidence": {"score": 0.58},
+            "valuation_confidence": {"score": 0.54, "expected_error_pct": {"p50": 19.0}},
+            "components": [],
+            "ranking_signal": 0.41,
+        },
+    )
+    monkeypatch.setattr(knowledge_model_module, "_build_memory_hierarchy", lambda **kwargs: {"items": []})
+
+    result = knowledge_model_module.refine_live_assumptions(
+        ticker="VOL",
+        sector="Industrials",
+        industry="Electrical Equipment & Parts",
+        market_cap=9_000.0,
+        revenues=[5200, 5400, 5600, 5750, 5900, 6100, 6250, 6400, 6550, 6700],
+        ebit_margins=[4.0, 18.0, 6.0, 16.0, 7.0, 20.0, 8.0, 18.0, 7.5, 9.0],
+        gross_margin_base_pct=36.0,
+        revenue_growth_near=3.0,
+        terminal_growth=2.5,
+        ebit_margin_base_pct=9.0,
+        ebit_margin_target=16.0,
+        beta=1.1,
+        wacc=8.0,
+        rf_rate=4.2,
+        erp=4.8,
+        kd_post=3.6,
+        e_wt=70.0,
+        d_wt=30.0,
+        total_assets=8_500.0,
+        total_debt=1_700.0,
+        revenue_base=6700.0,
+        operating_cf=620.0,
+        fcf=399.0,
+        capex_pct=2.4,
+        capexes=[150, 155, 160, 165, 170, 175, 180, 185, 190, 195],
+        da_pct=2.0,
+        das=[130, 132, 135, 138, 140, 142, 145, 147, 148, 150],
+        sbc_pct=0.0,
+        sbcs=[0.0] * 10,
+        tax_rate_pct=24.0,
+        pretax_incomes=[300, 320, 310, 290, 275, 260, 245, 230, 220, 210],
+        tax_provisions=[72, 77, 74, 69, 66, 63, 59, 56, 53, 50],
+        dso=48.0,
+        dio=62.0,
+        dpo=44.0,
+        observations=[],
+    )
+
+    assert result["margin_guardrail"]["applied"] is True
+    assert result["ebit_margin_target"] <= 12.7
+    assert "margin-volatility safeguard applied" in result["assumption_weights"]["ebit_margin_target"]["source"]
+    assert "normalised anchor" in result["assumption_weights"]["ebit_margin_target"]["warn"]
+
+
+def test_refine_live_assumptions_scales_positive_margin_memory_when_evidence_is_thin(monkeypatch) -> None:
+    class _Diagnostics:
+        def to_dict(self):
+            return {}
+
+    class _Calibrated:
+        revenue_growth_adj = 0.01
+        ebit_margin_adj = 0.22
+        beta_adj = -0.02
+        wacc_adj = -0.005
+        terminal_growth_adj = 0.002
+        calibration_confidence = 0.85
+        calibration_cohort_size = 4
+        scenario_width_multiplier = 1.2
+        calibration_diagnostics = _Diagnostics()
+
+    monkeypatch.setattr(knowledge_model_module, "calibrate", lambda *args, **kwargs: _Calibrated())
+    monkeypatch.setattr(
+        knowledge_model_module,
+        "_global_cross_symbol_overlay",
+        lambda *args, **kwargs: {
+            "enabled": True,
+            "scope": "regime",
+            "cohort_size": 3,
+            "sector_span": 2,
+            "confidence": 0.4,
+            "regime_filter": "matched",
+            "revenue_growth_adj_pp": 0.8,
+            "ebit_margin_adj_pp": 4.0,
+            "wacc_adj_pp": -0.2,
+            "terminal_growth_adj_pp": 0.1,
+            "beta_adj": -0.04,
+            "note": "Global cross-symbol learning active.",
+        },
+    )
+    monkeypatch.setattr(
+        knowledge_model_module,
+        "build_relationship_graph",
+        lambda **kwargs: {
+            "enabled": True,
+            "overlay": {
+                "revenue_growth_adj_pp": 0.6,
+                "ebit_margin_adj_pp": 3.0,
+                "wacc_adj_pp": -0.1,
+                "terminal_growth_adj_pp": 0.1,
+                "beta_adj": -0.02,
+            },
+            "node_count": 1,
+            "note": "Relationship graph learning active.",
+        },
+    )
+    monkeypatch.setattr(knowledge_model_module, "_load_analog_candidates", lambda limit=None: [])
+    monkeypatch.setattr(
+        knowledge_model_module,
+        "_build_layered_learning_snapshot",
+        lambda **kwargs: {
+            "learned_metrics": {"reinvestment_confidence": 0.0},
+            "uncertainty": {"scenario_width_multiplier": 1.2, "effective_confidence": 0.42, "weak_evidence": True},
+            "structural_break": {"detected": False, "score": 0.1, "note": None},
+            "layer_mix": {},
+        },
+    )
+    monkeypatch.setattr(knowledge_model_module, "match_pattern_library", lambda features: (None, 0.0, {}))
+    monkeypatch.setattr(knowledge_model_module, "_build_learning_explainability", lambda **kwargs: {"summary": "ok"})
+    monkeypatch.setattr(
+        knowledge_model_module,
+        "build_ranked_confidence_model",
+        lambda payload: {
+            "summary": "ok",
+            "dominant_risk": "margin",
+            "assumption_confidence": {"score": 0.4},
+            "valuation_confidence": {"score": 0.36, "expected_error_pct": {"p50": 24.0}},
+            "components": [],
+            "ranking_signal": 0.25,
+        },
+    )
+    monkeypatch.setattr(knowledge_model_module, "_build_memory_hierarchy", lambda **kwargs: {"items": []})
+
+    result = knowledge_model_module.refine_live_assumptions(
+        ticker="THIN",
+        sector="Industrials",
+        industry="Specialty Industrial Machinery",
+        market_cap=4_000.0,
+        revenues=[1000, 1040, 1080, 1120, 1160, 1180, 1200, 1210, 1220, 1230],
+        ebit_margins=[6.0, 6.5, 7.0, 7.4, 7.8, 8.1, 8.3, 8.5, 8.6, 8.8],
+        gross_margin_base_pct=28.0,
+        revenue_growth_near=4.0,
+        terminal_growth=2.5,
+        ebit_margin_base_pct=8.8,
+        ebit_margin_target=10.0,
+        beta=1.1,
+        wacc=8.5,
+        rf_rate=4.2,
+        erp=4.8,
+        kd_post=3.6,
+        e_wt=70.0,
+        d_wt=30.0,
+        total_assets=2_000.0,
+        total_debt=400.0,
+        revenue_base=1230.0,
+        operating_cf=120.0,
+        fcf=80.0,
+        capex_pct=3.0,
+        capexes=[28, 29, 30, 31, 32, 33, 34, 35, 36, 37],
+        da_pct=2.0,
+        das=[18, 18, 19, 19, 20, 20, 21, 21, 22, 22],
+        sbc_pct=0.0,
+        sbcs=[0.0] * 10,
+        tax_rate_pct=24.0,
+        pretax_incomes=[70, 72, 75, 78, 81, 84, 86, 88, 90, 92],
+        tax_provisions=[17, 17, 18, 19, 19, 20, 21, 21, 22, 22],
+        dso=45.0,
+        dio=55.0,
+        dpo=35.0,
+        observations=[],
+    )
+
+    assert result["thin_evidence_margin_guardrail"]["applied"] is True
+    assert result["assumption_weights"]["ebit_margin_target"]["learned_value"] < 4.0
+    assert "thin-evidence margin gate applied" in result["assumption_weights"]["ebit_margin_target"]["source"]
+    assert "Thin-evidence margin gate applied" in result["assumption_weights"]["ebit_margin_target"]["warn"]

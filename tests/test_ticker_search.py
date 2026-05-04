@@ -37,6 +37,69 @@ def test_search_tickers_keeps_same_code_across_multiple_exchanges(monkeypatch):
     assert "RIO.ASX" in tickers
 
 
+def test_search_tickers_prefers_primary_common_stock_before_aliases_and_non_stocks(monkeypatch):
+    monkeypatch.setattr(
+        ticker_search,
+        "_search_candidates",
+        lambda _query: [
+            ticker_search._build_search_item(
+                ticker="GOOGL.SN",
+                code="GOOGL",
+                name="Alphabet Inc. Cl A",
+                exchange="SN",
+                country="Chile",
+                source="live",
+                instrument_type="Common Stock",
+            ),
+            ticker_search._build_search_item(
+                ticker="GOOGL.MX",
+                code="GOOGL",
+                name="Alphabet Inc Class A",
+                exchange="MX",
+                country="Mexico",
+                source="live",
+                instrument_type="Common Stock",
+            ),
+            ticker_search._build_search_item(
+                ticker="GOOGL.US",
+                code="GOOGL",
+                name="Alphabet Inc Class A",
+                exchange="US",
+                country="USA",
+                source="live",
+                instrument_type="Common Stock",
+                is_primary=True,
+                primary_ticker="GOOGL.US",
+            ),
+            ticker_search._build_search_item(
+                ticker="GOOGL.NASDAQ",
+                code="GOOGL",
+                name="Alphabet Inc Class A",
+                exchange="NASDAQ",
+                country="USA",
+                source="exchange-cache",
+                instrument_type="Common Stock",
+            ),
+            ticker_search._build_search_item(
+                ticker="GOOGLX-USD.CC",
+                code="GOOGLX-USD",
+                name="Alphabet tokenized stock (xStock)",
+                exchange="CC",
+                country="Unknown",
+                source="live",
+                instrument_type="Currency",
+            ),
+        ],
+    )
+
+    results = ticker_search.search_tickers("GOOGL", limit=5)
+    tickers = [item["ticker"] for item in results]
+
+    assert tickers[:2] == ["GOOGL.US", "GOOGL.NASDAQ"]
+    assert set(tickers[2:4]) == {"GOOGL.MX", "GOOGL.SN"}
+    assert tickers[-1] == "GOOGLX-USD.CC"
+
+
 def test_seedable_tickers_prefers_primary_common_stock(monkeypatch):
     monkeypatch.setattr(
         ticker_search,
@@ -139,6 +202,91 @@ def test_seedable_tickers_skips_cached_alias_when_primary_listing_exists(monkeyp
     tickers = ticker_search.seedable_tickers(limit=5, common_stock_only=True)
 
     assert tickers == ["AAPL.US", "BHP.AU"]
+
+
+def test_seedable_tickers_dedupes_same_company_across_cross_listings(monkeypatch):
+    monkeypatch.setattr(
+        ticker_search,
+        "_ticker_search_index",
+        lambda: (
+            ticker_search._build_search_item(
+                ticker="BHP.LSE",
+                code="BHP",
+                name="BHP Group Limited",
+                exchange="LSE",
+                country="United Kingdom",
+                source="search-cache",
+                instrument_type="Common Stock",
+                is_primary=True,
+                isin="GB00BH0P3Z91",
+            ),
+            ticker_search._build_search_item(
+                ticker="BHP.DU",
+                code="BHP",
+                name="BHP Group Limited",
+                exchange="DU",
+                country="Germany",
+                source="cache",
+                instrument_type="Common Stock",
+                is_primary=True,
+                isin="US0886061086",
+            ),
+            ticker_search._build_search_item(
+                ticker="AAPL.US",
+                code="AAPL",
+                name="Apple Inc",
+                exchange="US",
+                country="USA",
+                source="cache",
+                instrument_type="Common Stock",
+                is_primary=True,
+            ),
+        ),
+    )
+    monkeypatch.setattr(ticker_search, "_cached_primary_listing_hints", lambda: {})
+
+    tickers = ticker_search.seedable_tickers(limit=5, common_stock_only=True)
+
+    assert tickers == ["BHP.LSE", "AAPL.US"]
+
+
+def test_seedable_tickers_skips_recently_unavailable_symbols(monkeypatch):
+    monkeypatch.setattr(
+        ticker_search,
+        "_ticker_search_index",
+        lambda: (
+            ticker_search._build_search_item(
+                ticker="DIH.VN",
+                code="DIH",
+                name="Development Investment Construction Hoi An JSC",
+                exchange="VN",
+                country="Vietnam",
+                source="search-cache",
+                instrument_type="Common Stock",
+                is_primary=True,
+            ),
+            ticker_search._build_search_item(
+                ticker="AAPL.US",
+                code="AAPL",
+                name="Apple Inc",
+                exchange="US",
+                country="USA",
+                source="cache",
+                instrument_type="Common Stock",
+                is_primary=True,
+            ),
+        ),
+    )
+    monkeypatch.setattr(ticker_search, "_cached_primary_listing_hints", lambda: {})
+    monkeypatch.setattr(
+        ticker_search,
+        "_recent_seed_symbol_health",
+        lambda: {"DIH.VN": {"available": False, "source": "unavailable-demo"}},
+    )
+
+    tickers = ticker_search.seedable_tickers(limit=5, common_stock_only=True)
+
+    assert tickers == ["AAPL.US"]
 
 
 def test_refresh_exchange_symbol_cache_fetches_and_invalidates_index(monkeypatch):

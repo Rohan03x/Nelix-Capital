@@ -1375,7 +1375,12 @@ def _eodhd_code(ticker: str) -> str:
     return normalize_requested_ticker(ticker)
 
 
-def build_dashboard_data(ticker: str, overrides: dict | None = None) -> dict | None:  # noqa: C901
+def build_dashboard_data(
+    ticker: str,
+    overrides: dict | None = None,
+    *,
+    mutate_learning: bool = True,
+) -> dict | None:  # noqa: C901
     """
     Fetch live data from EODHD and run a full 7-year DCF.
     Returns the complete dashboard dict (same schema as yfinance_client),
@@ -1385,6 +1390,9 @@ def build_dashboard_data(ticker: str, overrides: dict | None = None) -> dict | N
     auto-computed assumptions before the DCF is run.  Recognised keys:
         wacc, g (terminal growth), revenue_growth_near, ebit_margin_target,
         da_pct, capex_pct, sbc_pct, tax_rate, beta
+
+    *mutate_learning* controls whether the live request is allowed to write
+    bootstrap, peer-learning, and persistence side effects.
     """
     if not _REQUESTS_OK:
         return None
@@ -2464,29 +2472,36 @@ def build_dashboard_data(ticker: str, overrides: dict | None = None) -> dict | N
             for peer in _peers
             if str(peer.get("ticker") or peer.get("symbol") or "").strip()
         ]
-        _register_global_universe_symbols(
-            universe_store,
-            ticker=ticker,
-            company_name=company_name,
-            exchange=exchange,
-            country=str(gen.get("CountryName") or gen.get("CountryISO") or ""),
-            sector=sector,
-            industry=industry,
-            knowledge_model=knowledge_model_payload,
-            peer_items=peer_candidates,
-        )
-        peer_relationships = _record_peer_learning_signals(
-            discovery_store,
-            ticker=ticker,
-            company_name=company_name,
-            exchange=exchange,
-            country=str(gen.get("CountryName") or gen.get("CountryISO") or ""),
-            sector=sector,
-            industry=industry,
-            peer_items=peer_candidates,
-        )
+        if mutate_learning:
+            _register_global_universe_symbols(
+                universe_store,
+                ticker=ticker,
+                company_name=company_name,
+                exchange=exchange,
+                country=str(gen.get("CountryName") or gen.get("CountryISO") or ""),
+                sector=sector,
+                industry=industry,
+                knowledge_model=knowledge_model_payload,
+                peer_items=peer_candidates,
+            )
+            peer_relationships = _record_peer_learning_signals(
+                discovery_store,
+                ticker=ticker,
+                company_name=company_name,
+                exchange=exchange,
+                country=str(gen.get("CountryName") or gen.get("CountryISO") or ""),
+                sector=sector,
+                industry=industry,
+                peer_items=peer_candidates,
+            )
+        else:
+            peer_relationships = []
         _merge_peer_learning_relationships(_peers, peer_relationships)
-        learning_bootstrap = _auto_bootstrap_current_ticker(ticker, fund, universe_store)
+        learning_bootstrap = (
+            _auto_bootstrap_current_ticker(ticker, fund, universe_store)
+            if mutate_learning
+            else {"executed": False, "reason": "mutate_learning disabled"}
+        )
         global_universe = _global_universe_summary(universe_store)
         learned_peer_edges = _top_learned_peer_edges(discovery_store, ticker, limit=5)
 
@@ -2494,9 +2509,15 @@ def build_dashboard_data(ticker: str, overrides: dict | None = None) -> dict | N
             knowledge_model_payload["learning_bootstrap"] = learning_bootstrap
             knowledge_model_payload["global_universe"] = global_universe
             knowledge_model_payload["learned_peer_edges"] = learned_peer_edges
-            knowledge_model_payload["learning_backfill"] = _backfill_learning_actuals(ticker, fund)
-            knowledge_model_payload["learning_maintenance"] = _run_learning_maintenance(ticker, fund)
-            knowledge_model_payload["learning_persistence"] = _persist_learning_snapshot(_result, knowledge_model_payload)
+            if mutate_learning:
+                knowledge_model_payload["learning_backfill"] = _backfill_learning_actuals(ticker, fund)
+                knowledge_model_payload["learning_maintenance"] = _run_learning_maintenance(ticker, fund)
+                knowledge_model_payload["learning_persistence"] = _persist_learning_snapshot(_result, knowledge_model_payload)
+            else:
+                disabled_note = {"executed": False, "reason": "mutate_learning disabled"}
+                knowledge_model_payload["learning_backfill"] = disabled_note
+                knowledge_model_payload["learning_maintenance"] = disabled_note
+                knowledge_model_payload["learning_persistence"] = disabled_note
             _augment_learning_explainability(knowledge_model_payload, sector=sector, industry=industry)
             confidence_model = dict(knowledge_model_payload.get("confidence_model") or {})
             dashboard_breakdown = dict(confidence_model.get("dashboard_breakdown") or {})

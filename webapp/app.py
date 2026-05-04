@@ -123,19 +123,25 @@ def _fallback_dashboard_data(ticker: str, reason: str | None = None) -> dict:
     return fallback
 
 
-def _safe_dashboard_data(ticker: str, overrides: dict | None = None) -> dict:
+def _safe_dashboard_data(
+    ticker: str,
+    overrides: dict | None = None,
+    *,
+    mutate_learning: bool = True,
+) -> dict:
     _sync_external_learning_state()
     try:
         if overrides is None:
-            data = get_dashboard_data(ticker)
+            data = get_dashboard_data(ticker, mutate_learning=mutate_learning)
         else:
             try:
-                data = get_dashboard_data(ticker, overrides=overrides)
+                data = get_dashboard_data(ticker, overrides=overrides, mutate_learning=mutate_learning)
             except TypeError as exc:
-                if "unexpected keyword argument 'overrides'" not in str(exc):
+                if "unexpected keyword argument" not in str(exc):
                     raise
                 data = get_dashboard_data(ticker)
-        _persist_external_learning_state()
+        if mutate_learning:
+            _persist_external_learning_state()
         return data
     except Exception as exc:
         logger.exception("Dashboard data failed for %s", ticker)
@@ -190,7 +196,7 @@ def loading(ticker):
 @app.route("/dashboard/<ticker>")
 def dashboard(ticker):
     ticker = ticker.upper()
-    data   = _safe_dashboard_data(ticker)
+    data   = _safe_dashboard_data(ticker, mutate_learning=False)
     return render_template("dashboard.html", data=data)
 
 
@@ -198,7 +204,7 @@ def dashboard(ticker):
 
 @app.route("/api/dashboard/<ticker>")
 def api_dashboard(ticker):
-    data = _safe_dashboard_data(ticker.upper())
+    data = _safe_dashboard_data(ticker.upper(), mutate_learning=False)
     return jsonify(_dashboard_api_payload(data))
 
 
@@ -333,7 +339,7 @@ def api_recompute():
 
 @app.route("/api/confidence/<ticker>")
 def api_confidence(ticker):
-    data = _safe_dashboard_data(ticker.upper())
+    data = _safe_dashboard_data(ticker.upper(), mutate_learning=False)
     return jsonify(data.get("confidence_breakdown") or {"score": data.get("confidence_score", 50)})
 
 

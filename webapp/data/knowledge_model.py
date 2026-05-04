@@ -1195,6 +1195,87 @@ def _declining_regime_guardrail(
     }
 
 
+def _margin_volatility_guardrail(
+    *,
+    margin_normalisation: dict[str, Any],
+    company_margin_target_pct: float,
+    ebit_margin_base_pct: float,
+    refined_margin_target: float,
+) -> dict[str, Any]:
+    if not margin_normalisation.get("applied"):
+        return {
+            "applied": False,
+            "note": None,
+        }
+
+    scenario_width_multiplier = float(margin_normalisation.get("scenario_width_multiplier") or 1.0)
+    allowed_uplift = 0.5 if scenario_width_multiplier > 1.5 else 1.0
+    normalized_anchor_pct = round(
+        max(
+            float(margin_normalisation.get("normalized_margin_pct") or company_margin_target_pct),
+            ebit_margin_base_pct,
+        ),
+        1,
+    )
+    max_margin_target_pct = round(normalized_anchor_pct + allowed_uplift, 1)
+    if refined_margin_target <= max_margin_target_pct:
+        return {
+            "applied": False,
+            "note": None,
+        }
+
+    return {
+        "applied": True,
+        "normalized_anchor_pct": normalized_anchor_pct,
+        "max_margin_target_pct": max_margin_target_pct,
+        "allowed_uplift_pp": allowed_uplift,
+        "note": (
+            "Margin-volatility safeguard applied: positive learned overlays are capped near the "
+            f"normalised anchor ({normalized_anchor_pct:.1f}% -> {max_margin_target_pct:.1f}%) while scenarios stay widened."
+        ),
+    }
+
+
+def _thin_evidence_margin_guardrail(
+    *,
+    calibration_cohort_size: int,
+    analog_count: int,
+    global_cohort_size: int,
+) -> dict[str, Any]:
+    analog_scale = 1.0 if analog_count >= 2 else 0.8 if analog_count == 1 else 0.55
+    cohort_scale = 1.0 if calibration_cohort_size >= 15 else 0.85 if calibration_cohort_size >= 10 else 0.65 if calibration_cohort_size >= 5 else 0.45
+    global_scale = 1.0 if global_cohort_size >= 20 else 0.85 if global_cohort_size >= 10 else 0.7 if global_cohort_size >= 5 else 0.5
+    positive_scale = round(max(0.25, min(analog_scale, cohort_scale, global_scale)), 2)
+    if positive_scale >= 1.0:
+        return {
+            "applied": False,
+            "positive_scale": 1.0,
+            "note": None,
+        }
+
+    reasons: list[str] = []
+    if analog_count == 0:
+        reasons.append("no close analogs")
+    elif analog_count == 1:
+        reasons.append("only one close analog")
+    if calibration_cohort_size < 10:
+        reasons.append(f"{calibration_cohort_size} realised cohort records")
+    if global_cohort_size < 10:
+        reasons.append(f"{global_cohort_size} cross-symbol matches")
+
+    return {
+        "applied": True,
+        "positive_scale": positive_scale,
+        "analog_count": analog_count,
+        "calibration_cohort_size": calibration_cohort_size,
+        "global_cohort_size": global_cohort_size,
+        "note": (
+            "Thin-evidence margin gate applied: positive learned margin overlays are scaled down "
+            f"to {int(round(positive_scale * 100))}% because " + ", ".join(reasons) + "."
+        ),
+    }
+
+
 def _load_learning_cohort(limit: int | None = None) -> list[Any]:
     try:
         reader = LedgerReader()
@@ -1628,12 +1709,25 @@ def refine_live_assumptions(
     dpo: float,
     observations: list[CalibrationObservation] | None = None,
 ) -> dict[str, Any]:
-    def _merge_guardrail_warn(base_warn: str | None) -> str | None:
-        if not regime_guardrail["applied"]:
-            return base_warn
+    def _dampen_positive(value: float, scale: float) -> float:
+        if value <= 0:
+            return value
+        return round(value * scale, 2)
+
+    def _merge_guardrail_warn(base_warn: str | None, *guardrails: dict[str, Any]) -> str | None:
+        notes: list[str] = []
         if base_warn:
-            return f"{base_warn}; {regime_guardrail['note']}"
-        return str(regime_guardrail["note"])
+            notes.append(str(base_warn))
+        for guardrail in guardrails:
+            if guardrail.get("applied") and guardrail.get("note"):
+                notes.append(str(guardrail["note"]))
+        if not notes:
+            return None
+        deduped: list[str] = []
+        for note in notes:
+            if note not in deduped:
+                deduped.append(note)
+        return "; ".join(deduped)
 
     knowledge_sector = _knowledge_sector(sector)
     market_cap_regime = _market_cap_regime(market_cap)
@@ -1806,6 +1900,17 @@ def refine_live_assumptions(
     relationship_wacc_pp = round(float(relationship_overlay.get("wacc_adj_pp") or 0.0) * 0.35, 2)
     relationship_terminal_growth_pp = round(float(relationship_overlay.get("terminal_growth_adj_pp") or 0.0) * 0.35, 2)
     relationship_beta_adj = round(float(relationship_overlay.get("beta_adj") or 0.0) * 0.35, 3)
+    learned_margin_component = round((calibrated.ebit_margin_adj * 100) * margin_weights["learned_cohort"], 2)
+    thin_evidence_margin_guardrail = _thin_evidence_margin_guardrail(
+        calibration_cohort_size=int(calibrated.calibration_cohort_size or 0),
+        analog_count=len(analog_set.analogs),
+        global_cohort_size=int(global_learning.get("cohort_size") or 0),
+    )
+    if thin_evidence_margin_guardrail["applied"]:
+        positive_scale = float(thin_evidence_margin_guardrail["positive_scale"])
+        learned_margin_component = _dampen_positive(learned_margin_component, positive_scale)
+        global_margin_pp = _dampen_positive(global_margin_pp, positive_scale)
+        relationship_margin_pp = _dampen_positive(relationship_margin_pp, positive_scale)
 
     refined_growth = round(
         _clamp(
@@ -1824,7 +1929,7 @@ def refine_live_assumptions(
         _clamp(
             company_margin_target_pct * margin_weights["company_history"]
             + sector_margin_pct * margin_weights["sector_prior"]
-            + (calibrated.ebit_margin_adj * 100) * margin_weights["learned_cohort"]
+            + learned_margin_component
             + margin_pattern_pp
             + global_margin_pp
             + relationship_margin_pp,
@@ -1930,6 +2035,16 @@ def refine_live_assumptions(
         refined_terminal_growth = min(refined_terminal_growth, float(regime_guardrail["max_terminal_growth_pct"]))
         smoothed_beta = max(smoothed_beta, float(regime_guardrail["min_beta"]))
     layered_learning["regime_guardrail"] = regime_guardrail
+    margin_guardrail = _margin_volatility_guardrail(
+        margin_normalisation=margin_normalisation,
+        company_margin_target_pct=company_margin_target_pct,
+        ebit_margin_base_pct=ebit_margin_base_pct,
+        refined_margin_target=refined_margin_target,
+    )
+    if margin_guardrail["applied"]:
+        refined_margin_target = min(refined_margin_target, float(margin_guardrail["max_margin_target_pct"]))
+    layered_learning["margin_guardrail"] = margin_guardrail
+    layered_learning["thin_evidence_margin_guardrail"] = thin_evidence_margin_guardrail
     learned_reinvestment_confidence = float(learned_metrics.get("reinvestment_confidence") or 0.0)
     if learned_reinvestment_confidence > 0:
         implied_capex_pct = float(learned_metrics.get("reinvestment_rate_pct") or 0.0) + refined_da_pct
@@ -2034,6 +2149,10 @@ def refine_live_assumptions(
         )
     elif uncertainty.get("weak_evidence"):
         uncertainty_text = " Realised evidence is still thin, so confidence stays conservative and scenario ranges remain wider than normal."
+    if thin_evidence_margin_guardrail["applied"]:
+        uncertainty_text += f" {thin_evidence_margin_guardrail['note']}"
+    if margin_guardrail["applied"]:
+        uncertainty_text += f" {margin_guardrail['note']}"
     if regime_guardrail["applied"]:
         uncertainty_text += f" {regime_guardrail['note']}"
     analog_text = ""
@@ -2055,7 +2174,7 @@ def refine_live_assumptions(
             "global_overlay_pp": global_growth_pp,
             "relationship_overlay_pp": relationship_growth_pp,
             "source": growth_source + global_growth_source + relationship_growth_source,
-            "warn": _merge_guardrail_warn(growth_warn),
+            "warn": _merge_guardrail_warn(growth_warn, regime_guardrail),
         },
         "terminal_growth": {
             **{key: round(value, 2) for key, value in risk_weights.items()},
@@ -2066,18 +2185,18 @@ def refine_live_assumptions(
             "global_overlay_pp": global_terminal_growth_pp,
             "relationship_overlay_pp": relationship_terminal_growth_pp,
             "source": risk_source + global_risk_source + relationship_risk_source,
-            "warn": _merge_guardrail_warn(risk_warn),
+            "warn": _merge_guardrail_warn(risk_warn, regime_guardrail),
         },
         "ebit_margin_target": {
             **{key: round(value, 2) for key, value in margin_weights.items()},
             "company_value": company_margin_target_pct,
             "sector_value": sector_margin_pct,
-            "learned_value": round(calibrated.ebit_margin_adj * 100, 1),
+            "learned_value": learned_margin_component,
             "pattern_overlay_pp": margin_pattern_pp,
             "global_overlay_pp": global_margin_pp,
             "relationship_overlay_pp": relationship_margin_pp,
-            "source": margin_source + global_margin_source + relationship_margin_source + margin_normalisation["source_suffix"] + ("; declining/structural-break safeguard applied" if regime_guardrail["applied"] else ""),
-            "warn": _merge_guardrail_warn(margin_normalisation["note"] or margin_warn),
+            "source": margin_source + global_margin_source + relationship_margin_source + margin_normalisation["source_suffix"] + ("; thin-evidence margin gate applied" if thin_evidence_margin_guardrail["applied"] else "") + ("; margin-volatility safeguard applied" if margin_guardrail["applied"] else "") + ("; declining/structural-break safeguard applied" if regime_guardrail["applied"] else ""),
+            "warn": _merge_guardrail_warn(margin_normalisation["note"] or margin_warn, thin_evidence_margin_guardrail, margin_guardrail, regime_guardrail),
         },
         "beta": {
             **{key: round(value, 2) for key, value in risk_weights.items()},
@@ -2088,7 +2207,7 @@ def refine_live_assumptions(
             "global_overlay": global_beta_adj,
             "relationship_overlay": relationship_beta_adj,
             "source": risk_source + global_risk_source + relationship_risk_source,
-            "warn": _merge_guardrail_warn(risk_warn),
+            "warn": _merge_guardrail_warn(risk_warn, regime_guardrail),
         },
         "wacc": {
             **{key: round(value, 2) for key, value in risk_weights.items()},
@@ -2099,7 +2218,7 @@ def refine_live_assumptions(
             "global_overlay_pp": global_wacc_pp,
             "relationship_overlay_pp": relationship_wacc_pp,
             "source": risk_source + global_risk_source + relationship_risk_source,
-            "warn": _merge_guardrail_warn(risk_warn),
+            "warn": _merge_guardrail_warn(risk_warn, regime_guardrail),
         },
         "tax_rate_pct": {
             "company_history": 0.75,
@@ -2264,7 +2383,8 @@ def refine_live_assumptions(
         "relationship_graph": relationship_graph,
         "layered_learning": layered_learning,
         "margin_normalisation": margin_normalisation,
-        "regime_guardrail": regime_guardrail,
+        "thin_evidence_margin_guardrail": thin_evidence_margin_guardrail,
+        "margin_guardrail": margin_guardrail,
         "regime_guardrail": regime_guardrail,
         "scenario_width_multiplier": float(uncertainty.get("scenario_width_multiplier") or margin_normalisation["scenario_width_multiplier"]),
         "confidence_model": confidence_model,
