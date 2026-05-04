@@ -57,9 +57,18 @@ def _resolve_cache_dir() -> Path | None:
 _CACHE_DIR = _resolve_cache_dir()
 
 # Cache TTLs
-_TTL_PRICE_SEC  = 300       # 5  minutes for real-time price
-_TTL_FUND_SEC   = 21_600    # 6  hours   for fundamentals
-_TTL_EOD_HISTORY_SEC = 86_400
+# Price: 5 min (needs to stay fresh — users check live quotes)
+# Fundamentals: 24 h — income/balance sheets only change at quarterly earnings
+# EOD history: 7 days — historical price series barely moves day-to-day
+_TTL_PRICE_SEC       = 300          # 5  minutes
+_TTL_FUND_SEC        = 86_400       # 24 hours
+_TTL_EOD_HISTORY_SEC = 86_400 * 7  # 7  days
+
+# ── In-memory L1 cache (process-level, survives repeated requests) ────────────
+# Entries: {name: (data, expires_at_monotonic_sec)}
+# Checked before disk; avoids JSON round-trip on repeated page loads.
+import time as _time
+_MEM_CACHE: dict[str, tuple[Any, float]] = {}
 
 # ── Optional dependency check ─────────────────────────────────────────────────
 try:
@@ -104,6 +113,15 @@ def _cache_path(name: str) -> Path | None:
 
 
 def _cache_read(name: str, ttl_sec: int) -> Any | None:
+    # ── L1: in-memory ────────────────────────────────────────────────────
+    entry = _MEM_CACHE.get(name)
+    if entry is not None:
+        data_cached, expires_at = entry
+        if _time.monotonic() < expires_at:
+            return data_cached
+        del _MEM_CACHE[name]
+
+    # ── L2: disk ─────────────────────────────────────────────────────────
     p = _cache_path(name)
     if p is None or not p.exists():
         return None
@@ -113,14 +131,22 @@ def _cache_read(name: str, ttl_sec: int) -> Any | None:
         ts = datetime.fromisoformat(obj.get("_ts", "2000-01-01"))
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-        if (datetime.now(timezone.utc) - ts).total_seconds() < ttl_sec:
-            return obj.get("data")
+        age_sec = (datetime.now(timezone.utc) - ts).total_seconds()
+        if age_sec < ttl_sec:
+            data = obj.get("data")
+            # Promote to L1 for the remaining TTL
+            _MEM_CACHE[name] = (data, _time.monotonic() + (ttl_sec - age_sec))
+            return data
     except Exception:
         pass
     return None
 
 
-def _cache_write(name: str, data: Any) -> None:
+def _cache_write(name: str, data: Any, ttl_sec: int = 0) -> None:
+    # Write to L1 immediately
+    if ttl_sec > 0:
+        _MEM_CACHE[name] = (data, _time.monotonic() + ttl_sec)
+    # Write to L2 (disk)
     p = _cache_path(name)
     if p is None:
         return
@@ -294,7 +320,7 @@ def _fetch_price(eodhd_code: str) -> dict | None:
         return cached
     data = _get(f"real-time/{eodhd_code}")
     if data and isinstance(data, dict) and data.get("close"):
-        _cache_write(cache_key, data)
+        _cache_write(cache_key, data, ttl_sec=_TTL_PRICE_SEC)
         return data
     return None
 
@@ -307,7 +333,7 @@ def _fetch_fundamentals(eodhd_code: str) -> dict | None:
         return cached
     data = _get(f"fundamentals/{eodhd_code}")
     if data and isinstance(data, dict) and data.get("General"):
-        _cache_write(cache_key, data)
+        _cache_write(cache_key, data, ttl_sec=_TTL_FUND_SEC)
         return data
     return None
 
@@ -366,7 +392,7 @@ def fetch_historical_price_series(
         )
 
     if history:
-        _cache_write(cache_key, history)
+        _cache_write(cache_key, history, ttl_sec=_TTL_EOD_HISTORY_SEC)
     return history
 
 
