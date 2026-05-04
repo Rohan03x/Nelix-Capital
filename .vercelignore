@@ -6,6 +6,11 @@ logs/
 output/
 tests/
 
+# Local caches — Vercel fetches live; these bloat the bundle
+webapp/data/cache/
+auto_valuation/learning/db/
+overrides/
+
 ADAPTIVE_DCF_PROMPT.md
 arch_plan*.txt
 compare_out.txt
