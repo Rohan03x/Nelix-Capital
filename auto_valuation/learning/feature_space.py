@@ -39,6 +39,11 @@ FEATURE_SPECS: tuple[FeatureSpec, ...] = (
     FeatureSpec("maturity_score", "Maturity", "stage", 0.75, 0.55, "score"),
     FeatureSpec("valuation_regime_score", "Valuation Regime", "valuation", 0.70, 0.70, "score"),
     FeatureSpec("volatility_score", "Volatility", "risk", 0.70, 0.60, "score"),
+    # NOTE (ADAPTIVE_DCF_IMPROVEMENT_PLAN.md S4): analyst/sentiment/insider signals
+    # are surfaced via webapp.data.eodhd_client extractors but are intentionally
+    # NOT registered as cohort-similarity features here — they are point-in-time
+    # behavioural data, not structural fundamentals, and adding them changes the
+    # analog/baseline calibration suite in ways that require dedicated retuning.
 )
 
 FEATURE_NAMES = [spec.name for spec in FEATURE_SPECS]

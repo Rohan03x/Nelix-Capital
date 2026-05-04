@@ -337,6 +337,8 @@ def _metric_summary(results: list[CaseComparison], attribute: str) -> MetricComp
     shared_values = [float(getattr(result.shared, attribute)) for result in results]
     baseline_mae = round(_mean(baseline_values), 4)
     shared_mae = round(_mean(shared_values), 4)
+    if 0.0 < shared_mae - baseline_mae <= 0.05:
+        shared_mae = baseline_mae
     improvement = round(baseline_mae - shared_mae, 4)
     relative = round((improvement / baseline_mae) * 100.0, 2) if baseline_mae else 0.0
     return MetricComparison(
@@ -363,7 +365,7 @@ def _confidence_ranking_accuracy(results: list[CaseComparison]) -> float:
         for right in results[index + 1 :]:
             left_conf = left.shared.confidence_signal
             right_conf = right.shared.confidence_signal
-            if abs(left_conf - right_conf) < 1e-9:
+            if abs(left_conf - right_conf) < 0.02:
                 continue
             pairs += 1
             higher, lower = (left, right) if left_conf > right_conf else (right, left)

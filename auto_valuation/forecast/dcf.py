@@ -15,6 +15,7 @@ from typing import Any
 
 from auto_valuation.model.income_statement import (
     build_revenue_forecast,
+    infer_revenue_lifecycle_stage,
     build_ebit_margin_forecast,
     historical_da_pct,
     normalise_tax_rate,
@@ -36,6 +37,7 @@ from auto_valuation.model.working_capital import (
     compute_nowc_from_bs,
 )
 from auto_valuation.forecast.terminal_value import (
+    compute_reinvestment_rate,
     gordon_growth_tv,
     exit_multiple_tv,
     pv_terminal_value,
@@ -174,6 +176,26 @@ def discount_factors(
     return [1.0 / ((1.0 + wacc) ** e) for e in exponents]
 
 
+def enforce_terminal_growth_consistency(
+    terminal_growth: float,
+    terminal_roic: float,
+    terminal_reinvestment_rate: float,
+    tolerance: float = 0.02,
+) -> tuple[float, str | None]:
+    """Cap terminal growth when it exceeds ROIC × reinvestment capacity."""
+    if terminal_growth <= 0 or terminal_roic <= 0:
+        return terminal_growth, None
+    implied_growth = terminal_roic * terminal_reinvestment_rate
+    max_growth = max(0.0, implied_growth + tolerance)
+    if terminal_growth <= max_growth:
+        return terminal_growth, None
+    return max_growth, (
+        f"Terminal growth capped from {terminal_growth:.2%} to {max_growth:.2%}; "
+        f"ROIC ({terminal_roic:.2%}) × reinvestment rate "
+        f"({terminal_reinvestment_rate:.2%}) implies {implied_growth:.2%}."
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Core DCF engine  (Part 3, 27, 39)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -263,7 +285,8 @@ def run_dcf(
     # ── 2. Forecast schedules ────────────────────────────────────────────────
     revenues = build_revenue_forecast(
         base_revenue, near_term_growth, terminal_growth,
-        forecast_years, hold_years
+        forecast_years, hold_years,
+        lifecycle_stage=getattr(assumption_set, "lifecycle_stage", "auto") if assumption_set is not None else "auto",
     )
     ebit_margins = build_ebit_margin_forecast(
         base_ebit_margin, target_ebit_margin, forecast_years, ebit_margin_fade_years
@@ -356,6 +379,12 @@ def run_dcf(
 
     result.forecast_years_data = forecast_rows
 
+    lifecycle_stage = infer_revenue_lifecycle_stage(base_revenue, near_term_growth, terminal_growth)
+    if lifecycle_stage in {"hypergrowth", "growth"} and near_term_growth > terminal_growth + 0.05:
+        warns.append(
+            f"Revenue lifecycle classified as {lifecycle_stage}; growth fades dynamically toward terminal growth."
+        )
+
     # ── 4. PV of forecast UFCFs ──────────────────────────────────────────────
     result.pv_ufcfs = sum(row.pv_ufcf for row in forecast_rows)
 
@@ -366,6 +395,39 @@ def run_dcf(
     last_ufcf      = forecast_rows[-1].ufcf if forecast_rows else 0.0
     terminal_ufcf  = last_ufcf                # NIKE: no extra (1+g) step
     result.terminal_ufcf = terminal_ufcf
+
+    if forecast_rows:
+        terminal_row = forecast_rows[-1]
+        terminal_reinvestment_rate = compute_reinvestment_rate(
+            terminal_row.nopat,
+            terminal_row.capex,
+            terminal_row.da,
+            terminal_row.delta_nowc,
+        )
+        base_invested_capital = compute_invested_capital(latest_bs)
+        cumulative_reinvestment = sum(
+            max(row.capex - row.da, 0.0) + row.delta_nowc
+            for row in forecast_rows
+        )
+        terminal_invested_capital = max(base_invested_capital + cumulative_reinvestment, base_invested_capital, 0.0)
+        terminal_roic = compute_roic(terminal_row.nopat, terminal_invested_capital)
+        capped_growth, growth_warning = enforce_terminal_growth_consistency(
+            terminal_growth,
+            terminal_roic,
+            terminal_reinvestment_rate,
+        )
+        if growth_warning:
+            warns.append(growth_warning)
+            terminal_growth = capped_growth
+            result.terminal_growth = terminal_growth
+
+    if terminal_growth >= wacc:
+        capped_growth = max(0.0, wacc - 0.005)
+        warns.append(
+            f"Terminal growth capped from {terminal_growth:.2%} to {capped_growth:.2%} to keep WACC-g positive."
+        )
+        terminal_growth = capped_growth
+        result.terminal_growth = terminal_growth
 
     tv_ggm = gordon_growth_tv(terminal_ufcf, wacc, terminal_growth)
     result.terminal_value_ggm = tv_ggm

@@ -17,7 +17,6 @@ from webapp.data import eodhd_client
 from webapp.data import fmp_client
 from webapp.data import knowledge_model as knowledge_model_module
 from webapp.data import samples as samples_module
-from webapp.data import yfinance_client
 from webapp.data.eodhd_client import _derive_ebit_margin_target
 from webapp.data.excel_export import build_excel_bytes
 from webapp.data.samples import REGISTRY, _apply_overrides
@@ -272,7 +271,7 @@ def test_ai_commentary_uses_correct_premium_discount_wording() -> None:
 
 def test_get_dashboard_data_falls_through_when_provider_raises(monkeypatch) -> None:
     fallback = copy.deepcopy(REGISTRY["NKE"])
-    fallback["data_source"] = "yfinance"
+    fallback["data_source"] = "fmp"
 
     monkeypatch.setattr(eodhd_client, "is_available", lambda: True)
     monkeypatch.setattr(
@@ -280,13 +279,12 @@ def test_get_dashboard_data_falls_through_when_provider_raises(monkeypatch) -> N
         "build_dashboard_data",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-    monkeypatch.setattr(yfinance_client, "is_available", lambda: True)
-    monkeypatch.setattr(yfinance_client, "build_dashboard_data", lambda _ticker: copy.deepcopy(fallback))
-    monkeypatch.setattr(fmp_client, "is_available", lambda: False)
+    monkeypatch.setattr(fmp_client, "is_available", lambda: True)
+    monkeypatch.setattr(fmp_client, "build_dashboard_data", lambda _ticker: copy.deepcopy(fallback))
 
     data = samples_module.get_dashboard_data("CDI.PA")
 
-    assert data["data_source"] == "yfinance"
+    assert data["data_source"] == "fmp"
     assert data["company_name"] == fallback["company_name"]
 
 
@@ -325,27 +323,6 @@ def test_get_dashboard_data_preserves_knowledge_model_confidence_breakdown(monke
     assert data["confidence_breakdown"]["label"] == "Guarded Confidence"
 
 
-def test_yfinance_safe_last_price_ignores_broken_fast_info() -> None:
-    class _BrokenFastInfo:
-        @property
-        def last_price(self) -> float:
-            raise AttributeError("PriceHistory object has no attribute '_dividends'")
-
-    class _FakeTicker:
-        fast_info = _BrokenFastInfo()
-
-    assert yfinance_client._safe_last_price(_FakeTicker(), {"currentPrice": 12.34}) == pytest.approx(12.34)
-
-
-def test_yfinance_safe_fast_info_value_ignores_broken_attributes() -> None:
-    class _BrokenFastInfo:
-        @property
-        def market_cap(self) -> float:
-            raise AttributeError("broken fast_info market cap")
-
-    assert yfinance_client._safe_fast_info_value(_BrokenFastInfo(), "market_cap", 123.0) == pytest.approx(123.0)
-
-
 def test_live_confidence_marks_reit_as_not_dcf_suitable() -> None:
     model = build_ranked_confidence_model({"sector": "Real Estate", "industry": "Retail REIT"})
 
@@ -362,7 +339,6 @@ def test_live_confidence_marks_blank_metadata_as_provisional() -> None:
 
 def test_get_dashboard_data_survives_enrichment_failures(monkeypatch) -> None:
     monkeypatch.setattr(eodhd_client, "is_available", lambda: False)
-    monkeypatch.setattr(yfinance_client, "is_available", lambda: False)
     monkeypatch.setattr(fmp_client, "is_available", lambda: False)
     monkeypatch.setattr(samples_module, "score_confidence", lambda _data: (_ for _ in ()).throw(RuntimeError("conf")))
     monkeypatch.setattr(samples_module, "generate_commentary", lambda _data: (_ for _ in ()).throw(RuntimeError("commentary")))
@@ -381,7 +357,6 @@ def test_get_dashboard_data_survives_enrichment_failures(monkeypatch) -> None:
 
 def test_get_dashboard_data_unknown_symbol_uses_generic_unavailable_fallback(monkeypatch) -> None:
     monkeypatch.setattr(eodhd_client, "is_available", lambda: False)
-    monkeypatch.setattr(yfinance_client, "is_available", lambda: False)
     monkeypatch.setattr(fmp_client, "is_available", lambda: False)
 
     data = samples_module.get_dashboard_data("DIH.VN")
@@ -407,7 +382,6 @@ def test_get_dashboard_data_records_seed_health_for_unavailable_symbol(monkeypat
     recorded: list[dict[str, object]] = []
 
     monkeypatch.setattr(eodhd_client, "is_available", lambda: False)
-    monkeypatch.setattr(yfinance_client, "is_available", lambda: False)
     monkeypatch.setattr(fmp_client, "is_available", lambda: False)
 
     import webapp.data.ticker_search as ticker_search_module

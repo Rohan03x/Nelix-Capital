@@ -140,7 +140,7 @@ def run_valuation(cfg: ValuationConfig) -> ValuationResult:  # noqa: C901
         fetch_income_statement, fetch_balance_sheet, fetch_cash_flow,
         fetch_quarterly_income_statement, fetch_quarterly_balance_sheet,
         fetch_quarterly_cash_flow,
-        fetch_profile, fetch_ntm_estimates, fetch_yfinance_info,
+        fetch_profile, fetch_ntm_estimates, fetch_market_info,
         fetch_52wk_range, check_price_freshness,
         fetch_risk_free_rate, fetch_damodaran_industry_beta, fetch_damodaran_erp,
     )
@@ -164,7 +164,7 @@ def run_valuation(cfg: ValuationConfig) -> ValuationResult:  # noqa: C901
     q_cashflow = fetch_quarterly_cash_flow(cfg.ticker, api_key)
 
     ntm_estimates = fetch_ntm_estimates(cfg.ticker, api_key)
-    yf_info = fetch_yfinance_info(cfg.ticker)
+    market_info = fetch_market_info(cfg.ticker)
 
     # Clean: standardise field names
     income_stmts  = [standardise_field_names(unit_normalize(r)) for r in income_stmts]
@@ -198,9 +198,9 @@ def run_valuation(cfg: ValuationConfig) -> ValuationResult:  # noqa: C901
     net_debt   = compute_net_debt(latest_bs)
 
     # Price / market cap
-    current_price  = yf_info.get("currentPrice") or yf_info.get("regularMarketPrice")
-    shares_out_mm  = (yf_info.get("sharesOutstanding") or 0) / 1e6
-    market_cap_mm  = (yf_info.get("marketCap") or 0) / 1e6
+    current_price  = market_info.get("currentPrice") or market_info.get("regularMarketPrice")
+    shares_out_mm  = (market_info.get("sharesOutstanding") or 0) / 1e6
+    market_cap_mm  = (market_info.get("marketCap") or 0) / 1e6
     if market_cap_mm <= 0 and current_price and shares_out_mm > 0:
         market_cap_mm = current_price * shares_out_mm
 
@@ -298,7 +298,7 @@ def run_valuation(cfg: ValuationConfig) -> ValuationResult:  # noqa: C901
     )
 
     # Diluted shares
-    options_mm     = (yf_info.get("impliedSharesOutstanding") or shares_out_mm) - shares_out_mm
+    options_mm     = (market_info.get("impliedSharesOutstanding") or shares_out_mm) - shares_out_mm
     options_strike = current_price or 50.0
     dil_dict = compute_fully_diluted_shares(
         basic_shares_mm=shares_out_mm,

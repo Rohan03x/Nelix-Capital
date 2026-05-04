@@ -74,6 +74,50 @@ _DEFAULT_BETA = 1.0
 _DEFAULT_TGR = 0.025
 
 
+# ─── Historical macro context (S2 — eliminate look-ahead bias) ───────────────
+# Approximate FRED 10Y constant-maturity treasury, year-end averages (decimals).
+# Source: H.15 release. Updated through 2024.
+_HISTORICAL_RF_BY_YEAR: dict[int, float] = {
+    2010: 0.0322, 2011: 0.0278, 2012: 0.0180, 2013: 0.0235, 2014: 0.0254,
+    2015: 0.0214, 2016: 0.0184, 2017: 0.0233, 2018: 0.0291, 2019: 0.0214,
+    2020: 0.0089, 2021: 0.0145, 2022: 0.0295, 2023: 0.0397, 2024: 0.0421,
+    2025: 0.0430,
+}
+_RF_LONG_RUN_MEAN = 0.035  # 1990-2024 mean
+
+
+def _historical_rf(year: int) -> float:
+    """Return point-in-time risk-free rate (FRED 10Y) for a given calendar year."""
+    if year in _HISTORICAL_RF_BY_YEAR:
+        return _HISTORICAL_RF_BY_YEAR[year]
+    if year < min(_HISTORICAL_RF_BY_YEAR):
+        return _RF_LONG_RUN_MEAN
+    # Future / unknown — fall back to long-run mean rather than today's value
+    return _RF_LONG_RUN_MEAN
+
+
+def _macro_regime_for_year(year: int) -> str:
+    """Classify the year's macro environment from the historical RF rate.
+    S2: this MUST use the rate observable at the time, not today's rate."""
+    rf = _historical_rf(year)
+    if rf <= 0.020:
+        return "low_rate"
+    if rf >= 0.040:
+        return "high_rate"
+    return "neutral"
+
+
+def _growth_regime_for_value(actual_revenue_growth: float) -> str:
+    """M3: classify realised growth into a regime bucket."""
+    if actual_revenue_growth >= 0.20:
+        return "hyper_growth"
+    if actual_revenue_growth >= 0.08:
+        return "growth"
+    if actual_revenue_growth >= 0.0:
+        return "stable"
+    return "decline"
+
+
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _cap_regime(market_cap_usd: float | None) -> str:
@@ -215,7 +259,7 @@ def observations_for_ticker(
             industry=industry,
             data_vintage_years=min(vintage, 20),
             market_cap_regime=cap,
-            macro_regime="neutral",
+            macro_regime=_macro_regime_for_year(year),
             predicted_revenue_growth=0.0,          # neutral; signal = sector's inherent bias
             actual_revenue_growth=float(actual_rg),
             predicted_ebit_margin=float(pred_em),  # persistence model
@@ -229,6 +273,9 @@ def observations_for_ticker(
             ticker=ticker,
             predicted_ufcf_margin=prev.get("ufcf_margin"),
             actual_ufcf_margin=curr.get("ufcf_margin"),
+            as_of_year=int(year),
+            rf_rate_at_time=_historical_rf(int(year)),
+            growth_regime=_growth_regime_for_value(float(actual_rg)),
         ))
 
     # Quarterly pairs ─────────────────────────────────────────────────────────
@@ -251,7 +298,7 @@ def observations_for_ticker(
                 industry=industry,
                 data_vintage_years=min(vintage, 20),
                 market_cap_regime=cap,
-                macro_regime="neutral",
+                macro_regime=_macro_regime_for_year(curr_q["date"].year),
                 predicted_revenue_growth=0.0,
                 actual_revenue_growth=float(actual_rg_q),
                 predicted_ebit_margin=float(pred_em_q),
@@ -263,6 +310,9 @@ def observations_for_ticker(
                 predicted_beta=_DEFAULT_BETA,
                 actual_beta=_DEFAULT_BETA,
                 ticker=ticker,
+                as_of_year=int(curr_q["date"].year),
+                rf_rate_at_time=_historical_rf(int(curr_q["date"].year)),
+                growth_regime=_growth_regime_for_value(float(actual_rg_q)),
             ))
     return obs
 
@@ -480,6 +530,52 @@ _OBS_CACHE: list[CalibrationObservation] = []
 _OBS_CACHE_TS: float = 0.0
 _OBS_CACHE_TTL: float = 3600.0  # rebuild at most once per hour
 
+# ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (M5) — disk-backed observation cache.
+# Pickling avoids re-scanning ~3.7k JSON files on every cold start.
+_OBS_DISK_CACHE_PATH: Path = (
+    Path(__file__).resolve().parent / "db" / "obs_cache.pkl"
+)
+_OBS_DISK_TTL_SEC: float = 24 * 3600.0  # one day
+
+
+def _load_obs_cache_from_disk() -> tuple[list[CalibrationObservation], float] | None:
+    try:
+        import pickle
+        if not _OBS_DISK_CACHE_PATH.exists():
+            return None
+        age = _time.time() - _OBS_DISK_CACHE_PATH.stat().st_mtime
+        if age > _OBS_DISK_TTL_SEC:
+            return None
+        with _OBS_DISK_CACHE_PATH.open("rb") as f:
+            payload = pickle.load(f)
+        if not isinstance(payload, dict):
+            return None
+        obs = payload.get("observations") or []
+        ts = float(payload.get("timestamp") or 0.0)
+        if not obs:
+            return None
+        return list(obs), ts
+    except Exception as exc:
+        logger.warning("obs_cache disk load failed: %s", exc)
+        return None
+
+
+def _save_obs_cache_to_disk(obs: list[CalibrationObservation]) -> None:
+    try:
+        import pickle
+        _OBS_DISK_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _OBS_DISK_CACHE_PATH.with_suffix(".pkl.tmp")
+        with tmp.open("wb") as f:
+            pickle.dump(
+                {"observations": obs, "timestamp": _time.time()},
+                f,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        tmp.replace(_OBS_DISK_CACHE_PATH)
+    except Exception as exc:
+        logger.warning("obs_cache disk save failed: %s", exc)
+
+
 
 def get_all_observations(
     *,
@@ -502,6 +598,15 @@ def get_all_observations(
     now = _time.monotonic()
     if not force_refresh and _OBS_CACHE and (now - _OBS_CACHE_TS) < _OBS_CACHE_TTL:
         return list(_OBS_CACHE)
+
+    # M5 — try disk cache before scanning ~3.7k JSON files.
+    if not force_refresh and not _OBS_CACHE:
+        disk = _load_obs_cache_from_disk()
+        if disk is not None:
+            _OBS_CACHE = disk[0]
+            _OBS_CACHE_TS = now
+            logger.info("historical_replay.get_all_observations: loaded %d obs from disk cache", len(_OBS_CACHE))
+            return list(_OBS_CACHE)
 
     scan_dir = cache_dir or WEBAPP_CACHE_DIR
     if not scan_dir.exists():
@@ -537,6 +642,8 @@ def get_all_observations(
         len(all_obs),
         len(fund_files),
     )
+    # M5 — persist to disk so cold starts skip the JSON scan.
+    _save_obs_cache_to_disk(all_obs)
     return list(all_obs)
 
 

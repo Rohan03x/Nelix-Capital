@@ -107,10 +107,10 @@ def score_confidence(data: dict) -> ConfidenceResult:
     rev_series   = hist.get("revenue", [])
     margin_series = hist.get("ebit_margin", [])
 
-    # Detect data-source limits (yfinance returns max 4-5 annual years)
+    # Detect data-source limits for short annual-history providers.
     _dq = data.get("data_quality", {})
     _source = _dq.get("source", "")
-    _is_yf = "yahoo" in _source.lower() or "yfinance" in _source.lower() or data.get("is_live", False)
+    _source_limited = "short-history" in _source.lower() or data.get("is_live", False)
     _has_qrecon = _dq.get("has_quarterly_recon", False)
 
     # ── 1. Data availability (15 pts) ────────────────────────────────────────
@@ -123,11 +123,10 @@ def score_confidence(data: dict) -> ConfidenceResult:
     elif years_avail >= 5:
         d1 = ConfidenceDimension("Data Availability", 7, 15, "warn",
             f"Only {years_avail} years available. Short history increases forecast uncertainty.")
-    elif years_avail >= 4 and _is_yf:
-        # yfinance platform only exposes ~4 annual years — not a data quality failure
+    elif years_avail >= 4 and _source_limited:
         _recon_note = " Quarterly data reconstructed for additional coverage." if _has_qrecon else " Quarterly reconstruction attempted."
         d1 = ConfidenceDimension("Data Availability", 7, 15, "warn",
-            f"{years_avail} annual years from Yahoo Finance (platform limit).{_recon_note}")
+            f"{years_avail} annual years from a short-history source.{_recon_note}")
     elif years_avail >= 3:
         d1 = ConfidenceDimension("Data Availability", 4, 15, "warn",
             f"Only {years_avail} years of data — forecasts are highly uncertain.")

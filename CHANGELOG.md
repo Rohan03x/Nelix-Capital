@@ -9,6 +9,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Compliance pages and global disclaimer footer for `/terms`, `/disclosures`, and `/privacy`.
+- EU suitability gate for country-detected visitors, with a one-time research-use questionnaire stored in the anonymous session.
+- GDPR workflow lifecycle controls: `DELETE /api/me` purges anonymous watchlist/search/compare workflow data, and internal privacy cleanup removes stale workflow rows older than 24 months.
 - Shared-brain validation harness in `auto_valuation/validation/shared_brain.py` with deterministic, time-aware benchmark cases, operational diagnostics, and acceptance summarization.
 - `validate_shared_brain.py` CLI for running the benchmark and exporting an explicit acceptance verdict.
 - Live EODHD dashboard payload support for `knowledge_model` outputs, including knowledge-model assumption provenance in the web app payload.

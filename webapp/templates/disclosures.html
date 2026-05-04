@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Disclosures - Nelix Capital{% endblock %}
+
+{% block content %}
+<main class="legal-page">
+  <section class="legal-hero">
+    <div class="legal-eyebrow">Compliance</div>
+    <h1>Disclosures</h1>
+    <p>Important information about valuation methodology, source data, limitations, and conflicts.</p>
+  </section>
+
+  <section class="legal-panel">
+    <h2>Valuation Methodology</h2>
+    <p>
+      Nelix Capital may use discounted cash flow models, peer multiples, scenario analysis, sensitivity tables,
+      analyst consensus references, quality checks, and learning overlays. These are analytical estimates, not
+      statements of fair value, market value, or future performance.
+    </p>
+
+    <h2>Data Sources and Freshness</h2>
+    <p>
+      The application may combine market data, company fundamentals, exchange metadata, analyst estimates,
+      cached records, curated demo fixtures, and user-entered assumptions. Prices and financial statements can
+      be delayed, restated, stale, adjusted, or unavailable across jurisdictions and exchanges.
+    </p>
+
+    <h2>Forecast Risk</h2>
+    <p>
+      Valuation outputs are highly sensitive to revenue growth, margins, reinvestment, terminal value,
+      discount rates, capital structure, share count, currency conversion, and peer selection. Small assumption
+      changes can produce materially different intrinsic-value estimates.
+    </p>
+
+    <h2>Automated Analysis</h2>
+    <p>
+      Explainability notes, confidence scores, and generated commentary may summarize model inputs and risks,
+      but they can omit context or make mistakes. They should be treated as prompts for review rather than
+      definitive conclusions.
+    </p>
+
+    <h2>No Performance Guarantee</h2>
+    <p>
+      Historical backtests, calibration metrics, peer relationships, and prior model behaviour do not guarantee
+      future returns, future forecast accuracy, or future model performance.
+    </p>
+
+    <h2>Conflicts</h2>
+    <p>
+      Unless separately disclosed in writing, Nelix Capital does not receive issuer compensation for coverage
+      and does not execute trades. Users may hold positions in securities analysed by the tool.
+    </p>
+  </section>
+</main>
+{% endblock %}

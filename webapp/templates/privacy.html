@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Privacy - Nelix Capital{% endblock %}
+
+{% block content %}
+<main class="legal-page">
+  <section class="legal-hero">
+    <div class="legal-eyebrow">Compliance</div>
+    <h1>Privacy Notice</h1>
+    <p>How this application handles session, watchlist, model, and operational data.</p>
+  </section>
+
+  <section class="legal-panel">
+    <h2>Data We Process</h2>
+    <p>
+      Nelix Capital may process ticker searches, selected companies, valuation assumptions, watchlist entries,
+      manual compare relationships, anonymous session identifiers, request metadata, cache keys, and diagnostic
+      logs needed to operate and improve the service.
+    </p>
+
+    <h2>How Data Is Used</h2>
+    <p>
+      Data is used to render valuation pages, remember anonymous workflow state, reduce repeated provider calls,
+      improve ticker discovery, maintain learning evidence, investigate failures, and protect the service from
+      abuse.
+    </p>
+
+    <h2>Financial Data Caches</h2>
+    <p>
+      Company fundamentals, prices, exchange symbols, and model fixtures are generally about public companies,
+      not private individuals. They may be cached so the app can remain responsive and resilient when providers
+      are slow or unavailable.
+    </p>
+
+    <h2>Retention</h2>
+    <p>
+      Anonymous workflow data such as watchlists, notes, compare history, and diagnostic logs should be retained
+      only as long as needed for product operation, debugging, security, and model-quality review. The production
+      retention target for user-generated workflow data is no longer than 24 months unless a shorter legal,
+      security, or operational period applies.
+    </p>
+
+    <h2>Your Choices</h2>
+    <p>
+      You can clear browser storage and cookies to remove local session state. Hosted deployments expose
+      <code>DELETE /api/me</code> to purge anonymous server-side workflow data such as watchlists, search
+      impressions, manual compare history, and derived compare relationships.
+    </p>
+
+    <h2>Security</h2>
+    <p>
+      The application uses session controls, CSRF checks, rate limiting, and input-size guards where enabled.
+      No internet-facing system can be guaranteed secure, so avoid entering sensitive personal, account, or
+      brokerage information into valuation notes or overrides.
+    </p>
+  </section>
+</main>
+{% endblock %}

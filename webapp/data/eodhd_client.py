@@ -4,17 +4,16 @@ webapp/data/eodhd_client.py
 EODHD (End of Day Historical Data) API client.
 
 Provides up to 20+ years of audited annual financial history — far more
-than yfinance's 4-year limit.
+than the legacy 4-year fallback limit.
 
-API key:  691aca08424c26.36039280  (default; override with EODHD_API_KEY env var)
+API key:  read from EODHD_API_KEY (or EOD_API_KEY) environment variable
 Base URL: https://eodhd.com/api
 
 Endpoints used:
   GET /real-time/{TICKER}.US?api_token=…&fmt=json     → live price   (5-min  cache)
   GET /fundamentals/{TICKER}.US?api_token=…&fmt=json  → fundamentals (6-hour cache)
 
-Returns the same dict schema as yfinance_client.build_dashboard_data()
-so it is a drop-in replacement in the data pipeline.
+Returns the dashboard dict schema consumed by templates and API routes.
 """
 
 from __future__ import annotations
@@ -32,10 +31,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 from auto_valuation.config import LEARNING_CONFIG
+from auto_valuation.assumptions.wacc import compute_pre_tax_cost_of_debt
+from auto_valuation.data.macro import compute_crp, compute_size_premium, fetch_damodaran_erp
 from auto_valuation.learning.confidence import build_ranked_confidence_model
 
 # ── API configuration ─────────────────────────────────────────────────────────
-_EODHD_KEY_DEFAULT = "691aca08424c26.36039280"
 _EODHD_BASE        = "https://eodhd.com/api"
 
 # ── Disk-cache directory ──────────────────────────────────────────────────────
@@ -83,8 +83,15 @@ def _macro_regime_from_rf(rf_rate_decimal: float) -> str:
 # ── Optional dependency check ─────────────────────────────────────────────────
 try:
     import requests as _req
+    from requests.adapters import HTTPAdapter
+
+    _SESSION = _req.Session()
+    _ADAPTER = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0)
+    _SESSION.mount("https://", _ADAPTER)
+    _SESSION.mount("http://", _ADAPTER)
     _REQUESTS_OK = True
 except ImportError:
+    _SESSION = None
     _REQUESTS_OK = False
     logger.warning("requests not installed — EODHD client unavailable.")
 
@@ -102,7 +109,10 @@ except ImportError:
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _api_key() -> str:
-    return os.environ.get("EODHD_API_KEY", _EODHD_KEY_DEFAULT)
+    key = (os.environ.get("EODHD_API_KEY") or os.environ.get("EOD_API_KEY") or "").strip()
+    if not key and (os.environ.get("VERCEL") or os.environ.get("FLASK_ENV") == "production"):
+        raise RuntimeError("EODHD_API_KEY is required in production.")
+    return key
 
 
 def _sf(val: Any, default: float = 0.0) -> float:
@@ -309,12 +319,19 @@ def _historical_ebit_margin_anchor(ebit_margins: list[float], fallback: float) -
 
 def _get(endpoint: str, params: dict | None = None) -> Any | None:
     """HTTP GET against EODHD API. Returns parsed JSON or None on failure."""
-    if not _REQUESTS_OK:
+    if not _REQUESTS_OK or _SESSION is None:
         return None
-    p = {"api_token": _api_key(), "fmt": "json", **(params or {})}
+    try:
+        key = _api_key()
+    except RuntimeError:
+        raise
+    if not key:
+        logger.warning("EODHD API key missing; live EODHD request skipped for %s", endpoint)
+        return None
+    p = {"api_token": key, "fmt": "json", **(params or {})}
     url = f"{_EODHD_BASE}/{endpoint}"
     try:
-        r = _req.get(url, params=p, timeout=15)
+        r = _SESSION.get(url, params=p, timeout=15)
         r.raise_for_status()
         return r.json()
     except Exception as exc:
@@ -404,6 +421,150 @@ def fetch_historical_price_series(
     if history:
         _cache_write(cache_key, history, ttl_sec=_TTL_EOD_HISTORY_SEC)
     return history
+
+
+# ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (S6) — screener-based peer discovery.
+_TTL_SCREENER_SEC = 86_400 * 7  # 7 days
+
+
+def fetch_screener_peers(
+    *,
+    sector: str | None = None,
+    industry: str | None = None,
+    exchange: str | None = None,
+    min_market_cap_mm: float = 100.0,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Discover companies that match the given sector/industry filter via EODHD's
+    /screener endpoint. Returns a list of {code, name, market_cap, exchange}
+    dicts ranked by market cap. Cached for 7 days to conserve API quota."""
+    if not (sector or industry):
+        return []
+    key_bits = [
+        f"sector={sector or ''}",
+        f"industry={industry or ''}",
+        f"exch={exchange or ''}",
+        f"cap={int(min_market_cap_mm)}",
+        f"lim={int(limit)}",
+    ]
+    cache_key = "screener_" + "_".join(b.replace("/", "_").replace(" ", "_") for b in key_bits)
+    cached = _cache_read(cache_key, _TTL_SCREENER_SEC)
+    if cached:
+        return list(cached)
+
+    filters: list[list[Any]] = []
+    if sector:
+        filters.append(["sector", "=", sector])
+    if industry:
+        filters.append(["industry", "=", industry])
+    if exchange:
+        filters.append(["exchange", "=", exchange])
+    if min_market_cap_mm > 0:
+        filters.append(["market_capitalization", ">", int(min_market_cap_mm * 1_000_000)])
+
+    params = {
+        "filters": json.dumps(filters),
+        "sort": "market_capitalization.desc",
+        "limit": int(max(1, min(100, limit))),
+    }
+    data = _get("screener", params=params)
+    rows: list[dict[str, Any]] = []
+    if isinstance(data, dict):
+        items = data.get("data") or []
+        if isinstance(items, list):
+            for entry in items:
+                if not isinstance(entry, dict):
+                    continue
+                rows.append({
+                    "code":       str(entry.get("code") or ""),
+                    "name":       str(entry.get("name") or ""),
+                    "exchange":   str(entry.get("exchange") or ""),
+                    "sector":     str(entry.get("sector") or ""),
+                    "industry":   str(entry.get("industry") or ""),
+                    "market_cap": _sf(entry.get("market_capitalization")) or 0.0,
+                })
+    if rows:
+        _cache_write(cache_key, rows, ttl_sec=_TTL_SCREENER_SEC)
+    return rows
+
+
+# ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (F1) — news-sentiment signal.
+_TTL_SENTIMENT_SEC = 86_400  # 1 day
+
+
+def fetch_news_sentiment(
+    ticker: str,
+    *,
+    window_days: int = 30,
+) -> dict[str, Any]:
+    """Return aggregated EODHD news-sentiment for ``ticker`` over the last
+    ``window_days`` calendar days.  Schema:
+        {
+          "sentiment_avg":   float in [-1, 1] or None,
+          "article_count":   int,
+          "window_days":     int,
+          "label":           "bullish" | "neutral" | "bearish" | None,
+        }
+    Returns an empty dict on API failure so callers can degrade gracefully.
+    """
+    if not ticker:
+        return {}
+    code = _eodhd_code(ticker)
+    cache_key = f"sent_{code.replace('.', '_')}_{int(window_days)}"
+    cached = _cache_read(cache_key, _TTL_SENTIMENT_SEC)
+    if cached:
+        return cached
+
+    from datetime import date as _date, timedelta as _td
+    end = _date.today()
+    start = end - _td(days=int(window_days))
+    data = _get(
+        "sentiments",
+        params={"s": code, "from": start.isoformat(), "to": end.isoformat()},
+    )
+    if not isinstance(data, dict):
+        return {}
+    series = data.get(code) or next(iter(data.values()), [])
+    if not isinstance(series, list) or not series:
+        return {}
+
+    scores: list[float] = []
+    counts: list[int] = []
+    for row in series:
+        if not isinstance(row, dict):
+            continue
+        n = int(_sf(row.get("count"), default=0) or 0)
+        s = _sf(row.get("normalized"))
+        if s is None or n <= 0:
+            continue
+        scores.append(float(s) * n)
+        counts.append(n)
+    total_count = sum(counts)
+    if total_count == 0:
+        result: dict[str, Any] = {
+            "sentiment_avg": None,
+            "article_count": 0,
+            "window_days":   int(window_days),
+            "label":         None,
+        }
+    else:
+        avg = sum(scores) / total_count
+        if avg >= 0.15:
+            label = "bullish"
+        elif avg <= -0.15:
+            label = "bearish"
+        else:
+            label = "neutral"
+        result = {
+            "sentiment_avg": round(avg, 4),
+            "article_count": total_count,
+            "window_days":   int(window_days),
+            "label":         label,
+        }
+    _cache_write(cache_key, result, ttl_sec=_TTL_SENTIMENT_SEC)
+    return result
+
+
 
 
 def _sorted_yearly(section: dict, n_max: int = 10) -> list[dict]:
@@ -666,6 +827,163 @@ def _extract_consensus_growth(
         return None
     growth = (best_rev_avg / revenue_base_mm - 1.0) * 100.0
     return round(max(-30.0, min(80.0, growth)), 1)
+
+
+def _extract_analyst_ratings_payload(anal: dict[str, Any], current_price: float) -> dict[str, Any]:
+    """Surface the EODHD ``AnalystRatings`` block on the dashboard payload.
+
+    Reference: ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (P4).
+    """
+    if not isinstance(anal, dict):
+        return {}
+    target = _sf(anal.get("TargetPrice"))
+    rating = _sf(anal.get("Rating"))
+    strong_buy = int(_sf(anal.get("StrongBuy"), default=0) or 0)
+    buy = int(_sf(anal.get("Buy"), default=0) or 0)
+    hold = int(_sf(anal.get("Hold"), default=0) or 0)
+    sell = int(_sf(anal.get("Sell"), default=0) or 0)
+    strong_sell = int(_sf(anal.get("StrongSell"), default=0) or 0)
+    total = strong_buy + buy + hold + sell + strong_sell
+    pvt: float | None = None
+    if target and current_price:
+        try:
+            pvt = round(float(current_price) / float(target), 4)
+        except Exception:
+            pvt = None
+    return {
+        "analyst_target_price":  round(target, 2) if target else None,
+        "analyst_rating":        round(rating, 2) if rating else None,
+        "analyst_strong_buy":    strong_buy,
+        "analyst_buy":           buy,
+        "analyst_hold":          hold,
+        "analyst_sell":          sell + strong_sell,
+        "analyst_total":         total,
+        "price_vs_target":       pvt,
+    }
+
+
+def _extract_earnings_surprise(earnings: dict[str, Any]) -> dict[str, Any]:
+    """Compute trailing 4Q earnings-surprise statistics from EODHD ``Earnings.History``.
+
+    Reference: ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (P5).
+    """
+    history = (earnings or {}).get("History") or {}
+    if not isinstance(history, dict):
+        return {}
+    rows: list[tuple[str, float]] = []
+    for entry in history.values():
+        if not isinstance(entry, dict):
+            continue
+        surprise = _sf(entry.get("surprisePercent"))
+        actual = _sf(entry.get("epsActual"))
+        if surprise is None or actual is None or actual == 0:
+            continue
+        date_str = str(entry.get("date") or entry.get("reportDate") or "")
+        rows.append((date_str, float(surprise)))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    recent = rows[:4]
+    if not recent:
+        return {
+            "earnings_surprise_avg_4q": None,
+            "earnings_beat_count_4q": 0,
+            "earnings_quarters_used": 0,
+        }
+    surprises = [r[1] for r in recent]
+    return {
+        "earnings_surprise_avg_4q": round(sum(surprises) / len(surprises), 2),
+        "earnings_beat_count_4q":   sum(1 for s in surprises if s > 0),
+        "earnings_quarters_used":   len(recent),
+    }
+
+
+def _extract_eps_revision_signal(earnings: dict[str, Any]) -> dict[str, Any]:
+    """Pull EPS revision momentum (current vs 30-day-ago consensus) from
+    ``Earnings.Trend`` +1y. Reference: ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (S4)."""
+    trend = (earnings or {}).get("Trend") or {}
+    if not isinstance(trend, dict):
+        return {}
+    plus_1y = next(
+        (e for e in trend.values()
+         if isinstance(e, dict) and str(e.get("period") or "").lower() == "+1y"),
+        None,
+    )
+    if not plus_1y:
+        return {}
+    cur = _sf(plus_1y.get("epsTrendCurrent"))
+    d30 = _sf(plus_1y.get("epsTrend30daysAgo"))
+    rev_up = _sf(plus_1y.get("epsRevisionsUpLast30days"), default=0) or 0
+    rev_dn = _sf(plus_1y.get("epsRevisionsDownLast30days"), default=0) or 0
+    momentum = None
+    if cur is not None and d30 not in (None, 0):
+        momentum = round((cur - d30) / abs(d30), 4)
+    return {
+        "eps_revision_momentum_30d": momentum,
+        "eps_revisions_up_30d":      int(rev_up),
+        "eps_revisions_down_30d":    int(rev_dn),
+    }
+
+
+def _extract_insider_signal(
+    insiders: dict[str, Any] | list[Any],
+    *,
+    window_days: int = 90,
+) -> dict[str, Any]:
+    """Aggregate net insider activity over the last ``window_days``.
+
+    Reference: ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (M2).
+    """
+    if isinstance(insiders, dict):
+        entries = list(insiders.values())
+    elif isinstance(insiders, list):
+        entries = insiders
+    else:
+        return {}
+    if not entries:
+        return {}
+
+    from datetime import date as _date, timedelta as _td
+    cutoff = _date.today() - _td(days=window_days)
+
+    net_shares = 0.0
+    buys = 0
+    sells = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        date_str = str(entry.get("transactionDate") or entry.get("date") or "")
+        try:
+            d = _date.fromisoformat(date_str[:10])
+        except Exception:
+            continue
+        if d < cutoff:
+            continue
+        amt = _sf(entry.get("transactionAmount"))
+        if amt is None:
+            continue
+        side = str(entry.get("transactionAcquiredDisposed") or "").upper()
+        if side == "A":
+            net_shares += amt
+            buys += 1
+        elif side == "D":
+            net_shares -= amt
+            sells += 1
+
+    if buys == 0 and sells == 0:
+        return {}
+
+    if net_shares > 0:
+        signal = "buying"
+    elif net_shares < 0:
+        signal = "selling"
+    else:
+        signal = "neutral"
+
+    return {
+        "insider_net_shares_90d":   int(net_shares),
+        "insider_buy_count_90d":    buys,
+        "insider_sell_count_90d":   sells,
+        "insider_signal_90d":       signal,
+    }
 
 
 def _forecast_horizon_year(data: dict[str, Any]) -> int:
@@ -1630,8 +1948,8 @@ def build_dashboard_data(
 ) -> dict | None:  # noqa: C901
     """
     Fetch live data from EODHD and run a full 7-year DCF.
-    Returns the complete dashboard dict (same schema as yfinance_client),
-    or None on any failure so the caller can fall back to yfinance.
+    Returns the complete dashboard dict, or None on any failure so the caller
+    can fall back to the next configured provider.
 
     *overrides* (optional): dict of user-supplied parameters that replace
     auto-computed assumptions before the DCF is run.  Recognised keys:
@@ -1992,14 +2310,25 @@ def build_dashboard_data(
         beta = max(0.3, min(3.0, beta if beta != 0 else 1.0))
 
         rf_rate = _get_risk_free_rate()
-        erp     = 5.2
+        try:
+            erp = round(fetch_damodaran_erp() * 100, 1)
+        except Exception:
+            erp = 5.5
+        country_iso2 = gen.get("CountryISO") or gen.get("CountryCode") or gen.get("Country")
+        country_name = gen.get("CountryName") or gen.get("Country") or "United States"
+        crp = round(compute_crp(country_iso2=country_iso2, exchange_country=country_name) * 100, 1)
+        size_premium = round(compute_size_premium(market_cap) * 100, 1)
         # Blume (1971) adjustment pulls extreme betas toward 1.0: β_adj = 0.67·β + 0.33
         # Bloomberg and most sell-side models apply this by default.
         beta_adj = 0.67 * beta + 0.33
-        ke      = rf_rate + beta_adj * erp
+        ke      = rf_rate + beta_adj * erp + size_premium + crp
 
-        kd_pre  = (interest_expense / total_debt * 100) if total_debt > 1 and interest_expense > 0 else max(2.0, min(8.0, rf_rate + 1.5))
-        kd_pre  = max(2.0, min(12.0, kd_pre))
+        kd_pre  = compute_pre_tax_cost_of_debt(
+            interest_expense,
+            total_debt,
+            rf_rate / 100,
+            credit_spread=0.015,
+        ) * 100
 
         statutory_tax_rate = _statutory_tax_rate(gen.get("CountryName") or gen.get("Country") or "")
         if pretax_income > 1 and tax_prov > 0:
@@ -2057,6 +2386,25 @@ def build_dashboard_data(
                 0.4 * revenue_growth_near + 0.6 * _consensus_growth, 1
             )
             revenue_growth_near = max(-15.0, min(50.0, revenue_growth_near))
+
+        # ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (F5) — full anchoring to consensus
+        # Year 1 when ≥3 analysts cover the name.  Heavy-coverage names get
+        # a 90/10 blend (analysts dominate), thin-coverage stays at 60/40.
+        try:
+            _trend = (earn or {}).get("Trend") or {}
+            _plus1 = next(
+                (e for e in _trend.values()
+                 if isinstance(e, dict) and str(e.get("period") or "").lower() == "+1y"),
+                None,
+            )
+            _n_analysts_rev = int(_sf((_plus1 or {}).get("revenueNumberOfAnalysts"), default=0) or 0)
+            if _n_analysts_rev >= 3 and _consensus_growth is not None:
+                revenue_growth_near = round(
+                    0.10 * revenue_growth_near + 0.90 * _consensus_growth, 1
+                )
+                revenue_growth_near = max(-15.0, min(50.0, revenue_growth_near))
+        except Exception:
+            pass
 
         # Sector-aware terminal growth: Technology companies (cloud, AI, software,
         # semiconductors) have structural advantages — scale, R&D compounding, and
@@ -2139,7 +2487,7 @@ def build_dashboard_data(
             scenario_width_multiplier = max(1.0, float(knowledge_model_payload.get("scenario_width_multiplier") or 1.0))
 
             beta_adj = 0.67 * beta + 0.33
-            ke = rf_rate + beta_adj * erp
+            ke = rf_rate + beta_adj * erp + size_premium + crp
             kd_post = kd_pre * (1 - tax_rate_pct / 100)
             capex_steady_pct = min(capex_pct, da_pct + 3.0)
             if capex_pct > da_pct * 1.5:
@@ -2246,7 +2594,7 @@ def build_dashboard_data(
             if "beta" in _ov and _ov["beta"] is not None:
                 beta = max(0.3, min(3.0, float(_ov["beta"])))
                 beta_adj = 0.67 * beta + 0.33
-                ke = rf_rate + beta_adj * erp
+                ke = rf_rate + beta_adj * erp + size_premium + crp
                 kd_post = kd_pre * (1 - tax_rate_pct / 100)
                 total_cap = market_cap + total_debt
                 e_wt = market_cap / total_cap * 100 if total_cap > 0 else 85.0
@@ -2408,7 +2756,7 @@ def build_dashboard_data(
         )
         margin_source, margin_warn = _assumption_meta("ebit_margin_target", ebit_margin_target_source)
         beta_source, beta_warn = _assumption_meta("beta", "EODHD Technicals")
-        wacc_source, wacc_warn = _assumption_meta("wacc", f"CAPM: Rf {round(rf_rate,1)}% + β {round(beta,2)} × ERP {erp}%")
+        wacc_source, wacc_warn = _assumption_meta("wacc", f"CAPM: Rf {round(rf_rate,1)}% + β {round(beta,2)} × ERP {erp}% + size {size_premium}% + CRP {crp}%")
         tax_source, tax_warn = _assumption_meta("tax_rate_pct", "LTM effective tax rate")
         da_source, da_warn = _assumption_meta("da_pct", "LTM D&A / Revenue")
         capex_source, capex_warn = _assumption_meta("capex_pct", "LTM CapEx / Revenue")
@@ -2423,6 +2771,8 @@ def build_dashboard_data(
             {"driver": "EBIT Margin (Base)",         "auto": round(ebit_margin_base_pct, 1),  "active": round(ebit_margin_base_pct, 1),  "unit": "%", "mode": "AUTO", "source": "LTM EBIT / Revenue", "warn": None},
             {"driver": "EBIT Margin (Target Y7)",    "auto": round(ebit_margin_target, 1),    "active": round(ebit_margin_target, 1),    "unit": "%", "mode": "AUTO", "source": margin_source, "warn": margin_warn},
             {"driver": "WACC",                       "auto": wacc,  "active": wacc,  "unit": "%", "mode": "AUTO", "source": wacc_source, "warn": wacc_warn},
+            {"driver": "Size Premium",               "auto": size_premium, "active": size_premium, "unit": "%", "mode": "AUTO", "source": "Kroll/Duff & Phelps market-cap ladder", "warn": None},
+            {"driver": "Country Risk Premium",        "auto": crp, "active": crp, "unit": "%", "mode": "AUTO", "source": f"Damodaran CRP table: {country_name}", "warn": None},
             {"driver": "Cost of Debt (Pre-Tax)",     "auto": round(kd_pre, 1), "active": round(kd_pre, 1), "unit": "%", "mode": "AUTO", "source": "Interest expense / total debt", "warn": None},
             {"driver": "Beta (Levered)",             "auto": round(beta, 2),   "active": round(beta, 2),   "unit": "×",  "mode": "AUTO", "source": beta_source, "warn": beta_warn},
             {"driver": "Tax Rate",                   "auto": round(tax_rate_pct, 1), "active": round(tax_rate_pct, 1), "unit": "%", "mode": "AUTO", "source": tax_source, "warn": tax_warn},
@@ -2440,7 +2790,7 @@ def build_dashboard_data(
         flags = [
             {"name": "Data Freshness",  "status": "pass", "message": f"EODHD: {n} years of annual financials ({fy_years_asc[0]}–{fy_years_asc[-1]})."},
             {"name": "Revenue Sanity",  "status": "pass" if revenue_base > 10 else "warn", "message": f"Latest annual revenue: ${revenue_base:,.0f}M."},
-            {"name": "WACC Range",      "status": "pass", "message": f"WACC {wacc}% (β={beta:.2f}, Rf={rf_rate:.1f}%, ERP={erp}%)."},
+            {"name": "WACC Range",      "status": "pass", "message": f"WACC {wacc}% (β={beta:.2f}, Rf={rf_rate:.1f}%, ERP={erp}%, size={size_premium}%, CRP={crp}%)."},
             {"name": "WACC–g Spread",   "status": "pass" if wacc - terminal_growth >= 0.5 else "fail",
              "message": f"Spread {wacc - terminal_growth:.1f}pp {'above' if wacc - terminal_growth >= 0.5 else 'below'} 50bp minimum."},
             {"name": "TV % of EV",      "status": "warn" if tv_pct > 70 else "pass", "message": f"Terminal value = {tv_pct}% of EV."},
@@ -2466,6 +2816,12 @@ def build_dashboard_data(
             "total_analysts":       n_analysts,
             "mean_target":          round(analyst_median, 2),
         }
+
+        # Plan P4/P5/S4/M2 — extract richer signals from the EODHD fund file.
+        analyst_ratings_block = _extract_analyst_ratings_payload(anal, price)
+        earnings_surprise_block = _extract_earnings_surprise(earn)
+        eps_revision_block = _extract_eps_revision_signal(earn)
+        insider_block = _extract_insider_signal(fund.get("InsiderTransactions") or {})
 
         # ── Build result dict ─────────────────────────────────────────────
         _result = {
@@ -2523,7 +2879,8 @@ def build_dashboard_data(
             "beta":              round(beta, 2),
             "risk_free_rate":    round(rf_rate, 1),
             "erp":               erp,
-            "size_premium":      0.0,
+            "size_premium":      size_premium,
+            "country_risk_premium": crp,
             "equity_weight":     round(e_wt, 1),
             "debt_weight":       round(d_wt, 1),
             "equity_weight_pct": round(e_wt, 1),
@@ -2718,6 +3075,10 @@ def build_dashboard_data(
             "dupont":            dupont,
             "earnings_quality":  earnings_quality,
             "analyst_consensus": analyst_consensus,
+            **analyst_ratings_block,
+            **earnings_surprise_block,
+            **eps_revision_block,
+            **insider_block,
 
             "is_demo": False,
             "data_source": "eodhd",

@@ -104,7 +104,8 @@
 
   // Fire learning snapshot as fire-and-forget so bootstrap / backfill /
   // persistence run in the background for this ticker (write-mode route).
-  fetch('/api/snapshot/{{ ticker }}', { method: 'POST' }).catch(function() {});
+  var csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
+  fetch('/api/snapshot/{{ ticker }}', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } }).catch(function() {});
 
   fetch('/api/dashboard/{{ ticker }}' + (fetchSignal !== undefined ? '' : ''), fetchSignal ? { signal: fetchSignal } : {})
     .then(function(r) { return r.json(); })

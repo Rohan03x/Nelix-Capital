@@ -1,7 +1,7 @@
 """
 webapp/data/peer_lists.py
 ─────────────────────────
-Industry peer-group definitions and live metric fetching via yfinance.
+Industry peer-group definitions and live metric fetching via EODHD.
 
 Functions:
   get_peers_for_ticker(ticker, sector, industry) → list of tickers
@@ -101,7 +101,7 @@ MULTI_SEGMENT_PEERS: dict[str, dict[str, list[str]]] = {
     },
 }
 
-# Industry-level peer lists (yfinance industry string → peer tickers)
+# Industry-level peer lists (industry label → peer tickers)
 INDUSTRY_PEER_MAP: dict[str, list[str]] = {
     # Consumer Cyclical
     "Internet Retail":            ["WMT", "COST", "BABA", "MELI", "EBAY", "SHOP", "JD", "TGT", "AMZN"],
@@ -120,9 +120,9 @@ INDUSTRY_PEER_MAP: dict[str, list[str]] = {
     "Semiconductors":             ["NVDA", "AMD", "INTC", "QCOM", "AVGO", "TSM", "ASML", "AMAT", "KLAC"],
     # Note: MSFT/GOOGL/META removed – they are Software/Internet, not Consumer Electronics.
     "Consumer Electronics":       ["AAPL", "SONY", "HPQ", "DELL", "1810.HK", "NTDOY"],
-    # Electrical Equipment & Parts: lighting, switchgear, power management (canonical matches EODHD/yfinance)
+    # Electrical Equipment & Parts: lighting, switchgear, power management (EODHD canonical)
     # LIGHT.AS (Signify NV Euronext) intentionally excluded — it is a cross-listing of PHPPY.US
-    # Both keys maintained: "Electrical Equipment" (yfinance legacy) and "Electrical Equipment & Parts" (EODHD canonical)
+    # Both keys maintained: "Electrical Equipment" and "Electrical Equipment & Parts" (EODHD canonical)
     "Electrical Equipment":            ["AYI", "HUBB", "ETN", "LR.PA", "ABBN.SW", "EMR", "WOLF", "LYTS", "AMSAG.SW", "ZAG.VI"],
     "Electrical Equipment & Parts":    ["AYI", "HUBB", "ETN", "LR.PA", "ABBN.SW", "EMR", "WOLF", "LYTS", "AMSAG.SW", "ZAG.VI"],
     "Staffing & Employment Services": ["MAN", "ADEN.SW", "RAND.AS", "RHI", "KFY", "HSII"],
@@ -240,7 +240,7 @@ _INDUSTRY_STOPWORDS = {
     "specialty",
 }
 
-_YFINANCE_EXCHANGE_SUFFIX = {
+_EXCHANGE_DISPLAY_SUFFIX = {
     "AMEX": "",
     "ARCA": "",
     "AS": ".AS",
@@ -338,18 +338,18 @@ def _ticker_variants(ticker: str) -> set[str]:
     return {symbol, base}
 
 
-def _to_yfinance_ticker(code: str, exchange: str) -> str | None:
+def _to_display_ticker(code: str, exchange: str) -> str | None:
     symbol = (code or "").upper().strip()
     venue = (exchange or "").upper().strip()
     if not symbol:
         return None
     if "." in symbol:
         base, dotted_exchange = symbol.split(".", 1)
-        suffix = _YFINANCE_EXCHANGE_SUFFIX.get(dotted_exchange)
+        suffix = _EXCHANGE_DISPLAY_SUFFIX.get(dotted_exchange)
         if suffix is None:
             return symbol
         return f"{base}{suffix}"
-    suffix = _YFINANCE_EXCHANGE_SUFFIX.get(venue)
+    suffix = _EXCHANGE_DISPLAY_SUFFIX.get(venue)
     if suffix is None:
         return symbol if venue in {"", "OTC", "PINK"} else None
     return f"{symbol}{suffix}"
@@ -372,7 +372,7 @@ def _load_cached_peer_profiles() -> tuple[dict[str, Any], ...]:
         highlights = payload.get("Highlights") or {}
         code = general.get("Code") or path.stem.replace("eodhd_fund_", "").replace("_", ".")
         exchange = general.get("Exchange") or ""
-        ticker = _to_yfinance_ticker(str(code), str(exchange))
+        ticker = _to_display_ticker(str(code), str(exchange))
         if not ticker:
             continue
 
@@ -949,9 +949,29 @@ def _build_eodhd_multiples_index() -> dict[str, dict[str, Any]]:
     {ticker_variant → multiples_dict} index.
 
     Used by fetch_peer_metrics so that international peers (e.g. ABBN.SW,
-    LR.PA) get real multiples from EODHD instead of empty yfinance responses.
+    LR.PA) get real multiples from EODHD instead of empty public-web responses.
+
+    ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (M4) — pickled to disk so cold starts
+    skip the multi-thousand-file JSON scan when the snapshot is fresh.
     """
     cache_dir = Path(__file__).with_name("cache")
+    snapshot_path = cache_dir / "_peer_index.pkl"
+    snapshot_ttl_sec = 6 * 3600.0  # 6 hours
+
+    # Try fast-path disk snapshot first.
+    try:
+        import pickle, time as _t
+        if snapshot_path.exists():
+            age = _t.time() - snapshot_path.stat().st_mtime
+            if age < snapshot_ttl_sec:
+                with snapshot_path.open("rb") as f:
+                    snap = pickle.load(f)
+                if isinstance(snap, dict) and snap:
+                    logger.debug("EODHD multiples index loaded from disk (%d variants, age=%.0fs)", len(snap), age)
+                    return snap
+    except Exception as exc:
+        logger.warning("peer index disk load failed: %s", exc)
+
     index: dict[str, dict[str, Any]] = {}
 
     for path in cache_dir.glob("eodhd_fund_*.json"):
@@ -1023,6 +1043,16 @@ def _build_eodhd_multiples_index() -> dict[str, dict[str, Any]]:
                 index.setdefault(variant.upper(), metrics)
 
     logger.debug("EODHD multiples index built: %d ticker variants", len(index))
+    # M4 — persist snapshot so subsequent cold starts skip the JSON scan.
+    try:
+        import pickle
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = snapshot_path.with_suffix(".pkl.tmp")
+        with tmp.open("wb") as f:
+            pickle.dump(index, f, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(snapshot_path)
+    except Exception as exc:
+        logger.warning("peer index disk save failed: %s", exc)
     return index
 
 
@@ -1037,7 +1067,7 @@ def fetch_peer_metrics(
 
     Data source priority:
       1. EODHD fundamentals cache (covers all international tickers)
-      2. yfinance (fallback for any ticker not in the EODHD cache)
+    2. N/A row for any ticker not in the EODHD cache
 
     Returns:
         peers       — list of peer dicts (one per ticker, sorted by mkt cap desc)
@@ -1064,18 +1094,8 @@ def fetch_peer_metrics(
     eodhd_index = _build_eodhd_multiples_index()
     profiles = {str(profile.get("ticker") or ""): profile for profile in _load_cached_peer_profiles()}
 
-    # yfinance is only imported when actually needed
-    _yf: Any = None
-
-    def _get_yf():
-        nonlocal _yf
-        if _yf is None:
-            try:
-                import yfinance as yf
-                _yf = yf
-            except ImportError:
-                pass
-        return _yf
+    # Legacy public-web fallback removed — see ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (P3).
+    # Tickers missing from the EODHD index are surfaced with N/A multiples.
 
     peers: list[dict] = []
     for tk in peer_tickers:
@@ -1110,46 +1130,18 @@ def fetch_peer_metrics(
                 })
                 continue
 
-            # ── 2. yfinance fallback ──────────────────────────────────────
-            yf = _get_yf()
-            if yf is None:
-                raise RuntimeError("yfinance not available")
-
-            profile  = profiles.get(ticker_text) or {}
-            exchange = str(profile.get("exchange") or "")
-            yf_ticker = _to_yfinance_ticker(ticker_text, exchange) or ticker_text
-            info = yf.Ticker(yf_ticker).info or {}
-            mkt    = _safe_float(info.get("marketCap", 0)) / 1e6
-            rev    = _safe_float(info.get("totalRevenue", 0)) / 1e6
-            ebitda = _safe_float(info.get("ebitda", 0)) / 1e6
-            ebit   = _safe_float(info.get("ebit", 0)) / 1e6
-            ni     = _safe_float(info.get("netIncomeToCommon", 0)) / 1e6
-            fcf    = _safe_float(info.get("freeCashflow", 0)) / 1e6
-            td     = _safe_float(info.get("totalDebt", 0)) / 1e6
-            cash   = _safe_float(info.get("totalCash", 0)) / 1e6
-            ev     = mkt + td - cash if mkt > 0 else 0
-
-            def _mult(num, den):
-                if den and den > 0 and num and num > 0:
-                    return round(num / den, 2)
-                return None
-
+            # ── 2. Not in EODHD index → mark as N/A ──
             peers.append({
                 "ticker":     ticker_text,
-                "name":       info.get("shortName") or info.get("longName") or ticker_text,
-                "market_cap": round(mkt),
-                "ev":         round(ev),
-                "revenue":    round(rev),
-                "ebitda":     round(ebitda) if ebitda > 0 else None,
-                "ebit":       round(ebit)   if ebit != 0 else None,
-                "net_income": round(ni)     if ni != 0 else None,
-                "fcf":        round(fcf)    if fcf != 0 else None,
-                "ev_rev":     _mult(ev, rev),
-                "ev_ebitda":  _mult(ev, ebitda),
-                "ev_ebit":    _mult(ev, ebit),
-                "pe":         _mult(mkt, ni),
-                "p_fcf":      _mult(mkt, fcf),
+                "name":       ticker_text,
+                "market_cap": 0,
+                "ev":         0,
+                "revenue":    None, "ebitda": None, "ebit": None,
+                "net_income": None, "fcf": None,
+                "ev_rev":     None, "ev_ebitda": None, "ev_ebit": None,
+                "pe":         None, "p_fcf": None,
                 "subject":    (ticker_text == target_ticker),
+                "source":     "not_available",
             })
         except Exception as exc:
             logger.debug("Peer fetch failed for %s: %s", tk, exc)

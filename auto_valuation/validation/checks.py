@@ -37,6 +37,42 @@ _CRITICAL_IS_FIELDS = ["revenue", "ebit", "net_income", "da"]
 _CRITICAL_BS_FIELDS = ["total_assets", "total_equity", "total_liabilities"]
 _CRITICAL_CF_FIELDS = ["cfo", "capex"]
 
+_CRITICAL_CHECK_PREFIXES = (
+    "FMP_IS_",
+    "FMP_BS_",
+    "FMP_CF_",
+    "REVENUE_PRESENT",
+    "REVENUE_POSITIVE",
+    "CURRENCY_CONSISTENCY",
+)
+
+
+def _normalise_currency(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _record_currency(record: dict[str, Any]) -> str:
+    return _normalise_currency(
+        record.get("currency")
+        or record.get("reportedCurrency")
+        or record.get("reported_currency")
+    )
+
+
+def halt_on_critical_failures(
+    results: list[ValidationResult],
+    critical_prefixes: tuple[str, ...] = _CRITICAL_CHECK_PREFIXES,
+) -> None:
+    """Raise DataQualityError when a critical validation result failed."""
+    fatal = [
+        result for result in results
+        if result.status == "FAIL"
+        and any(result.name.startswith(prefix) for prefix in critical_prefixes)
+    ]
+    if fatal:
+        msgs = "; ".join(result.message or result.name for result in fatal)
+        raise DataQualityError(f"Data validation failed: {msgs}")
+
 
 def validate_fmp_data(
     income_stmts: list[dict],
@@ -85,6 +121,52 @@ def validate_fmp_data(
     _check_fields(cash_flows,     _CRITICAL_CF_FIELDS, "CF")
 
     return results
+
+
+def validate_currency_consistency(
+    profile: dict[str, Any] | None = None,
+    income_stmts: list[dict] | None = None,
+    balance_sheets: list[dict] | None = None,
+    cash_flows: list[dict] | None = None,
+    expected_currency: str | None = None,
+) -> ValidationResult:
+    """Ensure profile and statement currencies do not silently mix."""
+    observed: set[str] = set()
+    profile_currency = _record_currency(profile or {})
+    if profile_currency:
+        observed.add(profile_currency)
+    for group in (income_stmts or [], balance_sheets or [], cash_flows or []):
+        for record in group:
+            if not isinstance(record, dict):
+                continue
+            currency = _record_currency(record)
+            if currency:
+                observed.add(currency)
+
+    expected = _normalise_currency(expected_currency)
+    if expected:
+        observed.add(expected)
+
+    if not observed:
+        return ValidationResult(
+            name="CURRENCY_CONSISTENCY",
+            status="WARN",
+            message="No reporting currency metadata found; verify statements are normalised before valuation.",
+        )
+    if len(observed) > 1:
+        return ValidationResult(
+            name="CURRENCY_CONSISTENCY",
+            status="FAIL",
+            value=sorted(observed),
+            message=f"Mixed reporting currencies detected: {', '.join(sorted(observed))}.",
+        )
+    currency = next(iter(observed))
+    return ValidationResult(
+        name="CURRENCY_CONSISTENCY",
+        status="PASS",
+        value=currency,
+        message=f"All statement currency metadata resolves to {currency}.",
+    )
 
 
 def check_revenue_sanity(income_stmts: list[dict]) -> list[ValidationResult]:
@@ -757,6 +839,10 @@ def run_all_data_checks(
     income_stmts: list[dict],
     balance_sheets: list[dict],
     cash_flows: list[dict],
+    *,
+    profile: dict[str, Any] | None = None,
+    expected_currency: str | None = None,
+    halt_on_critical: bool = True,
 ) -> list[ValidationResult]:
     """
     Run all data-layer checks and return a combined list.
@@ -765,12 +851,17 @@ def run_all_data_checks(
     results: list[ValidationResult] = []
     results.extend(validate_fmp_data(income_stmts, balance_sheets, cash_flows))
     results.extend(check_revenue_sanity(income_stmts))
+    if profile is not None or expected_currency is not None:
+        results.append(validate_currency_consistency(
+            profile,
+            income_stmts,
+            balance_sheets,
+            cash_flows,
+            expected_currency,
+        ))
 
-    # Halt on hard FAILs
-    fatal = [r for r in results if r.status == "FAIL"]
-    if fatal:
-        msgs = "; ".join(r.message for r in fatal)
-        raise DataQualityError(f"Data validation failed: {msgs}")
+    if halt_on_critical:
+        halt_on_critical_failures(results)
 
     return results
 

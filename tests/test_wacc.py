@@ -20,9 +20,13 @@ from auto_valuation.assumptions.wacc import (
     relever_beta,
     blended_beta,
     cost_of_equity_capm,
+    compute_pre_tax_cost_of_debt,
+    country_adjusted_erp,
+    country_risk_premium_for_country,
     compute_capital_structure,
     compute_wacc,
     build_wacc,
+    size_premium_for_market_cap,
 )
 from auto_valuation.assumptions.growth import (
     blend_growth_estimate,
@@ -116,6 +120,30 @@ class TestCAPM:
         ke2 = cost_of_equity_capm(0.04, 1.5, 0.055)
         assert ke2 > ke1
 
+    def test_country_adjusted_erp(self):
+        assert country_adjusted_erp(0.055, 0.012) == pytest.approx(0.067)
+
+    def test_country_risk_lookup(self):
+        assert country_risk_premium_for_country("BR") == pytest.approx(0.020)
+
+    def test_size_premium_ladder(self):
+        assert size_premium_for_market_cap(250_000) == pytest.approx(0.0)
+        assert size_premium_for_market_cap(1_000) > size_premium_for_market_cap(60_000)
+
+
+class TestCostOfDebt:
+    def test_observed_interest_yield(self):
+        kd = compute_pre_tax_cost_of_debt(interest_expense=50, total_debt=1_000, risk_free_rate=0.04)
+        assert kd == pytest.approx(0.05)
+
+    def test_fallback_rf_plus_spread(self):
+        kd = compute_pre_tax_cost_of_debt(interest_expense=0, total_debt=0, risk_free_rate=0.04, credit_spread=0.02)
+        assert kd == pytest.approx(0.06)
+
+    def test_cost_of_debt_capped(self):
+        kd = compute_pre_tax_cost_of_debt(interest_expense=500, total_debt=1_000, risk_free_rate=0.04)
+        assert kd == pytest.approx(0.12)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Capital structure weights
@@ -198,6 +226,8 @@ class TestBuildWacc:
         d = self._run()
         assert "cost_of_equity" in d
         assert "pre_tax_cost_of_debt" in d
+        assert "size_premium" in d
+        assert "country_risk_premium" in d
 
     def test_blume_adjustment_applied(self):
         d_low_beta  = self._run(beta=0.80)

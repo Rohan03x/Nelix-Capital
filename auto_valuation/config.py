@@ -261,7 +261,7 @@ LEARNING_CONFIG: dict[str, Any] = {
     "research_cache_ttl_days": 7,
     "max_research_queries_per_run": 12,
     "min_source_credibility": 0.3,
-    "min_analog_similarity": 0.60,
+    "min_analog_similarity": 0.75,
     "max_analogs_returned": 10,
     "relationship_graph_max_neighbors": 10,
     "cross_sector_only": True,

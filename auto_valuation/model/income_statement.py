@@ -41,12 +41,79 @@ def historical_revenue_cagr(
     return (rev_recent / rev_base) ** (1 / years) - 1
 
 
+def infer_revenue_lifecycle_stage(
+    base_revenue: float,
+    near_term_growth: float,
+    terminal_growth: float,
+) -> str:
+    """Classify revenue maturity for dynamic fade scheduling."""
+    revenue = float(base_revenue or 0.0)
+    near = float(near_term_growth or 0.0)
+    terminal = float(terminal_growth or 0.0)
+    spread = near - terminal
+    if near <= 0 or spread <= 0.005:
+        return "declining"
+    if near >= 0.18 or (revenue > 0 and revenue < 1_000 and near >= 0.10):
+        return "hypergrowth"
+    if near >= 0.10 or (revenue > 0 and revenue < 10_000 and near >= 0.06):
+        return "growth"
+    if revenue >= 50_000 and near <= 0.06:
+        return "mature"
+    return "standard"
+
+
+def revenue_growth_fade_schedule(
+    near_term_growth: float,
+    terminal_growth: float,
+    forecast_years: int = 10,
+    fade_start_year: int = 3,
+    lifecycle_stage: str | None = None,
+) -> list[float]:
+    """Return annual revenue growth rates with optional lifecycle-aware fade."""
+    if forecast_years <= 0:
+        return []
+
+    stage = (lifecycle_stage or "standard").lower()
+    hold_year = int(fade_start_year or 1)
+    curvature = 1.0
+    if stage == "hypergrowth":
+        hold_year = min(max(2, hold_year), max(1, forecast_years - 1))
+        curvature = 0.75
+    elif stage == "growth":
+        hold_year = min(max(2, hold_year), max(1, forecast_years - 1))
+        curvature = 0.90
+    elif stage == "mature":
+        hold_year = 1
+        curvature = 1.25
+    elif stage == "declining":
+        hold_year = 1
+        curvature = 1.0
+
+    hold_year = max(1, min(hold_year, forecast_years))
+    if forecast_years == 1:
+        return [terminal_growth]
+
+    schedule: list[float] = []
+    fade_years = max(1, forecast_years - hold_year)
+    for year in range(1, forecast_years + 1):
+        if year <= hold_year:
+            growth = near_term_growth
+        else:
+            progress = (year - hold_year) / fade_years
+            shaped_progress = max(0.0, min(1.0, progress)) ** curvature
+            growth = near_term_growth + (terminal_growth - near_term_growth) * shaped_progress
+        schedule.append(growth)
+    schedule[-1] = terminal_growth
+    return schedule
+
+
 def build_revenue_forecast(
     base_revenue: float,
     near_term_growth: float,
     terminal_growth: float,
     forecast_years: int = 10,
     fade_start_year: int = 3,
+    lifecycle_stage: str | None = None,
 ) -> list[float]:
     """
     Build a revenue forecast list using a linear growth fade.
@@ -58,16 +125,22 @@ def build_revenue_forecast(
     Returns a list of `forecast_years` revenue values (not growth rates).
     Reference: Part 5.
     """
+    if lifecycle_stage == "auto":
+        lifecycle_stage = infer_revenue_lifecycle_stage(
+            base_revenue,
+            near_term_growth,
+            terminal_growth,
+        )
+    growth_schedule = revenue_growth_fade_schedule(
+        near_term_growth,
+        terminal_growth,
+        forecast_years,
+        fade_start_year,
+        lifecycle_stage,
+    )
     revenues: list[float] = []
     prev = base_revenue
-    for yr in range(1, forecast_years + 1):
-        if yr <= fade_start_year:
-            g = near_term_growth
-        else:
-            # Linear fade
-            total_fade_years = forecast_years - fade_start_year
-            elapsed = yr - fade_start_year
-            g = near_term_growth + (terminal_growth - near_term_growth) * (elapsed / total_fade_years)
+    for g in growth_schedule:
         prev = prev * (1 + g)
         revenues.append(prev)
     return revenues

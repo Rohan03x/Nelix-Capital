@@ -27,7 +27,9 @@ from auto_valuation.model.income_statement import (
     historical_da_pct,
     historical_ebit_margin,
     historical_revenue_cagr,
+    infer_revenue_lifecycle_stage,
     normalise_tax_rate,
+    revenue_growth_fade_schedule,
 )
 
 # ── working_capital ───────────────────────────────────────────────────────────
@@ -152,6 +154,16 @@ class TestBuildRevenueForecast:
         # Last year applies terminal growth 0.03 (linear fade reaches 0.03 at year 10)
         growth_yr10 = revenues[9] / revenues[8] - 1
         assert growth_yr10 == pytest.approx(0.03, abs=1e-4)
+
+    def test_lifecycle_stage_inference(self):
+        assert infer_revenue_lifecycle_stage(500, 0.22, 0.03) == "hypergrowth"
+        assert infer_revenue_lifecycle_stage(90_000, 0.04, 0.025) == "mature"
+
+    def test_mature_lifecycle_fades_earlier_than_growth(self):
+        mature = revenue_growth_fade_schedule(0.08, 0.03, forecast_years=7, fade_start_year=3, lifecycle_stage="mature")
+        growth = revenue_growth_fade_schedule(0.08, 0.03, forecast_years=7, fade_start_year=3, lifecycle_stage="growth")
+        assert mature[1] < growth[1]
+        assert mature[-1] == pytest.approx(0.03)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

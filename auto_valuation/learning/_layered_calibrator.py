@@ -47,6 +47,10 @@ class CalibrationObservation:
     actual_reinvestment_rate: float | None = None
     structural_break_flag: bool = False
     feature_vector: dict[str, float] | tuple[float, ...] | list[float] | None = None
+    # ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (S2/S3/M3) — point-in-time + growth dim
+    as_of_year: int | None = None
+    rf_rate_at_time: float | None = None
+    growth_regime: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -231,6 +235,57 @@ def _error_series(observations: list[Any], actual_key: str, predicted_key: str) 
             continue
         errors.append(float(actual) - float(predicted))
     return errors
+
+
+# ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (S3) — exponential time-decay weighting.
+# An observation from N years ago contributes exp(-DECAY * N) of its weight.
+# Half-life ≈ ln(2)/0.15 ≈ 4.6 years.
+_TIME_DECAY_RATE: float = 0.15
+
+
+def _observation_weight(observation: Any, current_year: int) -> float:
+    as_of = _get(observation, "as_of_year")
+    if as_of is None:
+        return 1.0
+    try:
+        age = max(0.0, float(current_year) - float(as_of))
+    except (TypeError, ValueError):
+        return 1.0
+    return math.exp(-_TIME_DECAY_RATE * age)
+
+
+def _weighted_robust_mean(
+    observations: list[Any],
+    actual_key: str,
+    predicted_key: str,
+    *,
+    current_year: int | None = None,
+) -> float:
+    """Trimmed weighted mean of (actual - predicted) with exponential time decay.
+    Falls back to unweighted ``_robust_mean`` when no ``as_of_year`` is present."""
+    cur = current_year or date.today().year
+    pairs: list[tuple[float, float]] = []
+    for o in observations:
+        a = _get(o, actual_key)
+        p = _get(o, predicted_key)
+        if a is None or p is None:
+            continue
+        err = float(a) - float(p)
+        w = _observation_weight(o, cur)
+        if w <= 0:
+            continue
+        pairs.append((err, w))
+    if not pairs:
+        return 0.0
+    if all(abs(w - pairs[0][1]) < 1e-9 for _, w in pairs):
+        return _robust_mean([e for e, _ in pairs])
+    pairs.sort(key=lambda t: t[0])
+    if len(pairs) > 4:
+        trim = max(1, int(len(pairs) * 0.1))
+        pairs = pairs[trim:-trim] or pairs
+    total_w = sum(w for _, w in pairs)
+    return sum(e * w for e, w in pairs) / total_w if total_w > 0 else 0.0
+
 
 
 def _robust_mean(values: list[float]) -> float:
@@ -571,7 +626,8 @@ def _build_assumption_summary(
         errors = _error_series(cohort, spec.actual_key, spec.predicted_key)
         if not errors:
             continue
-        residual_mean = _robust_mean(errors)
+        # S3 — exponential time-decay weighted residual (recent obs > older obs).
+        residual_mean = _weighted_robust_mean(cohort, spec.actual_key, spec.predicted_key)
         residual_std = max(_robust_std(errors), spec.min_sigma)
         scale_penalty = 1.0 + (residual_std / max(spec.min_sigma, 1e-6))
         raw_weight = priority * math.sqrt(len(errors)) / scale_penalty

@@ -1,5 +1,5 @@
 """
-data/fetcher.py — All market data fetching: FMP, yfinance, FRED, Damodaran.
+data/fetcher.py — All market data fetching: FMP, EODHD, FRED, Damodaran.
 
 Reference: Architecture Plan Parts 2.1, A.1-A.4, 28, 37.1, 45, 55.1, 78.2, 79.2.
 
@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any
 
 import requests
-import yfinance as yf
 
 from auto_valuation.config import (
     FMP_BASE_URL,
@@ -156,88 +155,201 @@ def fetch_sec_filings_8k(ticker: str, limit: int = 20) -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1B — yfinance data (market price, beta, 52-week range)
+# 1B — EODHD market data (market price, beta, 52-week range)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_yfinance_info(ticker: str) -> dict:
-    """
-    yfinance .info dict: marketCap, currentPrice, beta,
-    fiftyTwoWeekHigh, fiftyTwoWeekLow, regularMarketPreviousClose.
-    Reference: Parts 79.2, A.2.
-    """
-    try:
-        t = yf.Ticker(ticker)
-        info = t.info or {}
+def fetch_market_info(ticker: str) -> dict:
+    """Return basic market data from EODHD fund cache + real-time endpoint."""
+    info = fetch_eodhd_info(ticker)
+    if info:
         return info
-    except Exception as exc:
-        raise DataFetchError(f"yfinance fetch failed for {ticker}: {exc}") from exc
+    raise DataFetchError(f"No EODHD market data available for {ticker}")
+
+
+def fetch_eodhd_info(ticker: str) -> dict:
+    """Build a market-info dict from EODHD fund cache + real-time price."""
+    try:
+        from webapp.data import eodhd_client as _eod
+        code = _eod._eodhd_code(ticker)
+        fund = _eod._fetch_fundamentals(code) or {}
+        price = _eod._fetch_price(code) or {}
+    except Exception:
+        return {}
+
+    if not fund:
+        return {}
+
+    gen = fund.get("General", {}) or {}
+    hi = fund.get("Highlights", {}) or {}
+    tech = fund.get("Technicals", {}) or {}
+    share = fund.get("SharesStats", {}) or {}
+
+    info: dict = {
+        "shortName": gen.get("Name"),
+        "longName": gen.get("Name"),
+        "sector": gen.get("Sector"),
+        "industry": gen.get("Industry"),
+        "country": gen.get("CountryName") or gen.get("Country"),
+        "currency": gen.get("CurrencyCode"),
+        "exchange": gen.get("Exchange"),
+        "marketCap": hi.get("MarketCapitalization"),
+        "beta": tech.get("Beta"),
+        "fiftyTwoWeekHigh": tech.get("52WeekHigh"),
+        "fiftyTwoWeekLow": tech.get("52WeekLow"),
+        "sharesOutstanding": share.get("SharesOutstanding"),
+        "floatShares": share.get("SharesFloat"),
+        "trailingPE": hi.get("PERatio"),
+        "forwardPE": hi.get("ForwardPE"),
+        "dividendYield": hi.get("DividendYield"),
+        "ebitda": hi.get("EBITDA"),
+        "totalRevenue": hi.get("RevenueTTM"),
+        "profitMargins": hi.get("ProfitMargin"),
+        "ipoDate": gen.get("IPODate"),
+    }
+    if isinstance(price, dict):
+        close = price.get("close")
+        if close not in (None, "NA"):
+            info["currentPrice"] = close
+            info["regularMarketPreviousClose"] = price.get("previousClose") or close
+    return {k: v for k, v in info.items() if v is not None}
 
 
 def fetch_52wk_range(ticker: str) -> dict[str, float | None]:
-    """
-    Return {"high_52wk": float, "low_52wk": float, "current_price": float}.
-    Primary: yfinance .info. Fallback: 1-year history max/min.
-    Reference: Part 79.2.
-    """
-    try:
-        t = yf.Ticker(ticker)
-        info = t.info or {}
+    """Return ``{high_52wk, low_52wk, current_price}`` via EODHD."""
+    info = fetch_eodhd_info(ticker)
+    if info:
         high = info.get("fiftyTwoWeekHigh")
-        low  = info.get("fiftyTwoWeekLow")
+        low = info.get("fiftyTwoWeekLow")
         price = info.get("currentPrice") or info.get("regularMarketPreviousClose")
 
-        # Fallback: compute from 1-year price history
         if high is None or low is None:
-            hist = t.history(period="1y")
-            if not hist.empty:
-                high = float(hist["High"].max())
-                low  = float(hist["Low"].min())
-                if price is None and not hist.empty:
-                    price = float(hist["Close"].iloc[-1])
+            try:
+                from datetime import date as _date, timedelta as _td
+                from webapp.data import eodhd_client as _eod
+                code = _eod._eodhd_code(ticker)
+                series = _eod.fetch_historical_price_series(
+                    code,
+                    start_date=_date.today() - _td(days=400),
+                    end_date=_date.today(),
+                )
+                closes = [float(p["adjusted_close"]) for p in series if p.get("adjusted_close")]
+                if closes:
+                    high = high or max(closes)
+                    low = low or min(closes)
+                    price = price or closes[-1]
+            except Exception:
+                pass
 
-        return {"high_52wk": high, "low_52wk": low, "current_price": price}
-    except Exception as exc:
-        raise DataFetchError(f"52-week range fetch failed for {ticker}: {exc}") from exc
+        if high is not None and low is not None:
+            return {"high_52wk": high, "low_52wk": low, "current_price": price}
+    raise DataFetchError(f"52-week range fetch failed for {ticker}: no EODHD data")
 
 
 def check_price_freshness(ticker: str, max_stale_days: int = PRICE_STALENESS_DAYS) -> dict:
-    """
-    Verify that yfinance price data is fresh (< max_stale_days trading days old).
-    Returns {"fresh": bool, "last_date": str, "days_stale": int}.
-    Reference: Part 55.1.
-    """
+    """Check price freshness via EODHD real-time endpoint."""
     try:
-        t = yf.Ticker(ticker)
-        hist = t.history(period="5d")
-        if hist.empty:
-            return {"fresh": False, "last_date": None, "days_stale": 999}
-        last_dt = hist.index[-1]
-        # Convert to date (handles timezone-aware index)
-        if hasattr(last_dt, "date"):
-            last_date = last_dt.date()
-        else:
-            last_date = datetime.utcfromtimestamp(last_dt.timestamp()).date()
-        today = date.today()
-        delta = (today - last_date).days
-        return {
-            "fresh":      delta <= max_stale_days,
-            "last_date":  last_date.isoformat(),
-            "days_stale": delta,
-        }
+        from webapp.data import eodhd_client as _eod
+        code = _eod._eodhd_code(ticker)
+        price = _eod._fetch_price(code) or {}
+        ts = price.get("timestamp")
+        if ts:
+            last_date = datetime.utcfromtimestamp(int(ts)).date()
+            delta = (date.today() - last_date).days
+            return {
+                "fresh": delta <= max_stale_days,
+                "last_date": last_date.isoformat(),
+                "days_stale": delta,
+            }
     except Exception:
-        return {"fresh": False, "last_date": None, "days_stale": 999}
+        pass
+    return {"fresh": False, "last_date": None, "days_stale": 999}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1C — FRED (risk-free rate, GDP growth)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# EODHD macro context (cached for 30 days; replaces FRED for non-US tickers).
+_MACRO_CACHE: dict[str, tuple[float, dict[str, float]]] = {}
+_MACRO_TTL_SEC = 60 * 60 * 24 * 30  # 30 days
+
+
+def fetch_macro_context_eodhd(country_iso3: str = "USA") -> dict[str, float]:
+    """Country-specific macro context from EODHD ``/macro-indicator``.
+
+    Returns dict with possible keys:
+      ``risk_free_rate``      — real_interest_rate (decimal, e.g. 0.025)
+      ``gdp_growth_real``     — real GDP growth (decimal)
+      ``gdp_growth_nominal``  — real + inflation_consumer_prices_annual
+      ``inflation``           — CPI inflation (decimal)
+
+    Cached in-process for 30 days. Returns ``{}`` on any failure.
+    """
+    api_key = (
+        os.getenv("EODHD_API_KEY", "").strip()
+        or os.getenv("EOD_API_KEY", "").strip()
+    )
+    if not api_key:
+        return {}
+
+    iso = (country_iso3 or "USA").upper()
+    cached = _MACRO_CACHE.get(iso)
+    if cached and (time.time() - cached[0]) < _MACRO_TTL_SEC:
+        return dict(cached[1])
+
+    def _latest(indicator: str) -> float | None:
+        try:
+            r = requests.get(
+                f"https://eodhistoricaldata.com/api/macro-indicator/{iso}",
+                params={"indicator": indicator, "api_token": api_key, "fmt": "json"},
+                timeout=12,
+            )
+            r.raise_for_status()
+            data = r.json() or []
+            if not isinstance(data, list) or not data:
+                return None
+            sorted_rows = sorted(
+                (row for row in data if isinstance(row, dict) and row.get("Value") not in (None, "")),
+                key=lambda row: str(row.get("Date") or ""),
+                reverse=True,
+            )
+            if not sorted_rows:
+                return None
+            return float(sorted_rows[0]["Value"])
+        except Exception:
+            return None
+
+    real_rate_pct = _latest("real_interest_rate")
+    gdp_real_pct = _latest("gdp_growth_annual")
+    cpi_pct = _latest("inflation_consumer_prices_annual")
+
+    out: dict[str, float] = {}
+    if real_rate_pct is not None:
+        out["risk_free_rate"] = real_rate_pct / 100.0
+    if gdp_real_pct is not None:
+        out["gdp_growth_real"] = gdp_real_pct / 100.0
+    if cpi_pct is not None:
+        out["inflation"] = cpi_pct / 100.0
+    if "gdp_growth_real" in out:
+        out["gdp_growth_nominal"] = out["gdp_growth_real"] + out.get("inflation", 0.02)
+
+    if out:
+        _MACRO_CACHE[iso] = (time.time(), out)
+    return out
+
+
 def fetch_risk_free_rate(series: str = RF_FRED_SERIES) -> float:
+    """Risk-free rate. Priority: EODHD macro (any country) → FRED → fallback.
+    Reference: Parts 4.3, A.3 + ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (S1).
     """
-    Fetch the latest 10-year Treasury yield from FRED as a decimal.
-    Falls back to RF_DEFAULT_FALLBACK if FRED_API_KEY is not set or call fails.
-    Reference: Parts 4.3, A.3.
-    """
+    try:
+        ctx = fetch_macro_context_eodhd("USA")
+        rf = ctx.get("risk_free_rate")
+        if rf is not None:
+            return float(rf)
+    except Exception:
+        pass
+
     fred_key = os.getenv("FRED_API_KEY", "")
     if not fred_key:
         return RF_DEFAULT_FALLBACK
@@ -263,11 +375,18 @@ def fetch_risk_free_rate(series: str = RF_FRED_SERIES) -> float:
 
 
 def fetch_gdp_growth_estimate() -> float:
+    """Trailing nominal GDP growth (US default).
+    Priority: EODHD macro indicator → FRED → 4.0% fallback.
+    Reference: Architecture Plan + ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (S1).
     """
-    Fetch trailing nominal US GDP growth rate from FRED (GDP series, annual % change).
-    Used as a ceiling for terminal growth rate validation.
-    Falls back to 0.04 (4%) if unavailable.
-    """
+    try:
+        ctx = fetch_macro_context_eodhd("USA")
+        g = ctx.get("gdp_growth_nominal")
+        if g is not None:
+            return float(g)
+    except Exception:
+        pass
+
     fred_key = os.getenv("FRED_API_KEY", "")
     if not fred_key:
         return 0.04
@@ -320,6 +439,70 @@ _DAMODARAN_BETA_FALLBACK: dict[str, float] = {
 }
 
 _DAMODARAN_ERP_FALLBACK: float = 0.055
+
+
+def fetch_eodhd_beta(
+    ticker: str,
+    *,
+    benchmark: str = "GSPC.INDX",
+    lookback_days: int = 365 * 2,
+) -> float | None:
+    """Compute equity beta by regressing ticker daily returns against a benchmark.
+
+    Reference: ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (S5).
+    Uses cached EODHD daily history; returns ``None`` on insufficient data.
+    """
+    try:
+        from datetime import date as _date, timedelta as _td
+        from webapp.data import eodhd_client as _eod
+    except Exception:
+        return None
+    try:
+        code = _eod._eodhd_code(ticker)
+        end = _date.today()
+        start = end - _td(days=lookback_days)
+        stock = _eod.fetch_historical_price_series(code, start_date=start, end_date=end) or []
+        bench = _eod.fetch_historical_price_series(benchmark, start_date=start, end_date=end) or []
+    except Exception:
+        return None
+
+    def _series(series: list[dict[str, Any]]) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for row in series:
+            d = str(row.get("date") or "")
+            c = row.get("adjusted_close")
+            if d and c not in (None, ""):
+                try:
+                    out[d] = float(c)
+                except (TypeError, ValueError):
+                    continue
+        return out
+
+    s_map = _series(stock)
+    b_map = _series(bench)
+    common = sorted(set(s_map) & set(b_map))
+    if len(common) < 60:
+        return None
+    s_returns: list[float] = []
+    b_returns: list[float] = []
+    for prev, curr in zip(common[:-1], common[1:]):
+        sp, sc = s_map[prev], s_map[curr]
+        bp, bc = b_map[prev], b_map[curr]
+        if sp <= 0 or bp <= 0:
+            continue
+        s_returns.append((sc / sp) - 1.0)
+        b_returns.append((bc / bp) - 1.0)
+    n = len(s_returns)
+    if n < 60:
+        return None
+    mean_b = sum(b_returns) / n
+    mean_s = sum(s_returns) / n
+    cov = sum((b - mean_b) * (s - mean_s) for b, s in zip(b_returns, s_returns)) / n
+    var = sum((b - mean_b) ** 2 for b in b_returns) / n
+    if var <= 0:
+        return None
+    beta = cov / var
+    return round(max(0.1, min(5.0, beta)), 3)
 
 
 def fetch_damodaran_industry_beta(sector: str) -> float:
@@ -449,16 +632,14 @@ def _lookup_erp(table: dict[str, float], country: str) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_current_price(ticker: str) -> float | None:
-    """
-    Return the current market price for *ticker* from yfinance.
-    Returns None if unavailable.
-    Reference: Architecture Plan Part O8.
-    """
+    """Return the current market price via EODHD real-time."""
     try:
-        info = yf.Ticker(ticker).info or {}
-        price = info.get("currentPrice") or info.get("regularMarketPreviousClose")
-        if price:
-            return float(price)
+        from webapp.data import eodhd_client as _eod
+        code = _eod._eodhd_code(ticker)
+        price = _eod._fetch_price(code) or {}
+        close = price.get("close")
+        if close not in (None, "NA"):
+            return float(close)
     except Exception:
         pass
     return None

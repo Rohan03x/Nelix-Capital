@@ -153,7 +153,7 @@ This repository is now wired for deployment on Vercel Hobby, which is free for a
 2. Create a free Vercel account and import the repository.
 3. In Vercel project settings, add these environment variables:
 	- `FLASK_SECRET` — required so Flask sessions remain stable across requests
-	- `EODHD_API_KEY` — optional override; the app has a fallback key in code today
+	- `EODHD_API_KEY` — required for live EODHD data in production
 	- `FMP_API_KEY` — optional, enables the FMP fallback client
 	- `FRED_API_KEY` — optional, enables live macro data
 	- `SUPABASE_DB_URL` — recommended for full server-side learning persistence through Supabase snapshot sync

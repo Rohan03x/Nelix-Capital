@@ -84,6 +84,54 @@ def cost_of_equity_capm(
     return risk_free_rate + beta * equity_risk_premium + size_premium + country_risk_premium
 
 
+def size_premium_for_market_cap(market_cap_usd_mm: float) -> float:
+    """Return the Kroll/Duff & Phelps style size premium for market cap."""
+    from auto_valuation.data.macro import compute_size_premium
+
+    return compute_size_premium(market_cap_usd_mm)
+
+
+def country_risk_premium_for_country(
+    country_iso2: str | None = None,
+    exchange_country: str | None = None,
+) -> float:
+    """Return the Damodaran-style country risk premium for a country."""
+    from auto_valuation.data.macro import compute_crp
+
+    return compute_crp(country_iso2=country_iso2, exchange_country=exchange_country)
+
+
+def country_adjusted_erp(
+    base_equity_risk_premium: float,
+    country_risk_premium: float = 0.0,
+) -> float:
+    """Total ERP = mature-market ERP + country risk premium."""
+    return max(0.0, float(base_equity_risk_premium or 0.0)) + max(0.0, float(country_risk_premium or 0.0))
+
+
+def compute_pre_tax_cost_of_debt(
+    interest_expense: float | None,
+    total_debt: float | None,
+    risk_free_rate: float,
+    credit_spread: float = 0.015,
+    min_cost: float = 0.02,
+    max_cost: float = 0.12,
+) -> float:
+    """
+    Estimate the pre-tax cost of debt from reported interest expense.
+
+    Falls back to risk-free rate plus a conservative credit spread when debt
+    or interest expense is unavailable. All rates are decimals.
+    """
+    debt = abs(float(total_debt or 0.0))
+    interest = abs(float(interest_expense or 0.0))
+    if debt > 0 and interest > 0:
+        observed = interest / debt
+    else:
+        observed = float(risk_free_rate or 0.0) + float(credit_spread or 0.0)
+    return max(min_cost, min(max_cost, observed))
+
+
 def cost_of_equity_dividend_growth(
     dps_next: float,
     current_price: float,
@@ -233,6 +281,8 @@ def build_wacc(
         "beta":                   beta,
         "risk_free_rate":         risk_free_rate,
         "equity_risk_premium":    equity_risk_premium,
+        "size_premium":           size_premium,
+        "country_risk_premium":   country_risk_premium,
         "tax_rate":               tax_rate,
     }
 
@@ -529,6 +579,9 @@ compute_relevered_beta = relever_beta
 
 #: Canonical checklist name → cost_of_equity_capm
 compute_cost_of_equity = cost_of_equity_capm
+
+#: Canonical checklist name → compute_pre_tax_cost_of_debt
+compute_cost_of_debt = compute_pre_tax_cost_of_debt
 
 #: Canonical checklist name → apply_wacc_step_down
 wacc_mean_reversion_schedule = apply_wacc_step_down

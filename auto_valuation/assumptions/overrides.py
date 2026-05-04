@@ -113,6 +113,39 @@ _RANGE_CHECKS: dict[str, tuple[float, float]] = {
     "forecast_years":         (3,     15),
 }
 
+_MAX_OVERRIDE_DEPTH = 10
+_MAX_OVERRIDE_KEYS = 100
+_MAX_OVERRIDE_VALUE_LEN = 1000
+
+
+def _enforce_override_size_limits(value: Any, *, ticker: str, depth: int = 0) -> int:
+    if depth > _MAX_OVERRIDE_DEPTH:
+        raise ConfigError(
+            f"overrides/{ticker}.json exceeds max nesting depth {_MAX_OVERRIDE_DEPTH}."
+        )
+
+    if isinstance(value, dict):
+        key_count = len(value)
+        for key, item in value.items():
+            if len(str(key)) > _MAX_OVERRIDE_VALUE_LEN:
+                raise ConfigError(
+                    f"overrides/{ticker}.json has a key longer than {_MAX_OVERRIDE_VALUE_LEN} chars."
+                )
+            key_count += _enforce_override_size_limits(item, ticker=ticker, depth=depth + 1)
+        return key_count
+
+    if isinstance(value, list):
+        key_count = len(value)
+        for item in value:
+            key_count += _enforce_override_size_limits(item, ticker=ticker, depth=depth + 1)
+        return key_count
+
+    if isinstance(value, str) and len(value) > _MAX_OVERRIDE_VALUE_LEN:
+        raise ConfigError(
+            f"overrides/{ticker}.json has a string value longer than {_MAX_OVERRIDE_VALUE_LEN} chars."
+        )
+    return 0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Load and validate
@@ -156,6 +189,14 @@ def validate_overrides(
 
     Returns the cleaned, validated dict.
     """
+    if not isinstance(overrides, dict):
+        raise ConfigError(f"overrides/{ticker}.json must contain a JSON object.")
+    total_keys = _enforce_override_size_limits(overrides, ticker=ticker or "UNKNOWN")
+    if total_keys > _MAX_OVERRIDE_KEYS:
+        raise ConfigError(
+            f"overrides/{ticker}.json has {total_keys} keys/items; max is {_MAX_OVERRIDE_KEYS}."
+        )
+
     cleaned: dict[str, Any] = {}
 
     for key, value in overrides.items():

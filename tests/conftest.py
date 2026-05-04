@@ -16,6 +16,19 @@ def root_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+@pytest.fixture(autouse=True)
+def reset_webapp_security_state():
+    yield
+    try:
+        import webapp.app as webapp_module
+
+        webapp_module._RATE_LIMIT_BUCKETS.clear()
+        webapp_module.app.config["CSRF_ENABLED"] = False
+        webapp_module.app.config["RATELIMIT_ENABLED"] = False
+    except Exception:
+        pass
+
+
 # ── Minimal fake FMP financial data ───────────────────────────────────────────
 # Mirrors real FMP response shapes. Used by unit tests so no live API calls needed.
 

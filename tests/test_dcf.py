@@ -25,6 +25,7 @@ from auto_valuation.forecast.dcf import (
     ForecastYear,
     DCFResult,
     discount_factors,
+    enforce_terminal_growth_consistency,
     run_dcf,
 )
 
@@ -272,6 +273,21 @@ class TestRunDcf:
             assert len(res.warnings) >= 1
         except (ValueError, ZeroDivisionError):
             pass   # acceptable
+
+    def test_terminal_growth_roic_guard_caps_unfunded_growth(self):
+        adjusted, warning = enforce_terminal_growth_consistency(
+            terminal_growth=0.05,
+            terminal_roic=0.10,
+            terminal_reinvestment_rate=0.10,
+            tolerance=0.01,
+        )
+        assert adjusted == pytest.approx(0.02)
+        assert warning is not None
+
+    def test_run_dcf_caps_terminal_growth_if_wacc_spread_breaks(self):
+        res = self._run(wacc=0.025, terminal_growth=0.03)
+        assert res.terminal_growth < res.wacc
+        assert any("WACC-g" in warning for warning in res.warnings)
 
     def test_exit_multiple_tv_computed(self):
         res = self._run(exit_ev_ebitda_multiple=10.0)

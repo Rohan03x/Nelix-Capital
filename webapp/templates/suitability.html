@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Suitability Check - Nelix Capital{% endblock %}
+
+{% block content %}
+<main class="legal-page suitability-page">
+  <section class="legal-hero">
+    <div class="legal-eyebrow">Suitability</div>
+    <h1>Research Access Check</h1>
+    <p>Confirm how you plan to use Nelix Capital before viewing valuation outputs in your region.</p>
+  </section>
+
+  <form class="legal-panel suitability-form" method="POST" action="{{ url_for('suitability') }}">
+    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="next" value="{{ next_url }}">
+
+    {% if error %}
+      <div class="suitability-error" role="alert">{{ error }}</div>
+    {% endif %}
+
+    <h2>Investment Experience</h2>
+    <div class="suitability-options">
+      <label><input type="radio" name="experience" value="beginner" required> Beginner</label>
+      <label><input type="radio" name="experience" value="intermediate"> Intermediate</label>
+      <label><input type="radio" name="experience" value="advanced"> Advanced</label>
+    </div>
+
+    <h2>Risk Tolerance</h2>
+    <div class="suitability-options">
+      <label><input type="radio" name="risk_tolerance" value="low" required> Low</label>
+      <label><input type="radio" name="risk_tolerance" value="medium"> Medium</label>
+      <label><input type="radio" name="risk_tolerance" value="high"> High</label>
+    </div>
+
+    <h2>Research Horizon</h2>
+    <div class="suitability-options">
+      <label><input type="radio" name="horizon" value="short" required> Under 12 months</label>
+      <label><input type="radio" name="horizon" value="medium"> 1 to 5 years</label>
+      <label><input type="radio" name="horizon" value="long"> More than 5 years</label>
+    </div>
+
+    <label class="suitability-ack">
+      <input type="checkbox" name="acknowledge_non_advice" required>
+      I understand Nelix Capital is a research tool, not investment advice or a personal recommendation.
+    </label>
+
+    <button class="btn btn-primary" type="submit">Continue</button>
+  </form>
+</main>
+{% endblock %}

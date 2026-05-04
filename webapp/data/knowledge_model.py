@@ -1850,8 +1850,9 @@ def refine_live_assumptions(
 
     revenue_volatility = _safe_pstdev(_growth_rates(revenues[-(history_window_years + 1):]))
     margin_volatility = _safe_pstdev([margin / 100 for margin in ebit_margins[-history_window_years:]])
-    observations = list(observations) if observations is not None else _load_learning_cohort()
-    analog_candidates = _load_analog_candidates()
+    explicit_observations = observations is not None
+    observations = list(observations) if explicit_observations else _load_learning_cohort()
+    analog_candidates = [] if explicit_observations and len(observations) < 5 else _load_analog_candidates()
     symbol_features = build_symbol_features(
         ticker=ticker,
         sector=sector,
@@ -1929,6 +1930,7 @@ def refine_live_assumptions(
             subject_market_cap_regime=market_cap_regime,
             subject_macro_regime=current_macro_regime,
             observation_year=completed_years,
+            min_similarity=float(LEARNING_CONFIG.get("knowledge_model_min_analog_similarity", 0.60)),
             max_results=max_analog_results,
             cross_sector_only=False,
         )
@@ -2026,6 +2028,12 @@ def refine_live_assumptions(
         learned_margin_component = _dampen_positive(learned_margin_component, positive_scale)
         global_margin_pp = _dampen_positive(global_margin_pp, positive_scale)
         relationship_margin_pp = _dampen_positive(relationship_margin_pp, positive_scale)
+    if calibrated.ebit_margin_adj > 0:
+        global_margin_pp = max(global_margin_pp, 0.0)
+        relationship_margin_pp = max(relationship_margin_pp, 0.0)
+    elif calibrated.ebit_margin_adj < 0:
+        global_margin_pp = min(global_margin_pp, 0.0)
+        relationship_margin_pp = min(relationship_margin_pp, 0.0)
 
     refined_growth = round(
         _clamp(

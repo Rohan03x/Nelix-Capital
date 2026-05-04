@@ -49,7 +49,9 @@ from auto_valuation.validation.checks import (
     check_terminal_roic_vs_wacc,
     check_tv_pct_of_ev,
     check_wacc_range,
+    halt_on_critical_failures,
     run_all_data_checks,
+    validate_currency_consistency,
     validate_fmp_data,
 )
 from auto_valuation.utils.error import DataQualityError
@@ -649,6 +651,31 @@ class TestRunAllDataChecks:
         ]
         results = run_all_data_checks(stmts, _GOOD_BS, _GOOD_CF)
         assert any(r.status == "WARN" for r in results)
+
+    def test_currency_consistency_passes_matching_metadata(self):
+        results = run_all_data_checks(
+            [{**_GOOD_IS[0], "reportedCurrency": "USD"}],
+            [{**_GOOD_BS[0], "reportedCurrency": "USD"}],
+            [{**_GOOD_CF[0], "reportedCurrency": "USD"}],
+            profile={"currency": "USD"},
+        )
+        assert any(r.name == "CURRENCY_CONSISTENCY" and r.status == "PASS" for r in results)
+
+    def test_currency_consistency_halts_on_mismatch(self):
+        with pytest.raises(DataQualityError):
+            run_all_data_checks(
+                [{**_GOOD_IS[0], "reportedCurrency": "EUR"}],
+                [{**_GOOD_BS[0], "reportedCurrency": "USD"}],
+                [{**_GOOD_CF[0], "reportedCurrency": "USD"}],
+                profile={"currency": "USD"},
+            )
+
+    def test_halt_on_critical_failures_ignores_noncritical_fail(self):
+        halt_on_critical_failures([ValidationResult("NON_CRITICAL", "FAIL", message="soft")])
+
+    def test_validate_currency_consistency_warns_without_metadata(self):
+        result = validate_currency_consistency()
+        assert result.status == "WARN"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

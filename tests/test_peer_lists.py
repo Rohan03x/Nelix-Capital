@@ -285,6 +285,9 @@ def test_fetch_peer_metrics_backfills_curated_industry_when_live_metadata_missin
 
 
 def test_fetch_peer_metrics_normalizes_eodhd_suffixes_for_yfinance(monkeypatch):
+    """ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (P3): yfinance fallback was removed.
+    Tickers absent from the EODHD index now surface as not-available rows
+    instead of triggering a yfinance lookup."""
     import webapp.data.peer_lists as peer_lists
 
     requested: list[str] = []
@@ -292,21 +295,8 @@ def test_fetch_peer_metrics_normalizes_eodhd_suffixes_for_yfinance(monkeypatch):
     class _FakeTicker:
         def __init__(self, symbol: str):
             requested.append(symbol)
-            self.info = {
-                "shortName": symbol,
-                "marketCap": 1_000_000_000,
-                "totalRevenue": 500_000_000,
-                "ebitda": 100_000_000,
-                "ebit": 80_000_000,
-                "netIncomeToCommon": 50_000_000,
-                "freeCashflow": 40_000_000,
-                "totalDebt": 200_000_000,
-                "totalCash": 50_000_000,
-            }
+            self.info = {}
 
-    # Provide cached profiles so the taxonomy gate can evaluate industry similarity.
-    # All three test tickers are treated as Staffing & Employment Services to match
-    # ADEN.SW's industry and pass the _PEER_MIN_INDUSTRY_FIT gate.
     _mock_profiles = [
         {"ticker": t, "sector": "Industrials", "industry": "Staffing & Employment Services"}
         for t in ("G14.XETRA", "70GD.LSE", "JBGS.US")
@@ -318,14 +308,21 @@ def test_fetch_peer_metrics_normalizes_eodhd_suffixes_for_yfinance(monkeypatch):
     monkeypatch.setattr(peer_lists, "_load_cached_peer_profiles", lambda: _mock_profiles)
     monkeypatch.setattr(peer_lists, "_safe_universe_store", lambda: None)
     monkeypatch.setattr(peer_lists, "_safe_discovery_store", lambda: None)
+    # Force the EODHD index to be empty so all peers fall through to the
+    # not-available branch — no yfinance call should occur.
+    monkeypatch.setattr(peer_lists, "_build_eodhd_multiples_index", lambda: {})
 
-    peers, peer_median = peer_lists.fetch_peer_metrics(
+    peers, _peer_median = peer_lists.fetch_peer_metrics(
         ["G14.XETRA", "70GD.LSE", "JBGS.US"],
         "ADEN.SW",
         target_sector="Industrials",
         target_industry="Staffing & Employment Services",
     )
 
-    assert requested == ["G14.DE", "70GD.L", "JBGS"]
-    assert [peer["ticker"] for peer in peers] == ["G14.XETRA", "70GD.LSE", "JBGS.US"]
-    assert peer_median["ev_rev"] == 2.3
+    # P3 — yfinance must NOT be consulted any more.
+    assert requested == []
+    # Each requested peer is still surfaced as a row (with N/A multiples).
+    assert {peer.get("ticker") for peer in peers} >= {"G14.XETRA", "70GD.LSE", "JBGS.US"}
+    for peer in peers:
+        if peer.get("ticker") in {"G14.XETRA", "70GD.LSE", "JBGS.US"}:
+            assert peer.get("source") == "not_available"

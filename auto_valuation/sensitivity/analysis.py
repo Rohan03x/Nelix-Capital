@@ -255,17 +255,42 @@ def run_scenario_analysis(
     base_dcf_kwargs: dict,
     scenarios: list[str] | None = None,
     custom_scenario_overrides: dict[str, dict] | None = None,
+    *,
+    analyst_revenue_estimates: dict[str, float] | None = None,
 ) -> dict[str, DCFResult]:
     """
     Run DCF for bull / base / bear scenarios.
 
     custom_scenario_overrides: optional dict {scenario_name: {kwarg_overrides}}
+    analyst_revenue_estimates: optional dict with keys ``low_mm``, ``avg_mm``,
+        ``high_mm``, ``base_revenue_mm``, ``analyst_count``.  When supplied
+        with ≥3 analysts, near-term growth deltas are derived from the actual
+        analyst revenue range instead of the static ±3% defaults
+        (ADAPTIVE_DCF_IMPROVEMENT_PLAN.md M1).
     Returns {scenario_name: DCFResult}.
 
     Reference: Part 49.
     """
     if scenarios is None:
         scenarios = ["bull", "base", "bear"]
+
+    # M1 — derive growth deltas from analyst Low/Avg/High when ≥3 analysts.
+    analyst_growth_deltas: dict[str, float] | None = None
+    if analyst_revenue_estimates:
+        rev = analyst_revenue_estimates
+        n = int(rev.get("analyst_count") or 0)
+        base_rev = float(rev.get("base_revenue_mm") or 0.0)
+        base_g = float(base_dcf_kwargs.get("near_term_growth") or 0.0)
+        if n >= 3 and base_rev > 0:
+            low = rev.get("low_mm")
+            avg = rev.get("avg_mm")
+            high = rev.get("high_mm")
+            if low and avg and high:
+                analyst_growth_deltas = {
+                    "bear": (float(low) / base_rev - 1.0) - base_g,
+                    "base": (float(avg) / base_rev - 1.0) - base_g,
+                    "bull": (float(high) / base_rev - 1.0) - base_g,
+                }
 
     results: dict[str, DCFResult] = {}
 
@@ -277,6 +302,13 @@ def run_scenario_analysis(
         adj = _SCENARIO_ADJUSTMENTS.get(scenario, {})
         for delta_key, delta_val in adj.items():
             base_param = delta_key.replace("_delta", "")
+            # M1 — override growth delta from analyst data when available.
+            if (
+                analyst_growth_deltas is not None
+                and delta_key == "near_term_growth_delta"
+                and scenario in analyst_growth_deltas
+            ):
+                delta_val = analyst_growth_deltas[scenario]
             if base_param in kwargs:
                 kwargs[base_param] = kwargs[base_param] + delta_val
 

@@ -54,6 +54,59 @@ VALID_SCENARIOS = {"bull", "base", "bear"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Analyst-derived scenario deltas (M1 — drive scenarios from real consensus)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def deltas_from_analyst_estimates(
+    revenue_avg_mm: float | None,
+    revenue_low_mm: float | None,
+    revenue_high_mm: float | None,
+    base_revenue_mm: float | None,
+    base_near_term_growth: float | None,
+    *,
+    margin_swing: float = 0.02,
+    wacc_swing: float = 0.005,
+    terminal_swing: float = 0.005,
+) -> dict[str, dict[str, float]] | None:
+    """Derive bull/base/bear deltas from analyst Low/Avg/High revenue estimates.
+
+    Returns ``None`` when inputs are insufficient — callers should fall back to
+    the static ``SCENARIO_DELTAS`` table. Reference: ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (M1).
+    """
+    if not (revenue_avg_mm and revenue_low_mm and revenue_high_mm and base_revenue_mm and base_revenue_mm > 0):
+        return None
+    base_g = float(base_near_term_growth) if base_near_term_growth is not None else 0.0
+    g_avg = float(revenue_avg_mm) / float(base_revenue_mm) - 1.0
+    g_low = float(revenue_low_mm) / float(base_revenue_mm) - 1.0
+    g_high = float(revenue_high_mm) / float(base_revenue_mm) - 1.0
+    # Center deltas on consensus average so that "base" matches analyst mean.
+    return {
+        "bull": {
+            "near_term_growth":     (g_high - base_g),
+            "ebit_margin_current": +margin_swing,
+            "ebit_margin_terminal":+margin_swing,
+            "wacc":                -wacc_swing,
+            "terminal_g":          +terminal_swing,
+        },
+        "base": {
+            "near_term_growth":     (g_avg - base_g),
+            "ebit_margin_current":  0.0,
+            "ebit_margin_terminal": 0.0,
+            "wacc":                  0.0,
+            "terminal_g":            0.0,
+        },
+        "bear": {
+            "near_term_growth":     (g_low - base_g),
+            "ebit_margin_current": -margin_swing,
+            "ebit_margin_terminal":-margin_swing,
+            "wacc":                +wacc_swing,
+            "terminal_g":          -terminal_swing,
+        },
+    }
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Apply a scenario delta to a base assumptions dict
 # ─────────────────────────────────────────────────────────────────────────────
 

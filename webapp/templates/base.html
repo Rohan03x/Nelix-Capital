@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="csrf-token" content="{{ csrf_token() }}">
   <title>{% block title %}Nelix Capital{% endblock %}</title>
   <meta name="description" content="Institutional-grade DCF valuation for any public company.">
 
@@ -42,6 +43,20 @@
 </nav>
 
 {% block content %}{% endblock %}
+
+<footer class="compliance-footer" aria-label="Compliance notice">
+  <div class="compliance-footer__inner">
+    <p>
+      Nelix Capital is a research and valuation tool. Outputs are for informational analysis only,
+      are not investment advice, and do not account for your objectives, financial situation, or needs.
+    </p>
+    <nav class="compliance-footer__links" aria-label="Legal pages">
+      <a href="{{ url_for('terms') }}">Terms</a>
+      <a href="{{ url_for('disclosures') }}">Disclosures</a>
+      <a href="{{ url_for('privacy') }}">Privacy</a>
+    </nav>
+  </div>
+</footer>
 
 <!-- App JavaScript -->
 <script src="{{ url_for('static', filename='js/app.js') }}"></script>
