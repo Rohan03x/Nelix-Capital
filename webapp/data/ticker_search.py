@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import quote
 
+from auto_valuation.model.sector import FINANCIAL, MINING, REIT, detect_sector_type
 from webapp.data.samples import SUPPORTED_TICKERS
 
 
@@ -38,6 +39,25 @@ def _normalise_search_text(value: str) -> str:
     return _SPACE_RE.sub(" ", value.upper()).strip()
 
 
+def _safe_float(value: object) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _history_year_count(financials: object) -> int:
+    if not isinstance(financials, dict):
+        return 0
+    income_statement = financials.get("Income_Statement")
+    if not isinstance(income_statement, dict):
+        return 0
+    yearly = income_statement.get("yearly")
+    if not isinstance(yearly, dict):
+        return 0
+    return len(yearly)
+
+
 def _build_search_item(
     *,
     ticker: str,
@@ -50,6 +70,11 @@ def _build_search_item(
     is_primary: bool = False,
     isin: str = "",
     primary_ticker: str = "",
+    sector: str = "",
+    industry: str = "",
+    market_cap: float = 0.0,
+    history_years: int = 0,
+    has_fundamentals: bool = False,
 ) -> dict[str, object]:
     ticker_text = str(ticker or "").strip().upper()
     code_text = str(code or ticker_text.split(".")[0]).strip().upper()
@@ -70,6 +95,11 @@ def _build_search_item(
         "name": name_text,
         "exchange": exchange_text,
         "country": country_text,
+        "sector": str(sector or "").strip(),
+        "industry": str(industry or "").strip(),
+        "market_cap": max(_safe_float(market_cap), 0.0),
+        "history_years": max(int(history_years or 0), 0),
+        "has_fundamentals": bool(has_fundamentals),
         "search_text": search_text,
         "name_key": name_key,
         "ticker_key": _normalise_search_text(ticker_text),
@@ -106,6 +136,7 @@ def _build_index_item(payload_path: Path) -> dict[str, object] | None:
     general = data.get("General")
     if not isinstance(general, dict):
         return None
+    highlights = data.get("Highlights") if isinstance(data.get("Highlights"), dict) else {}
 
     code = str(general.get("Code") or "").strip().upper()
     exchange = str(general.get("Exchange") or "").strip().upper()
@@ -126,6 +157,11 @@ def _build_index_item(payload_path: Path) -> dict[str, object] | None:
         is_primary=True,
         isin=str(general.get("ISIN") or "").strip(),
         primary_ticker=primary_ticker,
+        sector=str(general.get("Sector") or "").strip(),
+        industry=str(general.get("Industry") or "").strip(),
+        market_cap=_safe_float(highlights.get("MarketCapitalization")),
+        history_years=_history_year_count(data.get("Financials")),
+        has_fundamentals=True,
     )
 
 
@@ -146,6 +182,11 @@ def _build_cached_search_item(row: dict[str, object], *, source: str = "search-c
         is_primary=bool(row.get("isPrimary") or row.get("IsPrimary")),
         isin=str(row.get("ISIN") or row.get("Isin") or "").strip(),
         primary_ticker=str(row.get("PrimaryTicker") or "").strip(),
+        sector=str(row.get("Sector") or "").strip(),
+        industry=str(row.get("Industry") or "").strip(),
+        market_cap=_safe_float(row.get("MarketCapitalization") or row.get("MarketCap")),
+        history_years=max(int(row.get("HistoryYears") or 0), 0),
+        has_fundamentals=bool(row.get("HistoryYears") or row.get("Sector") or row.get("Industry") or row.get("MarketCapitalization")),
     )
 
 
@@ -230,6 +271,38 @@ def _seed_candidate_is_healthy(ticker: str) -> bool:
     if not entry:
         return True
     return bool(entry.get("available", True))
+
+
+def _seed_candidate_health_rank(ticker: str) -> int:
+    entry = _recent_seed_symbol_health().get(str(ticker or "").strip().upper())
+    if not entry:
+        return 1
+    return 2 if bool(entry.get("available", True)) else 0
+
+
+def _seed_candidate_sector_type(item: dict[str, object]) -> str | None:
+    sector = str(item.get("sector") or "").strip()
+    industry = str(item.get("industry") or "").strip()
+    if not sector and not industry:
+        return None
+    return detect_sector_type(sector, industry)
+
+
+def _seed_candidate_is_dcf_suitable(item: dict[str, object]) -> bool:
+    sector_type = _seed_candidate_sector_type(item)
+    if sector_type is None:
+        return True
+    return sector_type not in {FINANCIAL, REIT, MINING}
+
+
+def _seed_candidate_richness(item: dict[str, object]) -> int:
+    history_years = max(int(item.get("history_years") or 0), 0)
+    return (
+        3 * int(bool(item.get("has_fundamentals")))
+        + 2 * int(bool(str(item.get("sector") or "").strip()))
+        + 2 * int(bool(str(item.get("industry") or "").strip()))
+        + min(history_years, 10)
+    )
 
 
 def _live_search_items(query: str) -> tuple[dict[str, object], ...]:
@@ -445,6 +518,9 @@ def seedable_symbol_items(limit: int | None = None, *, common_stock_only: bool =
     ranked_items = sorted(
         _ticker_search_index(),
         key=lambda item: (
+            -_seed_candidate_health_rank(str(item.get("ticker") or "")),
+            -_seed_candidate_richness(item),
+            -_safe_float(item.get("market_cap")),
             0 if bool(item.get("is_primary")) else 1,
             source_priority.get(str(item.get("source") or ""), 9),
             str(item.get("name") or "").upper(),
@@ -464,6 +540,8 @@ def seedable_symbol_items(limit: int | None = None, *, common_stock_only: bool =
         if not ticker or ticker in seen:
             continue
         if not _seed_candidate_is_healthy(ticker):
+            continue
+        if not _seed_candidate_is_dcf_suitable(item):
             continue
         instrument_type = str(item.get("instrument_type") or "").strip().lower()
         if common_stock_only and instrument_type not in allowed_types:
