@@ -63,7 +63,11 @@
       <div class="loading-progress-bar__fill" id="progressFill" style="width: 0%"></div>
     </div>
 
-    <div class="loading-cta" id="loadingCta">
+    <div id="waitMsg" style="display:none;font-size:.75rem;color:var(--text-muted);text-align:center;margin-top:.25rem;">
+      Fetching live data — first load can take 30–60 s…
+    </div>
+
+    <div class="loading-cta" id="loadingCta" style="display:none;">
       <a href="/dashboard/{{ ticker }}" class="btn btn--primary btn--large">
         View Dashboard →
       </a>
@@ -75,37 +79,94 @@
 {% block scripts %}
 <script>
 (function() {
-  const steps   = document.querySelectorAll('.step-item');
-  const fill    = document.getElementById('progressFill');
-  const cta     = document.getElementById('loadingCta');
+  const steps        = document.querySelectorAll('.step-item');
+  const fill         = document.getElementById('progressFill');
+  const cta          = document.getElementById('loadingCta');
+  const waitMsg      = document.getElementById('waitMsg');
   const dashboardUrl = '/dashboard/{{ ticker }}';
-  const total   = steps.length;
-  // Step delays (ms) — intentionally fast for good UX
-  const delays  = [120, 200, 160, 140, 220, 300, 350, 400, 450, 250, 200, 350];
-  let current   = 0;
+  const total        = steps.length;
 
+  // Cosmetic per-step delays (ms) — animate steps 0…total-2; last step waits for real data
+  const delays = [120, 200, 160, 140, 220, 300, 350, 400, 450, 250, 200, 350];
+
+  let current   = 0;
+  let animDone  = false;   // all cosmetic steps except the last have finished
+  let fetchDone = false;   // /api/dashboard actually responded
+
+  // ── Kick off the real computation immediately ──────────────────────────
+  var fetchCtrl;
+  try { fetchCtrl = new AbortController(); } catch(e) { fetchCtrl = null; }
+  var fetchSignal = fetchCtrl ? fetchCtrl.signal : undefined;
+
+  var fetchTimer = setTimeout(function() {
+    if (fetchCtrl) fetchCtrl.abort();
+  }, 120000);
+
+  fetch('/api/dashboard/{{ ticker }}' + (fetchSignal !== undefined ? '' : ''), fetchSignal ? { signal: fetchSignal } : {})
+    .then(function(r) { return r.json(); })
+    .catch(function() { /* network errors: still proceed */ })
+    .then(function() {
+      clearTimeout(fetchTimer);
+      fetchDone = true;
+      tryComplete();
+    });
+
+  // ── Once BOTH animation and fetch are done, navigate ──────────────────
+  function tryComplete() {
+    if (!animDone || !fetchDone) return;
+
+    // Mark the last step as done
+    var last = steps[total - 1];
+    last.classList.remove('active');
+    last.classList.add('done');
+    last.querySelector('.step-icon').textContent = '✓';
+
+    waitMsg.style.display = 'none';
+    fill.style.width = '100%';
+    cta.style.display = 'block';
+
+    // Auto-navigate after brief pause so user sees the green tick
+    setTimeout(function() {
+      window.location.assign(dashboardUrl);
+    }, 600);
+  }
+
+  // ── Cosmetic step animation ────────────────────────────────────────────
   function advance() {
+    // Mark the previous step done
     if (current > 0) {
-      const prev = steps[current - 1];
+      var prev = steps[current - 1];
       prev.classList.remove('active');
       prev.classList.add('done');
       prev.querySelector('.step-icon').textContent = '✓';
     }
-    if (current < total) {
-      const cur = steps[current];
+
+    if (current < total - 1) {
+      // Animate steps 0 … total-2 normally
+      var cur = steps[current];
       cur.classList.remove('pending');
       cur.classList.add('active');
-      cur.innerHTML = cur.innerHTML + '<div class="step-spinner"></div>';
+      cur.querySelector('.step-icon').textContent = '◉';
       fill.style.width = ((current + 1) / total * 100) + '%';
       current++;
-      setTimeout(advance, delays[current - 1] || 280);
+      setTimeout(advance, delays[current - 1] !== undefined ? delays[current - 1] : 280);
+
     } else {
-      // All done
-      fill.style.width = '100%';
-      cta.style.display = 'block';
-      setTimeout(function() {
-        window.location.assign(dashboardUrl);
-      }, 250);
+      // Reached the last step — keep it spinning until fetch completes
+      var last = steps[current];
+      last.classList.remove('pending');
+      last.classList.add('active');
+      last.querySelector('.step-icon').textContent = '◉';
+      fill.style.width = '92%';   // not 100% — we're not truly done yet
+      current++;
+      animDone = true;
+
+      if (fetchDone) {
+        tryComplete();
+      } else {
+        // Show an honest "still working" message
+        waitMsg.style.display = 'block';
+      }
     }
   }
 
