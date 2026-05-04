@@ -932,6 +932,100 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
         return default
 
 
+def _safe_multiple(val: Any, max_val: float = 500.0) -> float | None:
+    """Return val as a positive multiple or None if unreasonable."""
+    try:
+        v = float(val or 0)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0 or v > max_val:
+        return None
+    return round(v, 2)
+
+
+@lru_cache(maxsize=1)
+def _build_eodhd_multiples_index() -> dict[str, dict[str, Any]]:
+    """Scan all cached EODHD fundamentals files and build a
+    {ticker_variant → multiples_dict} index.
+
+    Used by fetch_peer_metrics so that international peers (e.g. ABBN.SW,
+    LR.PA) get real multiples from EODHD instead of empty yfinance responses.
+    """
+    cache_dir = Path(__file__).with_name("cache")
+    index: dict[str, dict[str, Any]] = {}
+
+    for path in cache_dir.glob("eodhd_fund_*.json"):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        payload = raw.get("data") if isinstance(raw, dict) and "data" in raw else raw
+        if not isinstance(payload, dict):
+            continue
+
+        general    = payload.get("General")    or {}
+        highlights = payload.get("Highlights") or {}
+        valuation  = payload.get("Valuation")  or {}
+        financials = payload.get("Financials") or {}
+
+        code     = str(general.get("Code")     or "").strip()
+        exchange = str(general.get("Exchange") or "").strip()
+        name     = str(general.get("Name")     or code)
+
+        if not code:
+            # Derive from filename as fallback (e.g. eodhd_fund_AYI_US → AYI / US)
+            stem  = path.stem.replace("eodhd_fund_", "")
+            parts = stem.rsplit("_", 1)
+            code, exchange = (parts[0], parts[1]) if len(parts) == 2 else (stem, "")
+
+        mkt_mln = float(highlights.get("MarketCapitalizationMln") or 0.0)
+        ev_raw  = float(valuation.get("EnterpriseValue")          or 0.0)
+
+        # Multiples that EODHD pre-computes in the Valuation section
+        ev_rev    = _safe_multiple(valuation.get("EnterpriseValueRevenue"))
+        ev_ebitda = _safe_multiple(valuation.get("EnterpriseValueEbitda"))
+        pe        = _safe_multiple(highlights.get("PERatio") or valuation.get("TrailingPE"))
+
+        # EV/EBIT — derive from latest annual operating income
+        ev_ebit = None
+        income_yearly = (financials.get("Income_Statement") or {}).get("yearly") or {}
+        cf_yearly     = (financials.get("Cash_Flow")        or {}).get("yearly") or {}
+
+        if income_yearly and ev_raw > 0:
+            latest_inc = income_yearly.get(sorted(income_yearly.keys())[-1]) or {}
+            ebit = float(latest_inc.get("operatingIncome") or 0.0)
+            if ebit > 0:
+                ev_ebit = _safe_multiple(ev_raw / ebit)
+
+        # P/FCF — derive from latest annual free cash flow
+        p_fcf = None
+        if cf_yearly and mkt_mln > 0:
+            latest_cf = cf_yearly.get(sorted(cf_yearly.keys())[-1]) or {}
+            fcf = float(latest_cf.get("freeCashFlow") or 0.0)
+            if fcf > 0:
+                # Both mkt_mln*1e6 and fcf are in the same local currency
+                p_fcf = _safe_multiple((mkt_mln * 1e6) / fcf)
+
+        metrics: dict[str, Any] = {
+            "name":       name,
+            "market_cap": round(mkt_mln),
+            "ev":         round(ev_raw / 1e6) if ev_raw else 0,
+            "ev_rev":     ev_rev,
+            "ev_ebitda":  ev_ebitda,
+            "ev_ebit":    ev_ebit,
+            "pe":         pe,
+            "p_fcf":      p_fcf,
+        }
+
+        eodhd_code = f"{code}.{exchange}" if exchange else code
+        for variant in _ticker_variants(eodhd_code) | _ticker_variants(code):
+            if variant:
+                index.setdefault(variant.upper(), metrics)
+
+    logger.debug("EODHD multiples index built: %d ticker variants", len(index))
+    return index
+
+
 def fetch_peer_metrics(
     peer_tickers: list[str],
     target_ticker: str,
@@ -939,17 +1033,16 @@ def fetch_peer_metrics(
     target_sector: str = "",
     target_industry: str = "",
 ) -> tuple[list[dict], dict]:
-    """Fetch basic valuation metrics for *peer_tickers* via yfinance.
+    """Fetch basic valuation metrics for *peer_tickers*.
+
+    Data source priority:
+      1. EODHD fundamentals cache (covers all international tickers)
+      2. yfinance (fallback for any ticker not in the EODHD cache)
 
     Returns:
         peers       — list of peer dicts (one per ticker, sorted by mkt cap desc)
         peer_median — dict of median multiples across the peer group
     """
-    try:
-        import yfinance as yf
-    except ImportError:
-        return [], {}
-
     target_ticker = target_ticker.upper()
     cache_key = _peer_cache_key(target_ticker, peer_tickers)
 
@@ -968,17 +1061,66 @@ def fetch_peer_metrics(
         peer_median = _compute_median(peers, target_ticker)
         return peers, peer_median
 
+    eodhd_index = _build_eodhd_multiples_index()
     profiles = {str(profile.get("ticker") or ""): profile for profile in _load_cached_peer_profiles()}
+
+    # yfinance is only imported when actually needed
+    _yf: Any = None
+
+    def _get_yf():
+        nonlocal _yf
+        if _yf is None:
+            try:
+                import yfinance as yf
+                _yf = yf
+            except ImportError:
+                pass
+        return _yf
+
     peers: list[dict] = []
     for tk in peer_tickers:
         try:
             ticker_text = str(tk or "").upper()
-            profile = profiles.get(ticker_text) or {}
+
+            # ── 1. EODHD cache (primary) ──────────────────────────────────
+            eodhd: dict[str, Any] | None = eodhd_index.get(ticker_text)
+            if eodhd is None:
+                for v in _ticker_variants(ticker_text):
+                    eodhd = eodhd_index.get(v)
+                    if eodhd:
+                        break
+
+            if eodhd is not None:
+                peers.append({
+                    "ticker":     ticker_text,
+                    "name":       eodhd.get("name") or ticker_text,
+                    "market_cap": int(eodhd.get("market_cap") or 0),
+                    "ev":         int(eodhd.get("ev") or 0),
+                    "revenue":    None,
+                    "ebitda":     None,
+                    "ebit":       None,
+                    "net_income": None,
+                    "fcf":        None,
+                    "ev_rev":     eodhd.get("ev_rev"),
+                    "ev_ebitda":  eodhd.get("ev_ebitda"),
+                    "ev_ebit":    eodhd.get("ev_ebit"),
+                    "pe":         eodhd.get("pe"),
+                    "p_fcf":      eodhd.get("p_fcf"),
+                    "subject":    (ticker_text == target_ticker),
+                })
+                continue
+
+            # ── 2. yfinance fallback ──────────────────────────────────────
+            yf = _get_yf()
+            if yf is None:
+                raise RuntimeError("yfinance not available")
+
+            profile  = profiles.get(ticker_text) or {}
             exchange = str(profile.get("exchange") or "")
             yf_ticker = _to_yfinance_ticker(ticker_text, exchange) or ticker_text
             info = yf.Ticker(yf_ticker).info or {}
-            mkt = _safe_float(info.get("marketCap", 0)) / 1e6
-            rev = _safe_float(info.get("totalRevenue", 0)) / 1e6
+            mkt    = _safe_float(info.get("marketCap", 0)) / 1e6
+            rev    = _safe_float(info.get("totalRevenue", 0)) / 1e6
             ebitda = _safe_float(info.get("ebitda", 0)) / 1e6
             ebit   = _safe_float(info.get("ebit", 0)) / 1e6
             ni     = _safe_float(info.get("netIncomeToCommon", 0)) / 1e6
@@ -993,8 +1135,8 @@ def fetch_peer_metrics(
                 return None
 
             peers.append({
-                "ticker":    ticker_text,
-                "name":      info.get("shortName") or info.get("longName") or ticker_text,
+                "ticker":     ticker_text,
+                "name":       info.get("shortName") or info.get("longName") or ticker_text,
                 "market_cap": round(mkt),
                 "ev":         round(ev),
                 "revenue":    round(rev),
