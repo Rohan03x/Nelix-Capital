@@ -14,6 +14,7 @@ from typing import Any, Callable
 from auto_valuation.config import LEARNING_CONFIG
 from auto_valuation.learning.storage_paths import learning_db_dir
 
+from .historical_replay import run_full_universe_replay
 from .live_evidence_bootstrap import (
     DEFAULT_BOOTSTRAP_TICKERS,
     _load_cached_bootstrap_tickers,
@@ -371,6 +372,20 @@ def _build_background_bootstrap_tickers(max_tickers: int) -> list[str]:
     return ordered[:effective_max]
 
 
+# Timestamp of the last successful full-universe replay so we can throttle it.
+_LAST_REPLAY_TS: float = 0.0
+
+
+def _should_run_replay(interval_hours: int) -> bool:
+    """Return True if the replay hasn't run within *interval_hours*."""
+    global _LAST_REPLAY_TS  # noqa: PLW0603
+    import time as _time
+    if _time.monotonic() - _LAST_REPLAY_TS >= interval_hours * 3600:
+        _LAST_REPLAY_TS = _time.monotonic()
+        return True
+    return False
+
+
 def run_background_learning_cycle(
     *,
     fundamentals_provider: Callable[[str], dict[str, Any] | None] | None = None,
@@ -402,6 +417,17 @@ def run_background_learning_cycle(
         interval_hours=int(LEARNING_CONFIG.get("scheduled_postmortem_interval_hours", 24)),
         max_tickers=int(LEARNING_CONFIG.get("background_runner_maintenance_max_tickers", 6)),
     )
+
+    # Replay all cached fundamentals to keep sector/cohort calibration priors
+    # up to date.  This also primes the in-process get_all_observations() cache
+    # so sector/cohort layers have peer data on the next model call.
+    # Runs at most once per day (interval_hours=24).
+    replay_interval = int(LEARNING_CONFIG.get("historical_replay_interval_hours", 24))
+    replay = run_full_universe_replay(
+        start_year=int(LEARNING_CONFIG.get("historical_replay_start_year", 2016)),
+        quarterly=True,
+        checkpoint_every=20,
+    ) if _should_run_replay(replay_interval) else {"enabled": True, "ran": False, "reason": "interval"}
 
     bootstrap_payload = bootstrap.to_dict() if hasattr(bootstrap, "to_dict") else dict(bootstrap)
     maintenance_payload = maintenance.to_dict() if hasattr(maintenance, "to_dict") else dict(maintenance)
@@ -441,6 +467,7 @@ def run_background_learning_cycle(
         "reason": None,
         "bootstrap": bootstrap_payload,
         "maintenance": maintenance_payload,
+        "replay": replay,
         "seed_refresh": seed_refresh,
         "state": state_payload,
     }

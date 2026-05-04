@@ -870,7 +870,7 @@ def _build_replay_prediction_record(
         run_date=base_snapshot.available_date,
         forecast_horizon_year=base_snapshot.year + 1,
         years_since_ipo=max(len(history) - 1, 0),
-        data_vintage_years=len(history),
+        data_vintage_years=min(len(history), 20),
         predicted_revenue_mm=round(float(first_year.revenue), 2),
         predicted_ebit_margin=round(float(first_year.ebit_margin), 6),
         predicted_ebit_mm=round(float(first_year.ebit), 2),

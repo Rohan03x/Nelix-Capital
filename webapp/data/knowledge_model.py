@@ -31,6 +31,7 @@ from auto_valuation.learning.cross_industry import (
 )
 from auto_valuation.learning.deployment_seed import analog_observations as seeded_analog_observations
 from auto_valuation.learning.deployment_seed import cohort_observations as seeded_cohort_observations
+from auto_valuation.learning.historical_replay import get_all_observations as _get_historical_observations
 from auto_valuation.learning.ledger import LedgerReader
 from auto_valuation.learning.postmortem import should_run_quinquennial
 from auto_valuation.learning.relationship_graph import build_relationship_graph
@@ -381,11 +382,14 @@ def _build_layered_learning_snapshot(
         and _maturity_bucket(int(_obs_value(observation, "data_vintage_years", 0) or 0)) == target_bucket
         and str(_obs_value(observation, "market_cap_regime", "") or "") == market_cap_regime
     ]
+    # Sector observations: same sector + cap regime, ANY maturity stage.
+    # Sector-level behaviour (growth mean, margin drift) is stable across company age;
+    # restricting by maturity bucket would leave this layer empty for most tickers.
     sector_observations = [
         observation
         for observation in observations
         if _knowledge_sector(str(_obs_value(observation, "sector", "") or "")) == sector
-        and _maturity_bucket(int(_obs_value(observation, "data_vintage_years", 0) or 0)) == target_bucket
+        and str(_obs_value(observation, "market_cap_regime", "") or "") == market_cap_regime
     ]
     macro_observations = [
         observation
@@ -421,7 +425,7 @@ def _build_layered_learning_snapshot(
     if pattern_name == "DISRUPTED_INCUMBENT" and pattern_score >= 0.7:
         structural_break_score = max(structural_break_score, min(1.0, 0.45 + 0.35 * pattern_score))
         structural_break_reasons.append("The active analog pattern resembles a disrupted incumbent regime rather than a stable continuation.")
-    if similarity_gap > 0.08:
+    if similarity_gap > 0.08 and len(sector_observations) >= 3:
         structural_break_score = max(structural_break_score, _clamp((similarity_gap - 0.08) / 0.22, 0.0, 1.0))
         structural_break_reasons.append(
             f"Cross-sector analog similarity ({cross_sector_similarity:.2f}) is overtaking same-sector similarity ({same_sector_similarity:.2f})."
@@ -1414,6 +1418,16 @@ def _load_learning_cohort(limit: int | None = None) -> list[Any]:
             }
         )
     if observations:
+        # Augment ledger records with historical quarterly/annual replay observations
+        # from every cached fundamentals file.  These give the sector and cohort layers
+        # the peer data they need (correct maturity-bucket alignment via
+        # data_vintage_years = min(available_annual_periods, 20)).
+        try:
+            historical = _get_historical_observations()
+            if historical:
+                observations = list(observations) + list(historical)
+        except Exception:
+            pass
         return observations
     return seeded_cohort_observations(limit=int(limit or _learning_pool_limit()))
 

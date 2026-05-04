@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import os
+import time as _time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -184,7 +185,10 @@ def observations_for_ticker(
     general = dict(fundamentals.get("General") or {})
     sector = str(general.get("Sector") or "")
     industry = str(general.get("Industry") or "")
-    mktcap_raw = _optional_float(str(general.get("MarketCapitalization") or ""))
+    # MarketCapitalization lives in Highlights, not General
+    highlights = dict(fundamentals.get("Highlights") or {})
+    mktcap_raw = _optional_float(str(highlights.get("MarketCapitalization") or "")) or \
+                 _optional_float(str(general.get("MarketCapitalization") or ""))
     cap = _cap_regime(mktcap_raw)
     wacc0 = _SECTOR_WACC.get(sector, _DEFAULT_WACC)
 
@@ -353,7 +357,10 @@ def _fundamentals_from_cache_file(path: Path) -> tuple[str, dict[str, Any]] | No
     exchange = str(general.get("Exchange") or "").strip().upper()
     if not code:
         return None
-    ticker = f"{code}.{exchange}" if exchange and "." not in code else code
+    # US exchanges: use bare code to match the live model's ticker format.
+    # International exchanges: use code.exchange (e.g. "ASML.AS", "005930.KO").
+    _US_EXCHANGES = {"NYSE", "NASDAQ", "AMEX", "NYSE MKT", "NYSE ARCA", "BATS", "OTC", "CBOE", "US", "PINK"}
+    ticker = code if exchange in _US_EXCHANGES else (f"{code}.{exchange}" if exchange and "." not in code else code)
     return ticker, data
 
 
@@ -467,7 +474,74 @@ def run_full_universe_replay(
     return result
 
 
+# ─── In-process cache for get_all_observations() ─────────────────────────────
+
+_OBS_CACHE: list[CalibrationObservation] = []
+_OBS_CACHE_TS: float = 0.0
+_OBS_CACHE_TTL: float = 3600.0  # rebuild at most once per hour
+
+
+def get_all_observations(
+    *,
+    start_year: int = 2016,
+    quarterly: bool = True,
+    cache_dir: Path | None = None,
+    max_workers: int | None = None,
+    force_refresh: bool = False,
+) -> list[CalibrationObservation]:
+    """Return all historical CalibrationObservation objects from every cached
+    fundamentals file.  Results are kept in module-level memory for
+    *_OBS_CACHE_TTL* seconds so that repeated calls within a single process
+    pay the I/O cost only once.
+
+    Observations use ``data_vintage_years = min(available_annual_periods, 20)``
+    which aligns with the live model's ``len(revenues)`` window.
+    """
+    global _OBS_CACHE, _OBS_CACHE_TS  # noqa: PLW0603
+
+    now = _time.monotonic()
+    if not force_refresh and _OBS_CACHE and (now - _OBS_CACHE_TS) < _OBS_CACHE_TTL:
+        return list(_OBS_CACHE)
+
+    scan_dir = cache_dir or WEBAPP_CACHE_DIR
+    if not scan_dir.exists():
+        return []
+
+    fund_files = sorted(scan_dir.glob("eodhd_fund_*.json"))
+    if not fund_files:
+        return []
+
+    workers = max(1, min(max_workers or (os.cpu_count() or 4), 8))
+    all_obs: list[CalibrationObservation] = []
+
+    def _process(path: Path) -> list[CalibrationObservation]:
+        result = _fundamentals_from_cache_file(path)
+        if result is None:
+            return []
+        ticker, fundamentals = result
+        try:
+            return observations_for_ticker(
+                ticker, fundamentals, start_year=start_year, quarterly=quarterly
+            )
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for batch in pool.map(_process, fund_files):
+            all_obs.extend(batch)
+
+    _OBS_CACHE = all_obs
+    _OBS_CACHE_TS = now
+    logger.info(
+        "historical_replay.get_all_observations: %d observations from %d files",
+        len(all_obs),
+        len(fund_files),
+    )
+    return list(all_obs)
+
+
 __all__ = [
+    "get_all_observations",
     "observations_for_ticker",
     "replay_ticker_history",
     "run_full_universe_replay",
