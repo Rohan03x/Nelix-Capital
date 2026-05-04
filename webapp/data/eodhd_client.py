@@ -599,6 +599,39 @@ def _extract_near_term_quarters(earnings: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _extract_consensus_growth(
+    earnings: dict[str, Any],
+    revenue_base_mm: float,
+) -> float | None:
+    """Return the +1y analyst consensus revenue growth (%) from EODHD Earnings.Trend.
+
+    Looks for the most forward annual entry (period == '+1y' or '0y') that has a
+    non-zero revenueEstimateAvg and computes the implied YoY growth vs the last
+    reported annual revenue. Returns None when no reliable estimate is available.
+    """
+    import math as _math
+    if revenue_base_mm <= 0:
+        return None
+    trend = dict(earnings.get("Trend") or {})
+    best_rev_avg: float | None = None
+    best_sort_key = ""
+    for date_str, entry in trend.items():
+        period = str(entry.get("period") or "")
+        if period not in ("+1y", "0y"):
+            continue
+        rev_avg = _sf(entry.get("revenueEstimateAvg"), default=float("nan"))
+        if _math.isnan(rev_avg) or rev_avg <= 0:
+            continue
+        # Prefer the most distant (most forward) date to get true next-year consensus
+        if str(date_str) > best_sort_key:
+            best_sort_key = str(date_str)
+            best_rev_avg = rev_avg / 1e6  # convert to $M
+    if best_rev_avg is None:
+        return None
+    growth = (best_rev_avg / revenue_base_mm - 1.0) * 100.0
+    return round(max(-30.0, min(80.0, growth)), 1)
+
+
 def _forecast_horizon_year(data: dict[str, Any]) -> int:
     forecast = list(data.get("forecast") or [])
     if forecast:
@@ -1946,6 +1979,17 @@ def build_dashboard_data(
         else:
             revenue_growth_near = 5.0
 
+        # Blend analyst consensus (+1y) into near-term growth.  When analysts
+        # have a forward view, their estimate outweighs the backward-looking CAGR
+        # (60 / 40 split).  This makes the base-case far more market-realistic
+        # and prevents the scenarios from diverging from what analysts actually expect.
+        _consensus_growth = _extract_consensus_growth(earn, revenue_base)
+        if _consensus_growth is not None:
+            revenue_growth_near = round(
+                0.4 * revenue_growth_near + 0.6 * _consensus_growth, 1
+            )
+            revenue_growth_near = max(-15.0, min(50.0, revenue_growth_near))
+
         # Sector-aware terminal growth: Technology companies (cloud, AI, software,
         # semiconductors) have structural advantages — scale, R&D compounding, and
         # secular AI tailwinds — that sustain above-GDP nominal growth long-term.
@@ -2209,8 +2253,12 @@ def build_dashboard_data(
         bull_g = min(bull_g, round(bull_wacc - 2.0, 1))
         bear_wacc = round(min(25.0, wacc + (1.5 * scenario_width_multiplier)), 1)
         bear_g = round(max(-1.0, terminal_growth - min(1.6, 1.0 * scenario_width_multiplier)), 1)
-        bull_growth = round(min(60.0, revenue_growth_near + (2.0 * scenario_width_multiplier)), 1)
-        bear_growth = round(max(-15.0, revenue_growth_near - (3.0 * scenario_width_multiplier)), 1)
+        # Scenarios diverge around the analyst consensus anchor (not the blended
+        # base-case growth) so bull and bear stay grounded in forward expectations.
+        _cons_g_scenario = _extract_consensus_growth(earn, revenue_base)
+        _scenario_anchor = _cons_g_scenario if _cons_g_scenario is not None else revenue_growth_near
+        bull_growth = round(min(60.0, _scenario_anchor + (2.0 * scenario_width_multiplier)), 1)
+        bear_growth = round(max(-15.0, _scenario_anchor - (3.0 * scenario_width_multiplier)), 1)
         bull_margin = round(max(ebit_margin_target, min(80.0, ebit_margin_target + (2.0 * scenario_width_multiplier))), 1)
         bear_margin = round(max(-10.0, ebit_margin_base_pct - max(1.0, scenario_width_multiplier)), 1)
         bull_iv, bull_up, bull_ev = _quick_iv(bull_wacc, bull_g, bull_growth, bull_margin)

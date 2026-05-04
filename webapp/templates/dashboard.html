@@ -1116,9 +1116,9 @@
     <div class="kpi-card {% if snapshot_state.get('persisted') %}green{% elif snapshot_state.get('enabled') %}amber{% endif %}">
       <div class="kpi-label">Current Snapshot</div>
       <div class="kpi-value {% if snapshot_state.get('persisted') %}green{% elif snapshot_state.get('enabled') %}amber{% endif %}">
-        {% if snapshot_state.get('persisted') %}Persisted{% elif snapshot_state.get('enabled') %}{{ snapshot_state.get('reason', 'pending')|replace('-', ' ')|title }}{% else %}Disabled{% endif %}
+        {% if snapshot_state.get('persisted') %}Persisted{% elif snapshot_state.get('enabled') %}{{ snapshot_state.get('reason', 'pending')|replace('-', ' ')|title }}{% else %}View-only{% endif %}
       </div>
-      <div class="kpi-sub">{% if snapshot_state.get('horizon_year') %}Horizon FY{{ snapshot_state.get('horizon_year') }}{% else %}Base-case learning snapshot{% endif %}</div>
+      <div class="kpi-sub">{% if snapshot_state.get('persisted') %}Horizon FY{{ snapshot_state.get('horizon_year') }}{% elif snapshot_state.get('enabled') %}{{ snapshot_state.get('reason', '') }}{% else %}Learning fires on first visit via loading page{% endif %}</div>
     </div>
   </div>
 

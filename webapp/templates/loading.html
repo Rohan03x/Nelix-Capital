@@ -102,6 +102,10 @@
     if (fetchCtrl) fetchCtrl.abort();
   }, 120000);
 
+  // Fire learning snapshot as fire-and-forget so bootstrap / backfill /
+  // persistence run in the background for this ticker (write-mode route).
+  fetch('/api/snapshot/{{ ticker }}', { method: 'POST' }).catch(function() {});
+
   fetch('/api/dashboard/{{ ticker }}' + (fetchSignal !== undefined ? '' : ''), fetchSignal ? { signal: fetchSignal } : {})
     .then(function(r) { return r.json(); })
     .catch(function() { /* network errors: still proceed */ })

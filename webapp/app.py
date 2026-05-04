@@ -227,6 +227,24 @@ def api_dashboard(ticker):
     return jsonify(_dashboard_api_payload(data))
 
 
+# ─── API: trigger learning snapshot (write-mode, fire-and-forget from loading) ─
+
+@app.route("/api/snapshot/<ticker>", methods=["POST"])
+def api_snapshot(ticker):
+    """Run a write-mode dashboard fetch for the given ticker.
+
+    Triggers bootstrap, backfill, and learning persistence that are
+    suppressed on ordinary read-only dashboard/API routes.  Called once per
+    ticker from the loading page as a fire-and-forget request so that newly
+    visited tickers accumulate learning evidence without slowing down the UI.
+    """
+    try:
+        _safe_dashboard_data(ticker.upper(), mutate_learning=True)
+    except Exception as exc:
+        logger.debug("Snapshot trigger failed for %s: %s", ticker, exc)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/ticker-search")
 def api_ticker_search():
     query = request.args.get("q", "")
