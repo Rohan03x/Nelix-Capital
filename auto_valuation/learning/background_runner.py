@@ -6,6 +6,7 @@ import atexit
 import json
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -35,7 +36,40 @@ _EXCHANGE_CURSOR_LOCK = threading.Lock()
 _BACKGROUND_EXCHANGE_CURSOR = 0
 
 
+class _TokenBucket:
+    """Thread-safe token-bucket rate limiter."""
+
+    def __init__(self, rate: float, capacity: float) -> None:
+        self._rate = rate        # tokens added per second
+        self._capacity = capacity
+        self._tokens = capacity
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        import time as _time
+        while True:
+            with self._lock:
+                now = _time.monotonic()
+                self._tokens = min(
+                    self._capacity,
+                    self._tokens + (now - self._last) * self._rate,
+                )
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self._rate
+            _time.sleep(wait)
+
+
+# EODHD paid plan: 1,000 req/min = 16.67 req/sec.
+# Use 15 req/sec to leave 10% headroom for dashboard/UI requests.
+_EODHD_RATE_LIMITER = _TokenBucket(rate=15.0, capacity=20.0)
+
+
 def _default_fundamentals_provider(ticker: str) -> dict[str, Any] | None:
+    _EODHD_RATE_LIMITER.acquire()
     try:
         from webapp.data.eodhd_client import _eodhd_code, _fetch_fundamentals
 
@@ -353,7 +387,7 @@ def run_background_learning_cycle(
     _restore_background_runner_cursors(state_path)
     provider = fundamentals_provider or _default_fundamentals_provider
     seed_refresh = _refresh_background_seed_cache()
-    bootstrap_max_tickers = int(LEARNING_CONFIG.get("background_runner_bootstrap_max_tickers", 18))
+    bootstrap_max_tickers = int(LEARNING_CONFIG.get("background_runner_bootstrap_max_tickers", 100))
     bootstrap_tickers = _build_background_bootstrap_tickers(bootstrap_max_tickers)
     bootstrap = run_live_evidence_bootstrap(
         tickers=bootstrap_tickers or None,
@@ -419,7 +453,7 @@ class LearningBackgroundRunner:
         loop_seconds: int | None = None,
         fundamentals_provider: Callable[[str], dict[str, Any] | None] | None = None,
     ) -> None:
-        self.loop_seconds = max(int(loop_seconds or LEARNING_CONFIG.get("background_runner_loop_seconds", 900)), 30)
+        self.loop_seconds = max(int(loop_seconds or LEARNING_CONFIG.get("background_runner_loop_seconds", 60)), 30)
         self.fundamentals_provider = fundamentals_provider
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -450,8 +484,25 @@ class LearningBackgroundRunner:
                 self.run_cycle()
             except Exception as exc:
                 logger.warning("Background learning cycle failed: %s", exc)
+            # Push latest learning state to remote (Supabase) in a daemon thread
+            # so it doesn't delay the next cycle. Throttled to max once per 5 min.
+            _t = threading.Thread(target=_push_to_remote_async, daemon=True, name="learning-sync")
+            _t.start()
             if self._stop_event.wait(self.loop_seconds):
                 break
+
+
+def _push_to_remote_async() -> None:
+    """Fire-and-forget push of all learning state to remote (Supabase). Throttled."""
+    try:
+        from auto_valuation.learning.production_sync import persist_external_learning_state
+        result = persist_external_learning_state()
+        if result.get("enabled") and result.get("reason") not in (None, "throttled"):
+            logger.warning("Remote learning sync returned: %s", result.get("reason"))
+        elif result.get("enabled") and result.get("reason") is None:
+            logger.debug("Remote learning sync: pushed %d namespaces", len(result.get("persisted") or {}))
+    except Exception as exc:
+        logger.debug("Remote learning sync failed (will retry next cycle): %s", exc)
 
 
 def start_learning_background_runner() -> LearningBackgroundRunner | None:
@@ -478,9 +529,32 @@ def stop_learning_background_runner() -> None:
             _RUNNER = None
 
 
+def get_daily_stats() -> dict[str, Any]:
+    """Return today's training counters read from the persisted state file."""
+    from datetime import date as _date
+    today = _date.today().isoformat()
+    state = read_background_runner_state()
+    # Count tickers from last recorded run; reset to 0 if last_run_at is not today
+    last_run = state.get("last_run_at", "")[:10]
+    if last_run == today:
+        tickers = len(state.get("requested_tickers") or [])
+    else:
+        tickers = 0
+    return {
+        "date": today,
+        "tickers_processed_today": tickers,
+        "runner_running": _RUNNER is not None and _RUNNER.running,
+        "loop_seconds": _RUNNER.loop_seconds if _RUNNER is not None else int(
+            LEARNING_CONFIG.get("background_runner_loop_seconds", 60)
+        ),
+        "last_run_at": state.get("last_run_at"),
+    }
+
+
 __all__ = [
     "BACKGROUND_RUNNER_STATE_PATH",
     "LearningBackgroundRunner",
+    "get_daily_stats",
     "read_background_runner_state",
     "run_background_learning_cycle",
     "start_learning_background_runner",

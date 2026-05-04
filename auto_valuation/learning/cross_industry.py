@@ -129,6 +129,7 @@ class AnalogMatch:
     sample_weight: float = 1.0
     usefulness_weight: float = 1.0
     evidence: tuple[dict[str, Any], ...] = ()
+    industry_fit_score: float = 1.0  # 1.0 = known industry; <1 = blank/Other penalty
 
 
 @dataclass(frozen=True)
@@ -282,6 +283,51 @@ def cosine_similarity(
     if left_norm == 0.0 or right_norm == 0.0:
         return 0.0
     return dot / (left_norm * right_norm)
+
+
+def _feature_vec(feature_map: dict[str, float]) -> list[float]:
+    """Return weighted feature vector for a coerced feature map."""
+    return [feature_map[name] * FEATURE_WEIGHTS[name] for name in FEATURE_NAMES]
+
+
+def _batch_cosine_similarities(
+    query_vec: list[float],
+    candidate_vecs: list[list[float]],
+) -> list[float]:
+    """Compute cosine similarities between query and all candidates.
+
+    Uses torch (CPU) for batches of 50+, falls back to pure Python otherwise.
+    """
+    n = len(candidate_vecs)
+    if n == 0:
+        return []
+
+    # Try torch path for large batches
+    if n >= 50:
+        try:
+            import torch  # noqa: PLC0415
+
+            q = torch.tensor(query_vec, dtype=torch.float32)
+            m = torch.tensor(candidate_vecs, dtype=torch.float32)  # (n, d)
+            q_norm = q / (q.norm() + 1e-9)
+            m_norm = m / (m.norm(dim=1, keepdim=True) + 1e-9)
+            sims = (m_norm @ q_norm).tolist()
+            return sims  # type: ignore[return-value]
+        except Exception:
+            pass  # fall through to pure Python
+
+    # Pure Python path
+    q_norm_sq = sum(v * v for v in query_vec)
+    q_norm = math.sqrt(q_norm_sq) if q_norm_sq > 0 else 0.0
+    results: list[float] = []
+    for vec in candidate_vecs:
+        dot = sum(a * b for a, b in zip(query_vec, vec))
+        v_norm = math.sqrt(sum(v * v for v in vec))
+        if q_norm == 0.0 or v_norm == 0.0:
+            results.append(0.0)
+        else:
+            results.append(dot / (q_norm * v_norm))
+    return results
 
 
 def _normalize_company_name(value: str) -> str:
@@ -560,11 +606,25 @@ def compute_global_overlay(analog_set: AnalogSet) -> dict[str, Any]:
             "ticker": match.analog.ticker,
             "score": round(match.analog_score, 3),
             "similarity": round(match.similarity_score, 3),
+            "sector": match.analog.sector or "—",
+            "industry": match.analog.industry or "—",
+            "industry_fit_score": round(match.industry_fit_score, 3),
             "maturity_stage": match.analog.maturity_stage,
             "valuation_regime": match.analog.valuation_regime,
         }
         for match in analog_set.analogs[:5]
     ]
+    # Analogs labeled as cross-sector structural matches
+    weak_industry_count = sum(1 for m in analog_set.analogs if m.industry_fit_score < 1.0)
+    analog_label = "cross-sector operating analogs" if sector_span > 1 else "same-sector operating analogs"
+    note_text = (
+        f"Cross-symbol overlay from {len(analog_set.analogs)} {analog_label} across {sector_span} sectors."
+    )
+    if weak_industry_count > 0:
+        note_text += (
+            f" {weak_industry_count} analog(s) had missing/Other industry metadata"
+            " and received a reduced weight."
+        )
     return {
         "enabled": True,
         "scope": "analog-network",
@@ -579,9 +639,7 @@ def compute_global_overlay(analog_set: AnalogSet) -> dict[str, Any]:
         "terminal_growth_adj_pp": terminal_growth_adj_pp,
         "beta_adj": beta_adj,
         "top_analogs": top_analogs,
-        "note": (
-            f"Cross-symbol overlay from {len(analog_set.analogs)} analogs across {sector_span} sectors."
-        ),
+        "note": note_text,
     }
 
 
@@ -651,6 +709,18 @@ def find_analogs(
         usefulness_weight = _clamp(candidate.predictive_usefulness or analog_features.predictive_usefulness, 0.25, 1.0)
         distance = sector_distance(subject_sector, candidate.sector, subject_industry, candidate.industry)
         evidence = _top_evidence(subject_features, analog_features)
+
+        # Industry-fit penalty: analogs with blank or "Other" industry/sector
+        # carry less weight because we cannot verify economic relatedness.
+        analog_industry = str(candidate.industry or "").strip()
+        analog_sector = str(candidate.sector or "").strip()
+        if not analog_industry or analog_industry.lower() in {"other", "n/a", "unknown", ""}:
+            industry_fit_score = 0.60  # blank industry — structural match only
+        elif not analog_sector or analog_sector.lower() in {"other", "n/a", "unknown", ""}:
+            industry_fit_score = 0.80  # blank sector — mild penalty
+        else:
+            industry_fit_score = 1.0
+
         if identity_bonus > 0:
             evidence = (
                 {
@@ -662,7 +732,15 @@ def find_analogs(
                     "bucket": "same_issuer",
                 },
             ) + evidence
-        analog_score = (similarity + identity_bonus) * recency_weight * quality_weight * sample_weight * usefulness_weight * (1.0 / distance)
+        analog_score = (
+            (similarity + identity_bonus)
+            * recency_weight
+            * quality_weight
+            * sample_weight
+            * usefulness_weight
+            * (1.0 / distance)
+            * industry_fit_score   # apply industry penalty
+        )
         matches.append(
             AnalogMatch(
                 analog=candidate,
@@ -676,6 +754,7 @@ def find_analogs(
                 sample_weight=sample_weight,
                 usefulness_weight=usefulness_weight,
                 evidence=evidence,
+                industry_fit_score=industry_fit_score,
             )
         )
 
@@ -805,6 +884,8 @@ __all__ = [
     "compute_global_overlay",
     "compute_overlay",
     "cosine_similarity",
+    "_batch_cosine_similarities",
+    "_feature_vec",
     "find_analogs",
     "form_cohorts",
     "match_pattern_library",

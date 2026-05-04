@@ -25,6 +25,9 @@ _SNAPSHOT_TABLE = "learning_state_snapshots"
 _SYNC_LOCK = threading.Lock()
 _LAST_HYDRATE_AT = 0.0
 _HYDRATE_TTL_SEC = 30.0
+_LAST_PERSIST_AT = 0.0
+_PERSIST_MIN_INTERVAL_SEC = 300.0  # max 1 push per 5 minutes (unless force=True)
+_LAST_PERSIST_RESULT: dict[str, Any] = {}
 _DSN_ENV_KEYS = (
     "LEARNING_STORE_DSN",
     "LEARNING_POSTGRES_DSN",
@@ -255,8 +258,11 @@ def hydrate_external_learning_state(*, force: bool = False) -> dict[str, Any]:
 
 
 def persist_external_learning_state(*, force: bool = False) -> dict[str, Any]:
+    global _LAST_PERSIST_AT, _LAST_PERSIST_RESULT
     if not external_learning_enabled():
         return {"enabled": False, "reason": "disabled"}
+    if not force and (time.monotonic() - _LAST_PERSIST_AT) < _PERSIST_MIN_INTERVAL_SEC:
+        return {"enabled": True, "reason": "throttled", **_LAST_PERSIST_RESULT}
 
     persisted: dict[str, bool] = {}
     with _SYNC_LOCK:
@@ -267,11 +273,28 @@ def persist_external_learning_state(*, force: bool = False) -> dict[str, Any]:
             else:
                 snapshot = _snapshot_json_file(Path(spec["path"]))
             persisted[namespace] = save_remote_snapshot(namespace, snapshot)
-    return {"enabled": True, "reason": None, "persisted": persisted}
+        _LAST_PERSIST_AT = time.monotonic()
+        _LAST_PERSIST_RESULT = {"persisted": persisted, "synced_at": _utcnow_iso()}
+    return {"enabled": True, "reason": None, **_LAST_PERSIST_RESULT}
+
+
+def get_sync_stats() -> dict[str, Any]:
+    """Return sync state for the status endpoint."""
+    enabled = external_learning_enabled()
+    last_at = _LAST_PERSIST_RESULT.get("synced_at")
+    elapsed = time.monotonic() - _LAST_PERSIST_AT if _LAST_PERSIST_AT > 0 else None
+    next_in = max(0.0, _PERSIST_MIN_INTERVAL_SEC - (elapsed or _PERSIST_MIN_INTERVAL_SEC))
+    return {
+        "enabled": enabled,
+        "last_synced_at": last_at,
+        "next_sync_in_seconds": round(next_in) if enabled else None,
+        "namespaces_synced": list((_LAST_PERSIST_RESULT.get("persisted") or {}).keys()),
+    }
 
 
 __all__ = [
     "external_learning_enabled",
+    "get_sync_stats",
     "hydrate_external_learning_state",
     "load_remote_snapshot",
     "persist_external_learning_state",

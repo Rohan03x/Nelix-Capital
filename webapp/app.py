@@ -10,6 +10,13 @@ import sys
 import json
 from pathlib import Path
 
+# Load .env file if present (local dev)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
+except ImportError:
+    pass
+
 from flask import (
     Flask, render_template, request, redirect,
     url_for, jsonify, session,
@@ -29,6 +36,18 @@ app = Flask(__name__)
 # Make enumerate available in Jinja2 templates
 app.jinja_env.globals.update(enumerate=enumerate)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
+
+
+def _maybe_start_background_runner() -> None:
+    if os.environ.get("VERCEL"):
+        return
+    try:
+        from auto_valuation.learning.background_runner import start_learning_background_runner
+        start_learning_background_runner()
+    except Exception as exc:
+        logger.debug("Could not start background runner: %s", exc)
+
+_maybe_start_background_runner()
 
 
 def _sync_external_learning_state(*, force: bool = False) -> dict[str, object]:
@@ -274,6 +293,77 @@ def api_manual_compare():
     result = store.record_manual_compare(subject, peers, event_id=payload.get("event_id"))
     _persist_external_learning_state()
     return jsonify({"ok": True, **result})
+
+
+@app.route("/api/internal/learning/status", methods=["GET"])
+def api_internal_learning_status():
+    payload: dict = {}
+    try:
+        from auto_valuation.learning.background_runner import (
+            read_background_runner_state,
+            get_daily_stats,
+        )
+        payload["runner"] = read_background_runner_state()
+        payload["daily"] = get_daily_stats()
+    except Exception as exc:
+        payload["runner"] = {"error": str(exc)}
+
+    try:
+        import sqlite3
+        from auto_valuation.learning._layered_calibrator import CalibrationStore
+        cs = CalibrationStore()
+        conn = sqlite3.connect(str(cs.db_path))
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM calibration_priors")
+        prior_count = cur.fetchone()[0]
+        cur.execute(
+            "SELECT sector || '/' || industry, cohort_size FROM calibration_priors "
+            "WHERE cohort_size > 0 ORDER BY cohort_size DESC LIMIT 8"
+        )
+        cohort_sizes = dict(cur.fetchall())
+        conn.close()
+        payload["calibration"] = {"prior_count": prior_count, "cohort_sizes_sample": cohort_sizes}
+    except Exception as exc:
+        payload["calibration"] = {"error": str(exc)}
+
+    try:
+        import sqlite3 as _sqlite3
+        from auto_valuation.learning.ledger import LedgerReader
+        _lr = LedgerReader()
+        _lconn = _sqlite3.connect(str(_lr.db_path))
+        _lcur = _lconn.cursor()
+        ledger_counts: dict = {}
+        for _t in ("prediction_records", "realized_outcomes", "postmortem_records", "maintenance_runs"):
+            try:
+                _lcur.execute(f"SELECT COUNT(*) FROM {_t}")
+                ledger_counts[_t] = _lcur.fetchone()[0]
+            except Exception:
+                pass
+        _lconn.close()
+        payload["ledger"] = ledger_counts
+    except Exception as exc:
+        payload["ledger"] = {"error": str(exc)}
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu = f"CUDA ({torch.cuda.get_device_name(0)})"
+        elif torch.backends.mps.is_available():
+            gpu = "MPS (Apple Silicon)"
+        else:
+            gpu = "CPU only"
+    except Exception:
+        gpu = "torch not available"
+    payload["gpu"] = gpu
+    payload["cpu_cores"] = os.cpu_count()
+
+    try:
+        from auto_valuation.learning.production_sync import get_sync_stats
+        payload["sync"] = get_sync_stats()
+    except Exception as exc:
+        payload["sync"] = {"error": str(exc)}
+
+    return jsonify({"ok": True, **payload})
 
 
 @app.route("/api/internal/learning/cron", methods=["GET", "POST"])
