@@ -123,6 +123,60 @@ def test_snapshot_load_falls_back_to_supabase_storage(monkeypatch):
 
     assert production_sync.load_remote_snapshot("runner_state") == {"namespace": "runner_state"}
 
+def test_storage_snapshot_saves_object_without_bucket_create(monkeypatch):
+    calls: list[tuple[str, str]] = []
+
+    class Response:
+        status_code = 200
+        reason = "OK"
+        text = "{}"
+
+    class Requests:
+        @staticmethod
+        def post(url, headers=None, data=None, json=None, timeout=None):
+            calls.append(("post", url))
+            return Response()
+
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setattr("requests.post", Requests.post)
+
+    assert production_sync._save_storage_snapshot("runner_state", {"ok": True}) is True
+    assert calls == [("post", "https://example.supabase.co/storage/v1/object/learning-state/runner_state.json")]
+
+
+def test_storage_snapshot_creates_bucket_only_when_missing(monkeypatch):
+    calls: list[tuple[str, str]] = []
+
+    class Response:
+        def __init__(self, status_code, text="{}", reason="OK"):
+            self.status_code = status_code
+            self.text = text
+            self.reason = reason
+
+    def post(url, headers=None, data=None, json=None, timeout=None):
+        calls.append(("post", url))
+        if "/object/" in url and len([call for call in calls if call == ("post", url)]) == 1:
+            return Response(404, '{"message":"Bucket not found"}', "Not Found")
+        return Response(200)
+
+    def get(url, headers=None, timeout=None):
+        calls.append(("get", url))
+        return Response(404, '{"message":"Bucket not found"}', "Not Found")
+
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setattr("requests.post", post)
+    monkeypatch.setattr("requests.get", get)
+
+    assert production_sync._save_storage_snapshot("ledger", {"ok": True}) is True
+    assert calls == [
+        ("post", "https://example.supabase.co/storage/v1/object/learning-state/ledger.json"),
+        ("get", "https://example.supabase.co/storage/v1/bucket/learning-state"),
+        ("post", "https://example.supabase.co/storage/v1/bucket"),
+        ("post", "https://example.supabase.co/storage/v1/object/learning-state/ledger.json"),
+    ]
+
 
 def test_api_internal_learning_cron_runs_cycle_and_sync(monkeypatch):
     webapp_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")

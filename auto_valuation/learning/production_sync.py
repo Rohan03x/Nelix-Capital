@@ -128,8 +128,27 @@ def _supabase_storage_headers(config: dict[str, str], *, content_type: str | Non
     return headers
 
 
-def _ensure_supabase_storage_bucket(config: dict[str, str]) -> None:
+def _storage_error_message(response: Any) -> str:
+    try:
+        body = str(response.text or "").strip()
+    except Exception:
+        body = ""
+    if len(body) > 500:
+        body = body[:500] + "..."
+    return f"{response.status_code} {response.reason}: {body}".strip()
+
+
+def _ensure_supabase_storage_bucket(config: dict[str, str]) -> bool:
     import requests
+
+    bucket_url = f"{config['url']}/storage/v1/bucket/{config['bucket']}"
+    lookup = requests.get(
+        bucket_url,
+        headers=_supabase_storage_headers(config),
+        timeout=15,
+    )
+    if lookup.status_code == 200:
+        return True
 
     response = requests.post(
         f"{config['url']}/storage/v1/bucket",
@@ -137,8 +156,10 @@ def _ensure_supabase_storage_bucket(config: dict[str, str]) -> None:
         json={"id": config["bucket"], "name": config["bucket"], "public": False},
         timeout=15,
     )
-    if response.status_code not in {200, 201, 409}:
-        response.raise_for_status()
+    if response.status_code in {200, 201, 409}:
+        return True
+    logger.warning("Supabase learning snapshot bucket ensure failed: %s", _storage_error_message(response))
+    return False
 
 
 def _load_storage_snapshot(namespace: str) -> dict[str, Any] | None:
@@ -166,20 +187,20 @@ def _save_storage_snapshot(namespace: str, payload: dict[str, Any]) -> bool:
     config = _supabase_storage_config()
     if not config:
         return False
-    _ensure_supabase_storage_bucket(config)
     encoded = json.dumps(payload, default=str).encode("utf-8")
     object_name = f"{namespace}.json"
-    response = requests.post(
-        f"{config['url']}/storage/v1/object/{config['bucket']}/{object_name}",
-        headers={
-            **_supabase_storage_headers(config, content_type="application/json"),
-            "x-upsert": "true",
-        },
-        data=encoded,
-        timeout=60,
-    )
+    object_url = f"{config['url']}/storage/v1/object/{config['bucket']}/{object_name}"
+    headers = {
+        **_supabase_storage_headers(config, content_type="application/json"),
+        "x-upsert": "true",
+    }
+    response = requests.post(object_url, headers=headers, data=encoded, timeout=60)
+    body = str(getattr(response, "text", "") or "").lower()
+    if response.status_code in {400, 404} and "bucket" in body:
+        _ensure_supabase_storage_bucket(config)
+        response = requests.post(object_url, headers=headers, data=encoded, timeout=60)
     if response.status_code not in {200, 201}:
-        response.raise_for_status()
+        raise RuntimeError(f"Supabase storage snapshot save failed for {namespace}: {_storage_error_message(response)}")
     return True
 
 
@@ -394,16 +415,22 @@ def persist_external_learning_state(*, force: bool = False) -> dict[str, Any]:
 
     persisted: dict[str, bool] = {}
     with _SYNC_LOCK:
+        errors: dict[str, str] = {}
         for namespace, spec in _component_specs().items():
-            if spec["kind"] == "sqlite":
-                spec["ensure"]()
-                snapshot = _snapshot_sqlite_db(Path(spec["path"]), tuple(spec["tables"]))
-            else:
-                snapshot = _snapshot_json_file(Path(spec["path"]))
-            persisted[namespace] = save_remote_snapshot(namespace, snapshot)
+            try:
+                if spec["kind"] == "sqlite":
+                    spec["ensure"]()
+                    snapshot = _snapshot_sqlite_db(Path(spec["path"]), tuple(spec["tables"]))
+                else:
+                    snapshot = _snapshot_json_file(Path(spec["path"]))
+                persisted[namespace] = save_remote_snapshot(namespace, snapshot)
+            except Exception as exc:
+                persisted[namespace] = False
+                errors[namespace] = str(exc)
         _LAST_PERSIST_AT = time.monotonic()
-        _LAST_PERSIST_RESULT = {"persisted": persisted, "synced_at": _utcnow_iso()}
-    return {"enabled": True, "reason": None, **_LAST_PERSIST_RESULT}
+        _LAST_PERSIST_RESULT = {"persisted": persisted, "synced_at": _utcnow_iso(), "errors": errors}
+    reason = None if all(persisted.values()) else "partial-failure"
+    return {"enabled": True, "reason": reason, **_LAST_PERSIST_RESULT}
 
 
 def get_sync_stats() -> dict[str, Any]:
