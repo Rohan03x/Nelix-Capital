@@ -347,6 +347,9 @@ def api_manual_compare():
 
 @app.route("/api/internal/learning/status", methods=["GET"])
 def api_internal_learning_status():
+    # On Vercel (serverless) hydrate from Supabase so counts reflect real data.
+    if os.environ.get("VERCEL"):
+        _sync_external_learning_state()
     payload: dict = {}
     try:
         from auto_valuation.learning.background_runner import (
