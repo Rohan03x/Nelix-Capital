@@ -103,3 +103,17 @@ def manual_compare_items(subject_ticker: str | None = None, limit: int | None = 
     if limit is not None and int(limit) > 0:
         items = items[: int(limit)]
     return [dict(item) for item in items if isinstance(item, dict)]
+
+
+def seed_summary() -> dict[str, Any]:
+    payload = _load_seed_payload()
+    peer_payload = payload.get("peer_relationships") or {}
+    manual_payload = payload.get("manual_compares") or {}
+    return {
+        "generated_at": payload.get("generated_at"),
+        "cohort_observations": len(payload.get("cohort_observations") or []),
+        "analog_observations": len(payload.get("analog_observations") or []),
+        "peer_subjects": len(peer_payload) if isinstance(peer_payload, dict) else 0,
+        "watchlist": len(payload.get("watchlist") or []),
+        "manual_compare_subjects": len(manual_payload) if isinstance(manual_payload, dict) else 0,
+    }

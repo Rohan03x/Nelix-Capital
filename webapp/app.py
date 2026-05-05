@@ -507,6 +507,12 @@ def api_internal_learning_status():
         payload["sync"] = {"error": str(exc)}
 
     try:
+        from auto_valuation.learning.deployment_seed import seed_summary
+        payload["deployment_seed"] = seed_summary()
+    except Exception as exc:
+        payload["deployment_seed"] = {"error": str(exc)}
+
+    try:
         from auto_valuation.learning.performance_report import build_learning_performance_report
 
         report = build_learning_performance_report(chunk_size=1000)
