@@ -1,5 +1,11 @@
 {
   "buildCommand": "python build.py",
+  "rewrites": [
+    {
+      "source": "/api/ticker-search",
+      "destination": "/api/ticker_search"
+    }
+  ],
   "crons": [
     {
       "path": "/api/internal/learning/cron",

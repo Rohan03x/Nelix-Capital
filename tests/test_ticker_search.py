@@ -134,7 +134,7 @@ def test_available_exchanges_uses_manifest_without_loading_full_index(tmp_path, 
 
 
 def test_vercel_ticker_search_function_uses_shards(tmp_path, monkeypatch):
-    api_path = Path(__file__).resolve().parents[1] / "api" / "ticker-search" / "index.py"
+    api_path = Path(__file__).resolve().parents[1] / "api" / "ticker_search.py"
     spec = importlib.util.spec_from_file_location("vercel_ticker_search", api_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -152,8 +152,8 @@ def test_vercel_ticker_search_function_uses_shards(tmp_path, monkeypatch):
         has_fundamentals=True,
     )
     (tmp_path / "search_shard_s.json").write_text(json.dumps([shard_item]), encoding="utf-8")
-    monkeypatch.setattr(module, "_cache_dir", lambda: tmp_path)
-    module._load_search_shard.cache_clear()
+    monkeypatch.setattr(module._MODULE, "_cache_dir", lambda: tmp_path)
+    module._MODULE._load_search_shard.cache_clear()
 
     payload = module.search_tickers_payload("signify", limit=20, exchange="auto")
 
