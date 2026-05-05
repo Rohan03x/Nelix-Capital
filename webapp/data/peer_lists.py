@@ -943,6 +943,196 @@ def _safe_multiple(val: Any, max_val: float = 500.0) -> float | None:
     return round(v, 2)
 
 
+_PEER_MULTIPLE_KEYS = ("ev_rev", "ev_ebitda", "ev_ebit", "pe", "p_fcf")
+
+
+def _row_has_peer_multiple(row: dict[str, Any]) -> bool:
+    return any(row.get(key) and row.get(key) > 0 for key in _PEER_MULTIPLE_KEYS)
+
+
+def _peer_cache_needs_refresh(rows: list[dict[str, Any]]) -> bool:
+    if not rows:
+        return True
+    return any(str(row.get("source") or "").lower() == "not_available" for row in rows)
+
+
+def _first_number(*values: Any, default: float = 0.0) -> float:
+    for value in values:
+        try:
+            if value is None or value == "" or value == "None":
+                continue
+            numeric = float(value)
+            if not math.isnan(numeric) and not math.isinf(numeric):
+                return numeric
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def _latest_yearly(financials: dict[str, Any], section_name: str) -> dict[str, Any]:
+    section = financials.get(section_name) or {}
+    yearly = section.get("yearly") or {}
+    if not isinstance(yearly, dict) or not yearly:
+        return {}
+    for _key, row in sorted(yearly.items(), key=lambda item: str(item[0]), reverse=True):
+        if isinstance(row, dict) and row:
+            return row
+    return {}
+
+
+def _metrics_from_eodhd_fundamentals(
+    payload: dict[str, Any] | None,
+    *,
+    fallback_ticker: str = "",
+) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data") if "data" in payload else payload
+    if not isinstance(data, dict):
+        return None
+
+    general = data.get("General") or {}
+    highlights = data.get("Highlights") or {}
+    valuation = data.get("Valuation") or {}
+    financials = data.get("Financials") or {}
+
+    code = str(general.get("Code") or "").strip()
+    exchange = str(general.get("Exchange") or "").strip()
+    if not code and fallback_ticker:
+        code = fallback_ticker.split(".", 1)[0]
+        if "." in fallback_ticker and not exchange:
+            exchange = fallback_ticker.split(".", 1)[1]
+    if not code:
+        return None
+
+    income = _latest_yearly(financials, "Income_Statement")
+    cash_flow = _latest_yearly(financials, "Cash_Flow")
+    balance = _latest_yearly(financials, "Balance_Sheet")
+
+    market_cap_mln = _first_number(highlights.get("MarketCapitalizationMln"))
+    market_cap_raw = _first_number(highlights.get("MarketCapitalization"), general.get("MarketCapitalization"))
+    if market_cap_mln <= 0 and market_cap_raw > 0:
+        market_cap_mln = market_cap_raw / 1e6 if market_cap_raw > 1e6 else market_cap_raw
+    if market_cap_raw <= 0 and market_cap_mln > 0:
+        market_cap_raw = market_cap_mln * 1e6
+
+    ev_raw = _first_number(valuation.get("EnterpriseValue"))
+    ev_mln = _first_number(valuation.get("EnterpriseValueMln"), valuation.get("EnterpriseValueMRQ"))
+    if ev_raw <= 0 and ev_mln > 0:
+        ev_raw = ev_mln * 1e6
+
+    cash = _first_number(
+        balance.get("cashAndShortTermInvestments"),
+        balance.get("cashAndCashEquivalents"),
+        balance.get("cash"),
+    )
+    debt = _first_number(balance.get("totalDebt"))
+    if debt <= 0:
+        debt = _first_number(balance.get("shortTermDebt")) + _first_number(balance.get("longTermDebt"))
+    if ev_raw <= 0 and market_cap_raw > 0:
+        ev_raw = max(0.0, market_cap_raw + debt - cash)
+
+    revenue = _first_number(income.get("totalRevenue"), income.get("revenue"))
+    ebit = _first_number(income.get("operatingIncome"), income.get("ebit"))
+    ebitda = _first_number(income.get("ebitda"), income.get("EBITDA"))
+    depreciation = abs(_first_number(income.get("depreciationAndAmortization"), cash_flow.get("depreciationAndAmortization")))
+    if ebitda <= 0 and ebit > 0 and depreciation > 0:
+        ebitda = ebit + depreciation
+    net_income = _first_number(income.get("netIncome"), income.get("net_income"))
+
+    free_cash_flow = _first_number(cash_flow.get("freeCashFlow"), cash_flow.get("free_cash_flow"))
+    if free_cash_flow <= 0:
+        operating_cash_flow = _first_number(cash_flow.get("totalCashFromOperatingActivities"), cash_flow.get("operatingCashFlow"))
+        capex = _first_number(cash_flow.get("capitalExpenditures"), cash_flow.get("capitalExpenditure"))
+        if operating_cash_flow > 0:
+            free_cash_flow = operating_cash_flow + capex if capex < 0 else operating_cash_flow - abs(capex)
+
+    ev_rev = _safe_multiple(_first_number(valuation.get("EnterpriseValueRevenue"), valuation.get("EVToRevenue")))
+    ev_ebitda = _safe_multiple(_first_number(valuation.get("EnterpriseValueEbitda"), valuation.get("EnterpriseValueEBITDA"), valuation.get("EVToEBITDA")))
+    ev_ebit = _safe_multiple(_first_number(valuation.get("EnterpriseValueEbit"), valuation.get("EnterpriseValueEBIT"), valuation.get("EVToEBIT")))
+    pe = _safe_multiple(_first_number(highlights.get("PERatio"), valuation.get("TrailingPE"), valuation.get("PE")))
+    p_fcf = _safe_multiple(_first_number(valuation.get("PriceToFreeCashFlow"), valuation.get("PriceFreeCashFlow"), valuation.get("PFCF")))
+
+    if ev_raw > 0:
+        ev_rev = ev_rev or _safe_multiple(ev_raw / revenue if revenue > 0 else None)
+        ev_ebitda = ev_ebitda or _safe_multiple(ev_raw / ebitda if ebitda > 0 else None)
+        ev_ebit = ev_ebit or _safe_multiple(ev_raw / ebit if ebit > 0 else None)
+    if market_cap_raw > 0:
+        pe = pe or _safe_multiple(market_cap_raw / net_income if net_income > 0 else None)
+        p_fcf = p_fcf or _safe_multiple(market_cap_raw / free_cash_flow if free_cash_flow > 0 else None)
+
+    eodhd_code = f"{code}.{exchange}" if exchange else code
+    variants = _ticker_variants(eodhd_code) | _ticker_variants(code) | _ticker_variants(fallback_ticker)
+    return {
+        "ticker": eodhd_code.upper(),
+        "name": str(general.get("Name") or code),
+        "market_cap": round(market_cap_mln),
+        "ev": round(ev_raw / 1e6) if ev_raw else 0,
+        "revenue": revenue or None,
+        "ebitda": ebitda or None,
+        "ebit": ebit or None,
+        "net_income": net_income or None,
+        "fcf": free_cash_flow or None,
+        "ev_rev": ev_rev,
+        "ev_ebitda": ev_ebitda,
+        "ev_ebit": ev_ebit,
+        "pe": pe,
+        "p_fcf": p_fcf,
+        "sector": str(general.get("Sector") or ""),
+        "industry": str(general.get("Industry") or ""),
+        "exchange": exchange,
+        "source": "eodhd",
+        "_variants": {variant.upper() for variant in variants if variant},
+    }
+
+
+def _fetch_eodhd_fundamentals_for_peer(ticker: str) -> dict[str, Any] | None:
+    try:
+        from webapp.data.eodhd_client import _fetch_fundamentals, normalize_requested_ticker
+    except Exception:
+        return None
+
+    candidates: list[str] = []
+    try:
+        candidates.append(normalize_requested_ticker(ticker))
+    except Exception:
+        pass
+    if ticker:
+        candidates.append(str(ticker).upper())
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        code = str(candidate or "").upper().strip()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        try:
+            fundamentals = _fetch_fundamentals(code)
+        except Exception:
+            fundamentals = None
+        if isinstance(fundamentals, dict):
+            return fundamentals
+    return None
+
+
+def _lookup_eodhd_peer_metrics(ticker: str, eodhd_index: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    ticker_text = str(ticker or "").upper().strip()
+    for variant in _ticker_variants(ticker_text):
+        metrics = eodhd_index.get(variant)
+        if metrics:
+            return dict(metrics)
+
+    fundamentals = _fetch_eodhd_fundamentals_for_peer(ticker_text)
+    metrics = _metrics_from_eodhd_fundamentals(fundamentals, fallback_ticker=ticker_text)
+    if not metrics:
+        return None
+
+    variants = metrics.pop("_variants", set())
+    for variant in variants:
+        eodhd_index.setdefault(str(variant).upper(), dict(metrics))
+    return dict(metrics)
+
+
 @lru_cache(maxsize=1)
 def _build_eodhd_multiples_index() -> dict[str, dict[str, Any]]:
     """Scan all cached EODHD fundamentals files and build a
@@ -983,62 +1173,12 @@ def _build_eodhd_multiples_index() -> dict[str, dict[str, Any]]:
         if not isinstance(payload, dict):
             continue
 
-        general    = payload.get("General")    or {}
-        highlights = payload.get("Highlights") or {}
-        valuation  = payload.get("Valuation")  or {}
-        financials = payload.get("Financials") or {}
-
-        code     = str(general.get("Code")     or "").strip()
-        exchange = str(general.get("Exchange") or "").strip()
-        name     = str(general.get("Name")     or code)
-
-        if not code:
-            # Derive from filename as fallback (e.g. eodhd_fund_AYI_US → AYI / US)
-            stem  = path.stem.replace("eodhd_fund_", "")
-            parts = stem.rsplit("_", 1)
-            code, exchange = (parts[0], parts[1]) if len(parts) == 2 else (stem, "")
-
-        mkt_mln = float(highlights.get("MarketCapitalizationMln") or 0.0)
-        ev_raw  = float(valuation.get("EnterpriseValue")          or 0.0)
-
-        # Multiples that EODHD pre-computes in the Valuation section
-        ev_rev    = _safe_multiple(valuation.get("EnterpriseValueRevenue"))
-        ev_ebitda = _safe_multiple(valuation.get("EnterpriseValueEbitda"))
-        pe        = _safe_multiple(highlights.get("PERatio") or valuation.get("TrailingPE"))
-
-        # EV/EBIT — derive from latest annual operating income
-        ev_ebit = None
-        income_yearly = (financials.get("Income_Statement") or {}).get("yearly") or {}
-        cf_yearly     = (financials.get("Cash_Flow")        or {}).get("yearly") or {}
-
-        if income_yearly and ev_raw > 0:
-            latest_inc = income_yearly.get(sorted(income_yearly.keys())[-1]) or {}
-            ebit = float(latest_inc.get("operatingIncome") or 0.0)
-            if ebit > 0:
-                ev_ebit = _safe_multiple(ev_raw / ebit)
-
-        # P/FCF — derive from latest annual free cash flow
-        p_fcf = None
-        if cf_yearly and mkt_mln > 0:
-            latest_cf = cf_yearly.get(sorted(cf_yearly.keys())[-1]) or {}
-            fcf = float(latest_cf.get("freeCashFlow") or 0.0)
-            if fcf > 0:
-                # Both mkt_mln*1e6 and fcf are in the same local currency
-                p_fcf = _safe_multiple((mkt_mln * 1e6) / fcf)
-
-        metrics: dict[str, Any] = {
-            "name":       name,
-            "market_cap": round(mkt_mln),
-            "ev":         round(ev_raw / 1e6) if ev_raw else 0,
-            "ev_rev":     ev_rev,
-            "ev_ebitda":  ev_ebitda,
-            "ev_ebit":    ev_ebit,
-            "pe":         pe,
-            "p_fcf":      p_fcf,
-        }
-
-        eodhd_code = f"{code}.{exchange}" if exchange else code
-        for variant in _ticker_variants(eodhd_code) | _ticker_variants(code):
+        stem = path.stem.replace("eodhd_fund_", "").replace("_", ".")
+        metrics = _metrics_from_eodhd_fundamentals(payload, fallback_ticker=stem)
+        if not metrics:
+            continue
+        variants = metrics.pop("_variants", set())
+        for variant in variants:
             if variant:
                 index.setdefault(variant.upper(), metrics)
 
@@ -1066,8 +1206,9 @@ def fetch_peer_metrics(
     """Fetch basic valuation metrics for *peer_tickers*.
 
     Data source priority:
-      1. EODHD fundamentals cache (covers all international tickers)
-      2. N/A (no secondary provider for tickers not in the EODHD cache)
+    1. EODHD fundamentals cache/index (covers all international tickers)
+    2. Live EODHD fundamentals fetch for peers missing from the local index
+    3. N/A only when EODHD has no fundamentals for that peer
 
     Returns:
         peers       — list of peer dicts (one per ticker, sorted by mkt cap desc)
@@ -1077,7 +1218,7 @@ def fetch_peer_metrics(
     cache_key = _peer_cache_key(target_ticker, peer_tickers)
 
     cached = _load_cache(cache_key)
-    if cached is not None:
+    if cached is not None and not _peer_cache_needs_refresh(list(cached)):
         logger.debug("Using cached peer data for %s", cache_key)
         peers = _enrich_peer_rows(
             list(cached),
@@ -1090,6 +1231,8 @@ def fetch_peer_metrics(
         peers = [p for p in peers if p.get("subject") or p.get("peer_valid", True)]
         peer_median = _compute_median(peers, target_ticker)
         return peers, peer_median
+    if cached is not None:
+        logger.info("Refreshing stale peer cache with missing multiples for %s", cache_key)
 
     eodhd_index = _build_eodhd_multiples_index()
     profiles = {str(profile.get("ticker") or ""): profile for profile in _load_cached_peer_profiles()}
@@ -1103,12 +1246,7 @@ def fetch_peer_metrics(
             ticker_text = str(tk or "").upper()
 
             # ── 1. EODHD cache (primary) ──────────────────────────────────
-            eodhd: dict[str, Any] | None = eodhd_index.get(ticker_text)
-            if eodhd is None:
-                for v in _ticker_variants(ticker_text):
-                    eodhd = eodhd_index.get(v)
-                    if eodhd:
-                        break
+            eodhd: dict[str, Any] | None = _lookup_eodhd_peer_metrics(ticker_text, eodhd_index)
 
             if eodhd is not None:
                 peers.append({
@@ -1126,6 +1264,10 @@ def fetch_peer_metrics(
                     "ev_ebit":    eodhd.get("ev_ebit"),
                     "pe":         eodhd.get("pe"),
                     "p_fcf":      eodhd.get("p_fcf"),
+                    "source":     eodhd.get("source") or "eodhd",
+                    "exchange":   eodhd.get("exchange") or "",
+                    "sector":     eodhd.get("sector") or "",
+                    "industry":   eodhd.get("industry") or "",
                     "subject":    (ticker_text == target_ticker),
                 })
                 continue
@@ -1171,7 +1313,8 @@ def fetch_peer_metrics(
             target_ticker,
             excluded,
         )
-    _save_cache(cache_key, valid_peers)
+    if any(_row_has_peer_multiple(peer) for peer in valid_peers):
+        _save_cache(cache_key, valid_peers)
 
     peer_median = _compute_median(valid_peers, target_ticker)
     return valid_peers, peer_median

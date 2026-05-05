@@ -311,6 +311,7 @@ def test_fetch_peer_metrics_normalizes_eodhd_suffixes_for_yfinance(monkeypatch):
     # Force the EODHD index to be empty so all peers fall through to the
     # not-available branch — no yfinance call should occur.
     monkeypatch.setattr(peer_lists, "_build_eodhd_multiples_index", lambda: {})
+    monkeypatch.setattr(peer_lists, "_fetch_eodhd_fundamentals_for_peer", lambda _ticker: None)
 
     peers, _peer_median = peer_lists.fetch_peer_metrics(
         ["G14.XETRA", "70GD.LSE", "JBGS.US"],
@@ -326,3 +327,81 @@ def test_fetch_peer_metrics_normalizes_eodhd_suffixes_for_yfinance(monkeypatch):
     for peer in peers:
         if peer.get("ticker") in {"G14.XETRA", "70GD.LSE", "JBGS.US"}:
             assert peer.get("source") == "not_available"
+
+
+def test_fetch_peer_metrics_refreshes_stale_not_available_cache_from_eodhd(monkeypatch):
+    import webapp.data.peer_lists as peer_lists
+
+    saved: dict[str, list[dict]] = {}
+    monkeypatch.setattr(
+        peer_lists,
+        "_load_cache",
+        lambda _key: [
+            {
+                "ticker": "AYI",
+                "name": "AYI",
+                "ev_rev": None,
+                "ev_ebitda": None,
+                "ev_ebit": None,
+                "pe": None,
+                "p_fcf": None,
+                "source": "not_available",
+            }
+        ],
+    )
+    monkeypatch.setattr(peer_lists, "_save_cache", lambda key, rows: saved.setdefault(key, rows))
+    monkeypatch.setattr(peer_lists, "_build_eodhd_multiples_index", lambda: {})
+    monkeypatch.setattr(peer_lists, "_load_cached_peer_profiles", lambda: [])
+    monkeypatch.setattr(peer_lists, "_safe_universe_store", lambda: None)
+    monkeypatch.setattr(peer_lists, "_safe_discovery_store", lambda: None)
+    monkeypatch.setattr(
+        peer_lists,
+        "_fetch_eodhd_fundamentals_for_peer",
+        lambda _ticker: {
+            "General": {
+                "Code": "AYI",
+                "Exchange": "US",
+                "Name": "Acuity Inc.",
+                "Sector": "Industrials",
+                "Industry": "Electrical Equipment & Parts",
+            },
+            "Highlights": {"MarketCapitalizationMln": 1000, "PERatio": 20},
+            "Valuation": {"EnterpriseValue": 1200000000},
+            "Financials": {
+                "Income_Statement": {
+                    "yearly": {
+                        "2025-12-31": {
+                            "totalRevenue": 500000000,
+                            "operatingIncome": 100000000,
+                            "ebitda": 150000000,
+                            "netIncome": 50000000,
+                        }
+                    }
+                },
+                "Cash_Flow": {
+                    "yearly": {
+                        "2025-12-31": {
+                            "freeCashFlow": 80000000,
+                        }
+                    }
+                },
+            },
+        },
+    )
+
+    peers, peer_median = peer_lists.fetch_peer_metrics(
+        ["AYI"],
+        "LIGHT.AS",
+        target_sector="Industrials",
+        target_industry="Electrical Equipment & Parts",
+    )
+
+    assert peers[0]["name"] == "Acuity Inc."
+    assert peers[0]["source"] == "eodhd"
+    assert peers[0]["ev_rev"] == 2.4
+    assert peers[0]["ev_ebitda"] == 8.0
+    assert peers[0]["ev_ebit"] == 12.0
+    assert peers[0]["pe"] == 20.0
+    assert peers[0]["p_fcf"] == 12.5
+    assert peer_median["ev_ebitda"] == 8.0
+    assert saved
