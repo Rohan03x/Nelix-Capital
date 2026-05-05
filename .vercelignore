@@ -2,6 +2,9 @@
 .vscode/
 .pytest_cache/
 __pycache__/
+.env
+.env.*
+*.env.local
 logs/
 output/
 tests/
@@ -34,6 +37,8 @@ auto_valuation/learning/ledger/**
 auto_valuation/learning/data/
 auto_valuation/learning/data/*
 auto_valuation/learning/data/**
+!auto_valuation/learning/data/
+!auto_valuation/learning/data/dashboard_learning_seed.json
 # Large binary/data file types — never needed at runtime in Lambda
 *.db
 **/*.db
