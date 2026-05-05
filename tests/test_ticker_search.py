@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-import importlib.util
 from pathlib import Path
 
+import webapp.app as webapp_module
 import webapp.data.eodhd_client as eodhd_client
 
 from webapp.data import ticker_search
@@ -133,13 +133,7 @@ def test_available_exchanges_uses_manifest_without_loading_full_index(tmp_path, 
     ticker_search.available_exchanges.cache_clear()
 
 
-def test_vercel_ticker_search_function_uses_shards(tmp_path, monkeypatch):
-    api_path = Path(__file__).resolve().parents[1] / "api" / "ticker_search.py"
-    spec = importlib.util.spec_from_file_location("vercel_ticker_search", api_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
+def test_flask_ticker_search_route_uses_shards(tmp_path, monkeypatch):
     shard_item = ticker_search._build_search_item(
         ticker="LIGHT.AS",
         code="LIGHT",
@@ -152,11 +146,16 @@ def test_vercel_ticker_search_function_uses_shards(tmp_path, monkeypatch):
         has_fundamentals=True,
     )
     (tmp_path / "search_shard_s.json").write_text(json.dumps([shard_item]), encoding="utf-8")
-    monkeypatch.setattr(module._MODULE, "_cache_dir", lambda: tmp_path)
-    module._MODULE._load_search_shard.cache_clear()
+    monkeypatch.setattr(ticker_search, "_CACHE_DIR", tmp_path)
+    ticker_search._load_search_shard.cache_clear()
 
-    payload = module.search_tickers_payload("signify", limit=20, exchange="auto")
+    webapp_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
+    with webapp_module.app.test_client() as client:
+        response = client.get("/api/ticker-search?q=signify&limit=20&exchange=auto")
 
+    payload = response.get_json()
+
+    assert response.status_code == 200
     assert payload["results"] == [
         {
             "ticker": "LIGHT.AS",
@@ -166,6 +165,7 @@ def test_vercel_ticker_search_function_uses_shards(tmp_path, monkeypatch):
             "country": "Netherlands",
         }
     ]
+    ticker_search._load_search_shard.cache_clear()
 
 
 def test_search_tickers_prefers_primary_common_stock_before_aliases_and_non_stocks(monkeypatch):

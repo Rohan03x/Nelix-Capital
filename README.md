@@ -157,6 +157,10 @@ This repository is now wired for deployment on Vercel Hobby, which is free for a
 	- `FMP_API_KEY` — optional, enables the FMP fallback client
 	- `FRED_API_KEY` — optional, enables live macro data
 	- `SUPABASE_DB_URL` — recommended for full server-side learning persistence through Supabase snapshot sync
+	- `LEARNING_R2_ACCOUNT_ID`, `LEARNING_R2_ENDPOINT_URL`, `LEARNING_R2_ACCESS_KEY_ID`, `LEARNING_R2_SECRET_ACCESS_KEY`, `LEARNING_R2_BUCKET` — optional Cloudflare R2 object-store backend for the full learned brain outside the Vercel bundle
+	- `LEARNING_R2_PREFIX` — optional R2 object prefix; defaults to `nelix-learning`
+	- `LEARNING_R2_CACHE_READ_THROUGH` — optional, defaults to disabled; set to `1` only if production should pull raw market-data cache files from R2 on demand
+	- `LEARNING_R2_CACHE_WRITE_THROUGH` — optional, defaults to disabled; set to `1` only if production should upload newly fetched cache files back to R2
 	- `LEARNING_CRON_SECRET` — recommended when using the scheduled learning sync endpoint on Vercel
 	- `SHARED_BRAIN_DATABASE_URL` — optional direct DB mode for discovery and symbol-universe only; not needed if you are using `SUPABASE_DB_URL`
 	- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` — only if you use email delivery features
@@ -171,6 +175,27 @@ The app now supports a Supabase-backed snapshot store for the full learning runt
 3. Set `SUPABASE_DB_URL` in Vercel to that connection string.
 4. Set `LEARNING_CRON_SECRET` in Vercel to any long random secret.
 5. Redeploy. The app will create the remote snapshot table automatically and start syncing the learning runtime into Supabase.
+
+### Cloudflare R2 full brain setup
+
+Use R2 when you want the whole local learned brain available to production without bundling hundreds of megabytes of runtime state into the Vercel function. Raw market-data cache mirroring is optional and not required for the learned brain.
+
+1. Create a Cloudflare R2 bucket, for example `nelix-learning-state`.
+2. Create an R2 API token with object read/write access to that bucket.
+3. Set these Vercel environment variables: `LEARNING_R2_ACCOUNT_ID`, `LEARNING_R2_ENDPOINT_URL`, `LEARNING_R2_ACCESS_KEY_ID`, `LEARNING_R2_SECRET_ACCESS_KEY`, `LEARNING_R2_BUCKET`, `LEARNING_R2_PREFIX=nelix-learning`, `LEARNING_SYNC_PREFER_OBJECT_STORAGE=1`, and `LEARNING_R2_RAW_COMPONENT_SYNC=1`.
+4. Locally sync the full learned brain into R2:
+
+```powershell
+$env:LEARNING_SYNC_PREFER_OBJECT_STORAGE = "1"
+$env:LEARNING_R2_RAW_COMPONENT_SYNC = "1"
+& ".venv/Scripts/python.exe" -c "from auto_valuation.learning.production_sync import persist_external_learning_state; print(persist_external_learning_state(force=True))"
+```
+
+5. Push/deploy to Vercel. Production will hydrate the learned SQLite/JSON brain through `production_sync.py`.
+
+Do not run the full `r2_mirror` cache mode unless you explicitly want raw `webapp/data/cache` market-data files in R2 as well.
+
+R2 is the durable learned-brain store. Vercel should still exclude `webapp/data/cache/**`, `auto_valuation/learning/db/**`, and `auto_valuation/learning/ledger/**` from the bundle because Lambda storage and bundle limits cannot hold local runtime state directly.
 
 ### Notes
 

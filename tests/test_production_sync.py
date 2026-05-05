@@ -6,6 +6,27 @@ import webapp.app as webapp_module
 from auto_valuation.learning import production_sync
 
 
+_R2_ENV_KEYS = (
+    "LEARNING_R2_ACCOUNT_ID",
+    "LEARNING_R2_ENDPOINT_URL",
+    "LEARNING_R2_ENDPOINT",
+    "LEARNING_R2_ACCESS_KEY_ID",
+    "LEARNING_R2_SECRET_ACCESS_KEY",
+    "LEARNING_R2_BUCKET",
+    "LEARNING_R2_PREFIX",
+    "R2_ENDPOINT_URL",
+    "R2_ENDPOINT",
+    "R2_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY",
+    "R2_BUCKET",
+)
+
+
+def _clear_r2_env(monkeypatch):
+    for env_key in _R2_ENV_KEYS:
+        monkeypatch.delenv(env_key, raising=False)
+
+
 def test_sqlite_snapshot_roundtrip_restores_rows(tmp_path):
     db_path = tmp_path / "state.db"
     with sqlite3.connect(db_path) as conn:
@@ -87,6 +108,7 @@ def test_component_specs_include_calibration_and_maintenance_state():
 
 
 def test_external_learning_enabled_with_supabase_storage(monkeypatch):
+    _clear_r2_env(monkeypatch)
     for env_key in production_sync._DSN_ENV_KEYS:
         monkeypatch.delenv(env_key, raising=False)
 
@@ -94,6 +116,73 @@ def test_external_learning_enabled_with_supabase_storage(monkeypatch):
     monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
 
     assert production_sync.external_learning_enabled() is True
+
+
+def test_external_learning_enabled_with_cloudflare_r2(monkeypatch):
+    for env_key in production_sync._DSN_ENV_KEYS:
+        monkeypatch.delenv(env_key, raising=False)
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+
+    monkeypatch.setenv("LEARNING_R2_ENDPOINT_URL", "https://account.r2.cloudflarestorage.com")
+    monkeypatch.setenv("LEARNING_R2_BUCKET", "learning-state")
+    monkeypatch.setenv("LEARNING_R2_ACCESS_KEY_ID", "access")
+    monkeypatch.setenv("LEARNING_R2_SECRET_ACCESS_KEY", "secret")
+
+    assert production_sync.external_learning_enabled() is True
+    assert "cloudflare-r2" in production_sync.get_sync_stats()["backends"]
+
+
+def test_storage_snapshot_prefers_r2_when_configured(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_r2_save(namespace, payload):
+        captured["namespace"] = namespace
+        captured["payload"] = payload
+        return True
+
+    monkeypatch.setattr(production_sync, "_save_r2_snapshot", _fake_r2_save)
+    monkeypatch.setattr(production_sync, "_supabase_storage_configs", lambda: [])
+
+    assert production_sync._save_storage_snapshot("ledger", {"ok": True}) is True
+    assert captured == {"namespace": "ledger", "payload": {"ok": True}}
+
+
+def test_storage_snapshot_loads_from_r2_before_supabase(monkeypatch):
+    monkeypatch.setattr(production_sync, "_load_r2_snapshot", lambda namespace: {"namespace": namespace})
+    monkeypatch.setattr(production_sync, "_supabase_storage_configs", lambda: [])
+
+    assert production_sync._load_storage_snapshot("runner_state") == {"namespace": "runner_state"}
+
+
+def test_save_remote_snapshot_prefers_r2_over_postgres_when_configured(monkeypatch):
+    calls: list[str] = []
+
+    def _unexpected_connect():
+        calls.append("postgres")
+        raise AssertionError("postgres should not be used when R2 is primary")
+
+    monkeypatch.setattr(production_sync, "_r2_storage_enabled", lambda: True)
+    monkeypatch.setattr(production_sync, "_save_storage_snapshot", lambda namespace, payload: calls.append(namespace) or True)
+    monkeypatch.setattr(production_sync, "_connect_remote", _unexpected_connect)
+
+    assert production_sync.save_remote_snapshot("ledger", {"ok": True}) is True
+    assert calls == ["ledger"]
+
+
+def test_load_remote_snapshot_prefers_r2_over_postgres_when_configured(monkeypatch):
+    calls: list[str] = []
+
+    def _unexpected_connect():
+        calls.append("postgres")
+        raise AssertionError("postgres should not be used when R2 is primary")
+
+    monkeypatch.setattr(production_sync, "_r2_storage_enabled", lambda: True)
+    monkeypatch.setattr(production_sync, "_load_storage_snapshot", lambda namespace: calls.append(namespace) or {"namespace": namespace})
+    monkeypatch.setattr(production_sync, "_connect_remote", _unexpected_connect)
+
+    assert production_sync.load_remote_snapshot("runner_state") == {"namespace": "runner_state"}
+    assert calls == ["runner_state"]
 
 
 def test_snapshot_save_falls_back_to_supabase_storage(monkeypatch):
@@ -145,6 +234,7 @@ def test_chunked_sqlite_snapshot_roundtrip_uses_manifest(monkeypatch):
     assert restored["tables"] == snapshot["tables"]
 
 def test_storage_snapshot_saves_object_without_bucket_create(monkeypatch):
+    _clear_r2_env(monkeypatch)
     calls: list[tuple[str, str]] = []
 
     class Response:
@@ -167,6 +257,7 @@ def test_storage_snapshot_saves_object_without_bucket_create(monkeypatch):
 
 
 def test_storage_snapshot_creates_bucket_only_when_missing(monkeypatch):
+    _clear_r2_env(monkeypatch)
     calls: list[tuple[str, str]] = []
 
     class Response:
@@ -200,6 +291,7 @@ def test_storage_snapshot_creates_bucket_only_when_missing(monkeypatch):
 
 
 def test_storage_snapshot_retries_alternate_supabase_key(monkeypatch):
+    _clear_r2_env(monkeypatch)
     auth_headers: list[str] = []
 
     class Response:

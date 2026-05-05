@@ -21,6 +21,8 @@ LOCK_PATH = learning_db_dir() / "learning_worker.lock"
 def _pid_running(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        return _windows_pid_running(pid)
     try:
         os.kill(pid, 0)
     except OSError:
@@ -28,6 +30,35 @@ def _pid_running(pid: int) -> bool:
     except Exception:
         return True
     return True
+
+
+def _windows_pid_running(pid: int) -> bool:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        process_handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not process_handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(process_handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(process_handle)
+    except Exception:
+        return False
 
 
 def _read_lock_pid(path: Path) -> int | None:

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sqlite3
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -100,7 +101,29 @@ def _dsn() -> str:
 
 
 def external_learning_enabled() -> bool:
-    return bool(_dsn() or _supabase_storage_configs())
+    return bool(_dsn() or _r2_storage_enabled() or _supabase_storage_configs())
+
+
+def _r2_storage_enabled() -> bool:
+    try:
+        from .r2_store import r2_enabled
+
+        return bool(r2_enabled())
+    except Exception:
+        return False
+
+
+def _storage_backend_names() -> list[str]:
+    names: list[str] = []
+    if _prefer_object_storage():
+        names.append("object-storage-primary")
+    if _dsn():
+        names.append("postgres")
+    if _r2_storage_enabled():
+        names.append("cloudflare-r2")
+    if _supabase_storage_configs():
+        names.append("supabase-storage")
+    return names
 
 
 def _sync_chunk_rows() -> int:
@@ -108,6 +131,21 @@ def _sync_chunk_rows() -> int:
         return max(int(str(os.environ.get(_SYNC_CHUNK_ROWS_ENV) or "500").strip()), 1)
     except (TypeError, ValueError):
         return 500
+
+
+def _truthy_env(name: str, default: bool = False) -> bool:
+    value = str(os.environ.get(name) or "").strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on"}
+
+
+def _prefer_object_storage() -> bool:
+    return _r2_storage_enabled() and _truthy_env("LEARNING_SYNC_PREFER_OBJECT_STORAGE", True)
+
+
+def _r2_raw_component_sync_enabled() -> bool:
+    return _r2_storage_enabled() and _truthy_env("LEARNING_R2_RAW_COMPONENT_SYNC", True)
 
 
 def _supabase_storage_configs() -> list[dict[str, str]]:
@@ -179,6 +217,10 @@ def _ensure_supabase_storage_bucket(config: dict[str, str]) -> bool:
 
 
 def _load_storage_snapshot(namespace: str) -> dict[str, Any] | None:
+    r2_payload = _load_r2_snapshot(namespace)
+    if r2_payload is not None:
+        return r2_payload
+
     import requests
 
     configs = _supabase_storage_configs()
@@ -205,6 +247,9 @@ def _load_storage_snapshot(namespace: str) -> dict[str, Any] | None:
 
 
 def _save_storage_snapshot(namespace: str, payload: dict[str, Any]) -> bool:
+    if _save_r2_snapshot(namespace, payload):
+        return True
+
     import requests
 
     configs = _supabase_storage_configs()
@@ -228,6 +273,29 @@ def _save_storage_snapshot(namespace: str, payload: dict[str, Any]) -> bool:
             return True
         errors.append(_storage_error_message(response))
     raise RuntimeError(f"Supabase storage snapshot save failed for {namespace}: {'; '.join(errors)}")
+
+
+def _load_r2_snapshot(namespace: str) -> dict[str, Any] | None:
+    try:
+        from .r2_store import load_json_object, snapshot_object_key
+
+        payload = load_json_object(snapshot_object_key(namespace))
+    except Exception as exc:
+        logger.warning("R2 learning snapshot load failed for %s: %s", namespace, exc)
+        return None
+    return dict(payload or {}) if isinstance(payload, dict) else None
+
+
+def _save_r2_snapshot(namespace: str, payload: dict[str, Any]) -> bool:
+    try:
+        from .r2_store import r2_enabled, save_json_object, snapshot_object_key
+
+        if not r2_enabled():
+            return False
+        return bool(save_json_object(snapshot_object_key(namespace), payload))
+    except Exception as exc:
+        logger.warning("R2 learning snapshot save failed for %s: %s", namespace, exc)
+        return False
 
 
 def _connect_remote():
@@ -256,6 +324,10 @@ def _ensure_remote_schema(conn: Any) -> None:
 
 
 def _load_remote_snapshot_raw(namespace: str) -> dict[str, Any] | None:
+    if _prefer_object_storage():
+        payload = _load_storage_snapshot(namespace)
+        if payload is not None:
+            return payload
     try:
         conn = _connect_remote()
         if conn is not None:
@@ -305,6 +377,8 @@ def load_remote_snapshot(namespace: str) -> dict[str, Any] | None:
 
 
 def save_remote_snapshot(namespace: str, payload: dict[str, Any]) -> bool:
+    if _prefer_object_storage() and _save_storage_snapshot(namespace, payload):
+        return True
     try:
         conn = _connect_remote()
         if conn is not None:
@@ -443,45 +517,145 @@ def _restore_json_file(file_path: Path, snapshot: dict[str, Any]) -> int:
     return 1 if payload else 0
 
 
+def _sqlite_sidecar_paths(db_path: Path) -> tuple[Path, Path]:
+    return (Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm"))
+
+
+def _remove_sqlite_sidecars(db_path: Path) -> None:
+    for sidecar in _sqlite_sidecar_paths(db_path):
+        try:
+            sidecar.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _sqlite_table_count(db_path: Path, tables: tuple[str, ...]) -> int:
+    if not db_path.exists():
+        return 0
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            available_tables = {
+                str(row[0])
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            return sum(
+                int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] or 0)
+                for table in tables
+                if table in available_tables
+            )
+    except Exception:
+        return 0
+
+
+def _r2_component_object_key(namespace: str, spec: dict[str, Any]) -> str:
+    return str(spec.get("r2_key") or f"brain/db/{Path(spec['path']).name}")
+
+
+def _backup_sqlite_for_upload(source: Path, temp_dir: Path) -> Path:
+    backup_path = temp_dir / source.name
+    try:
+        src_conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+        try:
+            dst_conn = sqlite3.connect(backup_path)
+            try:
+                src_conn.backup(dst_conn)
+            finally:
+                dst_conn.close()
+        finally:
+            src_conn.close()
+        return backup_path
+    except Exception:
+        backup_path.write_bytes(source.read_bytes())
+        return backup_path
+
+
+def _save_r2_raw_component(namespace: str, spec: dict[str, Any]) -> bool:
+    if not _r2_raw_component_sync_enabled():
+        return False
+    from .r2_store import upload_file
+
+    path = Path(spec["path"])
+    if not path.exists():
+        return False
+    object_key = _r2_component_object_key(namespace, spec)
+    if spec["kind"] == "sqlite":
+        with tempfile.TemporaryDirectory(prefix="nelix-r2-sqlite-") as tmp_name:
+            upload_path = _backup_sqlite_for_upload(path, Path(tmp_name))
+            return bool(upload_file(object_key, upload_path, content_type="application/vnd.sqlite3"))
+    content_type = "application/json" if path.suffix.lower() == ".json" else None
+    return bool(upload_file(object_key, path, content_type=content_type))
+
+
+def _restore_r2_raw_component(namespace: str, spec: dict[str, Any], *, force: bool = False) -> int | None:
+    if not _r2_raw_component_sync_enabled():
+        return None
+    from .r2_store import download_file
+
+    path = Path(spec["path"])
+    if path.exists() and path.stat().st_size > 0 and not force:
+        if spec["kind"] == "sqlite":
+            return _sqlite_table_count(path, tuple(spec["tables"]))
+        return 1
+    object_key = _r2_component_object_key(namespace, spec)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="nelix-r2-restore-") as tmp_name:
+        download_path = Path(tmp_name) / path.name
+        if not download_file(object_key, download_path):
+            return None
+        if spec["kind"] == "sqlite":
+            _remove_sqlite_sidecars(path)
+        os.replace(download_path, path)
+    if spec["kind"] == "sqlite":
+        return _sqlite_table_count(path, tuple(spec["tables"]))
+    return 1
+
+
 def _component_specs() -> dict[str, dict[str, Any]]:
     return {
         "ledger": {
             "kind": "sqlite",
             "path": DEFAULT_DB_PATH,
+            "r2_key": "brain/db/predictions.db",
             "tables": ("prediction_records", "realized_outcomes", "postmortem_records", "maintenance_runs"),
             "ensure": lambda: LedgerReader(db_path=DEFAULT_DB_PATH, export_dir=DEFAULT_EXPORT_DIR),
         },
         "calibration": {
             "kind": "sqlite",
             "path": CALIBRATION_DB_PATH,
+            "r2_key": "brain/db/calibration.db",
             "tables": ("calibration_priors",),
             "ensure": lambda: CalibrationStore(db_path=CALIBRATION_DB_PATH),
         },
         "universe": {
             "kind": "sqlite",
             "path": SYMBOL_UNIVERSE_DB_PATH,
+            "r2_key": "brain/db/symbol_universe.db",
             "tables": ("symbol_universe",),
             "ensure": lambda: SymbolUniverseStore(db_path=SYMBOL_UNIVERSE_DB_PATH),
         },
         "discovery": {
             "kind": "sqlite",
             "path": DISCOVERY_DB_PATH,
+            "r2_key": "brain/db/discovery.db",
             "tables": ("watchlist_items", "search_impressions", "manual_compare_events", "peer_relationships"),
             "ensure": lambda: DiscoveryStore(db_path=DISCOVERY_DB_PATH),
         },
         "quinquennial": {
             "kind": "sqlite",
             "path": POSTMORTEM_DB_PATH,
+            "r2_key": "brain/db/postmortems.db",
             "tables": ("quinquennial_reports",),
             "ensure": lambda: QuinquennialStore(db_path=POSTMORTEM_DB_PATH),
         },
         "runner_state": {
             "kind": "json",
             "path": BACKGROUND_RUNNER_STATE_PATH,
+            "r2_key": "brain/db/background_runner_state.json",
         },
         "maintenance_state": {
             "kind": "json",
             "path": MAINTENANCE_STATE_PATH,
+            "r2_key": "brain/db/maintenance_state.json",
         },
     }
 
@@ -496,6 +670,11 @@ def hydrate_external_learning_state(*, force: bool = False) -> dict[str, Any]:
     restored: dict[str, int] = {}
     with _SYNC_LOCK:
         for namespace, spec in _component_specs().items():
+            if _prefer_object_storage() and _r2_raw_component_sync_enabled():
+                restored_count = _restore_r2_raw_component(namespace, spec, force=force)
+                if restored_count is not None:
+                    restored[namespace] = restored_count
+                    continue
             snapshot = load_remote_snapshot(namespace)
             if not snapshot:
                 continue
@@ -524,6 +703,11 @@ def persist_external_learning_state(*, force: bool = False) -> dict[str, Any]:
         errors: dict[str, str] = {}
         for namespace, spec in _component_specs().items():
             try:
+                if _prefer_object_storage() and _r2_raw_component_sync_enabled():
+                    if spec["kind"] == "sqlite":
+                        spec["ensure"]()
+                    persisted[namespace] = _save_r2_raw_component(namespace, spec)
+                    continue
                 if spec["kind"] == "sqlite":
                     spec["ensure"]()
                     snapshot = _snapshot_sqlite_db(Path(spec["path"]), tuple(spec["tables"]))
@@ -548,6 +732,7 @@ def get_sync_stats() -> dict[str, Any]:
     next_in = max(0.0, _PERSIST_MIN_INTERVAL_SEC - (elapsed or _PERSIST_MIN_INTERVAL_SEC))
     return {
         "enabled": enabled,
+        "backends": _storage_backend_names(),
         "last_synced_at": last_at,
         "next_sync_in_seconds": round(next_in) if enabled else None,
         "namespaces_synced": list((_LAST_PERSIST_RESULT.get("persisted") or {}).keys()),
