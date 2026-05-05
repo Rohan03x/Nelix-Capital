@@ -13,6 +13,9 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 
 search_tickers_payload = _MODULE.search_tickers_payload
-handler = _MODULE.handler
 _cache_dir = _MODULE._cache_dir
 _load_search_shard = _MODULE._load_search_shard
+
+
+class handler(_MODULE.handler):
+    pass
