@@ -26,7 +26,7 @@ from flask import (
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from webapp.data.samples import get_dashboard_data, REGISTRY, SUPPORTED_TICKERS
-from webapp.data.ticker_search import resolve_search_input, search_tickers
+from webapp.data.ticker_search import available_exchanges, resolve_search_input, search_tickers
 
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,29 @@ app = Flask(__name__)
 # Make enumerate available in Jinja2 templates
 app.jinja_env.globals.update(enumerate=enumerate)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
+
+_HISTORICAL_YEARS_UNSET = object()
+
+
+def _normalize_historical_years_choice(value: str | None) -> str:
+    raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if raw in {"", "ipo", "since_ipo", "all", "max"}:
+        return "since_ipo"
+    if raw in {"10", "15"}:
+        return raw
+    return "since_ipo"
+
+
+def _historical_years_limit(value: str | None) -> int | None:
+    choice = _normalize_historical_years_choice(value)
+    return None if choice == "since_ipo" else int(choice)
+
+
+def _current_historical_years_limit() -> int | None:
+    try:
+        return _historical_years_limit(session.get("years", "since_ipo"))
+    except RuntimeError:
+        return None
 
 
 def _maybe_start_background_runner() -> None:
@@ -147,16 +170,26 @@ def _safe_dashboard_data(
     overrides: dict | None = None,
     *,
     mutate_learning: bool = True,
+    historical_years: int | None | object = _HISTORICAL_YEARS_UNSET,
 ) -> dict:
-    _sync_external_learning_state()
+    if historical_years is _HISTORICAL_YEARS_UNSET:
+        historical_years = _current_historical_years_limit()
+    if mutate_learning:
+        _sync_external_learning_state()
     try:
-        if overrides is None:
-            data = get_dashboard_data(ticker, mutate_learning=mutate_learning)
-        else:
+        kwargs = {"mutate_learning": mutate_learning, "historical_years": historical_years}
+        if overrides is not None:
+            kwargs["overrides"] = overrides
+        try:
+            data = get_dashboard_data(ticker, **kwargs)
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            kwargs.pop("historical_years", None)
             try:
-                data = get_dashboard_data(ticker, overrides=overrides, mutate_learning=mutate_learning)
-            except TypeError as exc:
-                if "unexpected keyword argument" not in str(exc):
+                data = get_dashboard_data(ticker, **kwargs)
+            except TypeError as legacy_exc:
+                if "unexpected keyword argument" not in str(legacy_exc):
                     raise
                 data = get_dashboard_data(ticker)
         if mutate_learning:
@@ -170,7 +203,7 @@ def _safe_dashboard_data(
 
 @app.route("/")
 def index():
-    return render_template("index.html", supported=SUPPORTED_TICKERS)
+    return render_template("index.html", supported=SUPPORTED_TICKERS, exchanges=available_exchanges())
 
 
 # ─── Valuation entry point ───────────────────────────────────────────────────
@@ -178,23 +211,24 @@ def index():
 @app.route("/valuate", methods=["POST"])
 def valuate():
     typed_ticker = request.form.get("ticker", "NKE").strip()
-    selected_ticker = request.form.get("selected_ticker", "").strip().upper()
+    selected_raw = request.form.get("selected_ticker", "").strip()
+    selected_ticker = selected_raw.upper()
     exchange = request.form.get("exchange", "auto")
     currency = request.form.get("currency", "USD")
-    years    = request.form.get("years", "10")
+    years = _normalize_historical_years_choice(request.form.get("years", "since_ipo"))
 
-    resolved_ticker = selected_ticker or resolve_search_input(typed_ticker, exchange=exchange)
+    typed_upper = typed_ticker.upper().strip()
+    resolved_ticker = resolve_search_input(typed_ticker, exchange=exchange)
+    if selected_ticker and selected_ticker != typed_upper:
+        resolved_ticker = selected_ticker
+    elif not resolved_ticker and selected_ticker:
+        resolved_ticker = selected_ticker
     ticker = (resolved_ticker or typed_ticker or "NKE").upper().strip()
 
     # Normalise the ticker to an EODHD-compatible code so the exchange hint
     # is embedded in the ticker param (e.g. "BHP" + exchange="LSE" → "BHP.LSE").
     from webapp.data.eodhd_client import normalize_requested_ticker
     ticker = normalize_requested_ticker(ticker, exchange=exchange)
-
-    discovery_store = _safe_discovery_store()
-    if discovery_store is not None:
-        discovery_store.record_search_impression(typed_ticker, [], exchange=exchange, selected_ticker=ticker)
-        _persist_external_learning_state()
 
     session["ticker"]   = ticker
     session["exchange"] = exchange
@@ -254,10 +288,6 @@ def api_ticker_search():
     except ValueError:
         limit = 12
     results = search_tickers(query, limit=limit, exchange=exchange)
-    discovery_store = _safe_discovery_store()
-    if discovery_store is not None:
-        discovery_store.record_search_impression(query, results, exchange=exchange)
-        _persist_external_learning_state()
     return jsonify({"results": results})
 
 

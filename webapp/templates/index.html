@@ -58,11 +58,9 @@
             <label class="form-label" for="exchange">Exchange</label>
             <select class="form-select" id="exchange" name="exchange">
               <option value="auto">Auto-detect</option>
-              <option value="NYSE">NYSE</option>
-              <option value="NASDAQ">NASDAQ</option>
-              <option value="LSE">LSE</option>
-              <option value="TSE">TSE</option>
-              <option value="HKEX">HKEX</option>
+              {% for exchange_code in exchanges %}
+              <option value="{{ exchange_code }}">{{ exchange_code }}</option>
+              {% endfor %}
             </select>
           </div>
           <div class="form-group">
@@ -78,8 +76,8 @@
           <div class="form-group">
             <label class="form-label" for="years">Historical Years</label>
             <select class="form-select" id="years" name="years">
-              <option value="5">5 years</option>
-              <option value="10" selected>10 years</option>
+              <option value="since_ipo" selected>Since IPO</option>
+              <option value="10">10 years</option>
               <option value="15">15 years</option>
             </select>
           </div>
@@ -239,7 +237,7 @@ function setTicker(ticker) {
     const url = new URL('/api/ticker-search', window.location.origin);
     url.searchParams.set('q', trimmed);
     url.searchParams.set('exchange', exchangeInput.value || 'auto');
-    url.searchParams.set('limit', '12');
+    url.searchParams.set('limit', '20');
 
     try {
       const response = await fetch(url.toString(), { headers: { 'Accept': 'application/json' } });
@@ -334,9 +332,6 @@ function setTicker(ticker) {
   });
 
   form.addEventListener('submit', function () {
-    if (!selectedTickerInput.value.trim()) {
-      selectedTickerInput.value = tickerInput.value.trim();
-    }
     submitBtn.textContent = 'Preparing model…';
     submitBtn.disabled = true;
     hideSuggestions();

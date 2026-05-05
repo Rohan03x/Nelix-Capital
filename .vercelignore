@@ -7,6 +7,8 @@ output/
 tests/
 
 # Large/ephemeral cache files — excluded from bundle
+# Keep webapp/data/cache/search_shard_*.json and search_exchanges.json in the
+# bundle; they are the fast local ticker-search universe for deployed autocomplete.
 # Individual company fundamentals (fetched live per-request)
 webapp/data/cache/eodhd_fund_*.json
 # Redundant flat index (shards below are the canonical source)

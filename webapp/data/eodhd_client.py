@@ -550,13 +550,15 @@ def fetch_news_sentiment(
 
 
 
-def _sorted_yearly(section: dict, n_max: int = 10) -> list[dict]:
+def _sorted_yearly(section: dict, n_max: int | None = 10) -> list[dict]:
     """Return up to n_max annual periods from an EODHD Financials sub-section,
     sorted newest-first (so index 0 = most recent year)."""
     yearly = section.get("yearly") or {}
     if not yearly:
         return []
     periods = sorted(yearly.items(), key=lambda kv: kv[0], reverse=True)
+    if n_max is None or n_max <= 0:
+        return [v for _, v in periods]
     return [v for _, v in periods[:n_max]]
 
 
@@ -1928,6 +1930,7 @@ def build_dashboard_data(
     overrides: dict | None = None,
     *,
     mutate_learning: bool = True,
+    historical_years: int | None = 10,
 ) -> dict | None:  # noqa: C901
     """
     Fetch live data from EODHD and run a full 7-year DCF.
@@ -1941,6 +1944,9 @@ def build_dashboard_data(
 
     *mutate_learning* controls whether the live request is allowed to write
     bootstrap, peer-learning, and persistence side effects.
+
+    *historical_years* caps annual financial statements; ``None`` uses every
+    yearly period available from EODHD.
     """
     if not _REQUESTS_OK:
         return None
@@ -2011,9 +2017,10 @@ def build_dashboard_data(
         bs_sec = fins.get("Balance_Sheet", {})
         cf_sec = fins.get("Cash_Flow", {})
 
-        is_periods = _sorted_yearly(is_sec, 10)   # newest-first
-        bs_periods = _sorted_yearly(bs_sec, 10)
-        cf_periods = _sorted_yearly(cf_sec, 10)
+        history_limit = None if historical_years is None else max(1, int(historical_years))
+        is_periods = _sorted_yearly(is_sec, history_limit)   # newest-first
+        bs_periods = _sorted_yearly(bs_sec, history_limit)
+        cf_periods = _sorted_yearly(cf_sec, history_limit)
 
         # ── Shares outstanding ────────────────────────────────────────────
         shares_raw = _shares_to_millions(

@@ -925,6 +925,7 @@ def get_dashboard_data(
     overrides: dict | None = None,
     *,
     mutate_learning: bool = True,
+    historical_years: int | None = 10,
 ) -> dict:
     """Return dashboard data for *ticker*.
 
@@ -968,7 +969,14 @@ def get_dashboard_data(
 
     # 1. Try EODHD first (best historical depth — 10–20+ years)
     if eodhd_available():
-        data = _try_provider("eodhd", eodhd_build, ticker, overrides=overrides, mutate_learning=mutate_learning)
+        data = _try_provider(
+            "eodhd",
+            eodhd_build,
+            ticker,
+            overrides=overrides,
+            mutate_learning=mutate_learning,
+            historical_years=historical_years,
+        )
 
     # 2. Fallback to FMP if EODHD failed
     if data is None and fmp_available():

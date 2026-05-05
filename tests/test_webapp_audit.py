@@ -918,11 +918,7 @@ def test_api_ticker_search_returns_results(monkeypatch):
     import webapp.app as webapp_module
 
     webapp_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
-    calls: list[tuple[str, list[dict[str, str]], str]] = []
-
-    class _DiscoveryStore:
-        def record_search_impression(self, query, results, *, exchange="auto", selected_ticker=None):
-            calls.append((query, results, exchange))
+    discovery_calls: list[bool] = []
 
     monkeypatch.setattr(
         webapp_module,
@@ -937,7 +933,7 @@ def test_api_ticker_search_returns_results(monkeypatch):
             }
         ],
     )
-    monkeypatch.setattr(webapp_module, "_safe_discovery_store", lambda: _DiscoveryStore())
+    monkeypatch.setattr(webapp_module, "_safe_discovery_store", lambda: discovery_calls.append(True) or None)
 
     with webapp_module.app.test_client() as client:
         response = client.get("/api/ticker-search?q=samsung&exchange=auto&limit=12")
@@ -945,32 +941,47 @@ def test_api_ticker_search_returns_results(monkeypatch):
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["results"][0]["ticker"] == "005930.KO"
-    assert calls[0][0] == "samsung"
+    assert discovery_calls == []
 
 
-def test_api_ticker_search_persists_external_learning_state(monkeypatch):
+def test_api_ticker_search_does_not_persist_external_learning_state(monkeypatch):
     import webapp.app as webapp_module
 
     webapp_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
     persisted: list[bool] = []
-
-    class _DiscoveryStore:
-        def record_search_impression(self, query, results, *, exchange="auto", selected_ticker=None):
-            return None
+    discovery_calls: list[bool] = []
 
     monkeypatch.setattr(
         webapp_module,
         "search_tickers",
         lambda query, limit=12, exchange="auto": [{"ticker": "NKE", "name": "Nike Inc", "exchange": "US"}],
     )
-    monkeypatch.setattr(webapp_module, "_safe_discovery_store", lambda: _DiscoveryStore())
+    monkeypatch.setattr(webapp_module, "_safe_discovery_store", lambda: discovery_calls.append(True) or None)
     monkeypatch.setattr(webapp_module, "_persist_external_learning_state", lambda force=False: persisted.append(force) or {"ok": True})
 
     with webapp_module.app.test_client() as client:
         response = client.get("/api/ticker-search?q=nike")
 
     assert response.status_code == 200
-    assert persisted == [False]
+    assert discovery_calls == []
+    assert persisted == []
+
+
+def test_valuate_route_defaults_to_since_ipo_years():
+    import webapp.app as webapp_module
+
+    webapp_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
+
+    with webapp_module.app.test_client() as client:
+        response = client.post(
+            "/valuate",
+            data={"ticker": "NKE", "exchange": "auto", "currency": "USD"},
+        )
+        with client.session_transaction() as flask_session:
+            years = flask_session["years"]
+
+    assert response.status_code == 302
+    assert years == "since_ipo"
 
 
 def test_watchlist_and_manual_compare_routes_persist_discovery_state(tmp_path, monkeypatch):
@@ -1151,6 +1162,42 @@ def test_index_renders_company_search_autocomplete():
     assert "Search by company name or ticker across all available exchanges" in html
     assert "selectedTicker" in html
     assert "/api/ticker-search" in html
+    assert '<option value="since_ipo" selected>Since IPO</option>' in html
+    assert '<option value="10">10 years</option>' in html
+    assert '<option value="15">15 years</option>' in html
+
+
+def test_loading_page_does_not_fire_duplicate_model_fetches():
+    import webapp.app as webapp_module
+
+    webapp_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
+
+    with webapp_module.app.test_client() as client:
+        response = client.get("/loading/NKE")
+
+    html = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert "/api/snapshot" not in html
+    assert "/api/dashboard" not in html
+
+
+def test_safe_dashboard_data_passes_requested_history_window(monkeypatch):
+    import webapp.app as webapp_module
+
+    webapp_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
+    seen_kwargs: dict[str, object] = {}
+
+    def _fake_dashboard_data(_ticker, **kwargs):
+        seen_kwargs.update(kwargs)
+        return {"ticker": "NKE", "historical": {"years": []}}
+
+    monkeypatch.setattr(webapp_module, "get_dashboard_data", _fake_dashboard_data)
+
+    with webapp_module.app.test_request_context("/"):
+        webapp_module.session["years"] = "15"
+        webapp_module._safe_dashboard_data("NKE", mutate_learning=False)
+
+    assert seen_kwargs["historical_years"] == 15
 
 
 def test_eodhd_cross_currency_quotes_use_quote_fx_and_usd_reporting(monkeypatch):

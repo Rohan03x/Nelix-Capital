@@ -15,7 +15,7 @@
       </div>
       <div class="step-item pending" data-step="1">
         <div class="step-icon">◉</div>
-        <span class="step-label">Pulling 10-year financial statements</span>
+        <span class="step-label">Pulling financial statements</span>
       </div>
       <div class="step-item pending" data-step="2">
         <div class="step-icon">◉</div>
@@ -86,40 +86,14 @@
   const dashboardUrl = '/dashboard/{{ ticker }}';
   const total        = steps.length;
 
-  // Cosmetic per-step delays (ms) — animate steps 0…total-2; last step waits for real data
   const delays = [120, 200, 160, 140, 220, 300, 350, 400, 450, 250, 200, 350];
 
   let current   = 0;
-  let animDone  = false;   // all cosmetic steps except the last have finished
-  let fetchDone = false;   // /api/dashboard actually responded
+  let animDone  = false;
 
-  // ── Kick off the real computation immediately ──────────────────────────
-  var fetchCtrl;
-  try { fetchCtrl = new AbortController(); } catch(e) { fetchCtrl = null; }
-  var fetchSignal = fetchCtrl ? fetchCtrl.signal : undefined;
-
-  var fetchTimer = setTimeout(function() {
-    if (fetchCtrl) fetchCtrl.abort();
-  }, 120000);
-
-  // Fire learning snapshot as fire-and-forget so bootstrap / backfill /
-  // persistence run in the background for this ticker (write-mode route).
-  fetch('/api/snapshot/{{ ticker }}', { method: 'POST' }).catch(function() {});
-
-  fetch('/api/dashboard/{{ ticker }}' + (fetchSignal !== undefined ? '' : ''), fetchSignal ? { signal: fetchSignal } : {})
-    .then(function(r) { return r.json(); })
-    .catch(function() { /* network errors: still proceed */ })
-    .then(function() {
-      clearTimeout(fetchTimer);
-      fetchDone = true;
-      tryComplete();
-    });
-
-  // ── Once BOTH animation and fetch are done, navigate ──────────────────
   function tryComplete() {
-    if (!animDone || !fetchDone) return;
+    if (!animDone) return;
 
-    // Mark the last step as done
     var last = steps[total - 1];
     last.classList.remove('active');
     last.classList.add('done');
@@ -129,15 +103,12 @@
     fill.style.width = '100%';
     cta.style.display = 'block';
 
-    // Auto-navigate after brief pause so user sees the green tick
     setTimeout(function() {
       window.location.assign(dashboardUrl);
     }, 600);
   }
 
-  // ── Cosmetic step animation ────────────────────────────────────────────
   function advance() {
-    // Mark the previous step done
     if (current > 0) {
       var prev = steps[current - 1];
       prev.classList.remove('active');
@@ -146,7 +117,6 @@
     }
 
     if (current < total - 1) {
-      // Animate steps 0 … total-2 normally
       var cur = steps[current];
       cur.classList.remove('pending');
       cur.classList.add('active');
@@ -156,21 +126,14 @@
       setTimeout(advance, delays[current - 1] !== undefined ? delays[current - 1] : 280);
 
     } else {
-      // Reached the last step — keep it spinning until fetch completes
       var last = steps[current];
       last.classList.remove('pending');
       last.classList.add('active');
       last.querySelector('.step-icon').textContent = '◉';
-      fill.style.width = '92%';   // not 100% — we're not truly done yet
+      fill.style.width = '92%';
       current++;
       animDone = true;
-
-      if (fetchDone) {
-        tryComplete();
-      } else {
-        // Show an honest "still working" message
-        waitMsg.style.display = 'block';
-      }
+      tryComplete();
     }
   }
 

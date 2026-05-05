@@ -31,6 +31,7 @@ def _resolve_cache_dir() -> Path:
 
 _CACHE_DIR = _resolve_cache_dir()
 _PREBUILT_INDEX_PATH = _CACHE_DIR / "search_index_prebuilt.json"
+_EXCHANGE_MANIFEST_PATH = _CACHE_DIR / "search_exchanges.json"
 _SPACE_RE = re.compile(r"[^A-Z0-9]+")
 _SEARCH_TTL_SEC = 43_200
 _SEED_HEALTH_STALE_HOURS = 72
@@ -380,14 +381,14 @@ def _search_candidates(query: str) -> list[dict[str, object]]:
         return []
     first = query_key[0].lower() if query_key[0].isalpha() else "misc"
     shard = _load_search_shard(first)
+    local_matches: list[dict[str, object]] = []
     if shard:
         local_matches = _matched_candidates(query_key, shard)
         if local_matches:
             return local_matches
-        return _matched_candidates(query_key, _live_search_items(query))
-    local_matches = _matched_candidates(query_key, _ticker_search_index())
-    if local_matches:
-        return local_matches
+    index_matches = _matched_candidates(query_key, _ticker_search_index())
+    if index_matches:
+        return index_matches
     return _matched_candidates(query_key, _live_search_items(query))
 
 
@@ -489,6 +490,45 @@ def _ticker_search_index() -> tuple[dict[str, object], ...]:
 
 
 @lru_cache(maxsize=1)
+def available_exchanges() -> tuple[str, ...]:
+    preferred = (
+        "US",
+        "NYSE",
+        "NASDAQ",
+        "LSE",
+        "XETRA",
+        "PA",
+        "SW",
+        "TO",
+        "V",
+        "KO",
+        "KQ",
+        "TSE",
+        "HK",
+        "HKEX",
+        "AU",
+    )
+    seen: set[str] = set()
+    if _EXCHANGE_MANIFEST_PATH.exists():
+        try:
+            payload = json.loads(_EXCHANGE_MANIFEST_PATH.read_text(encoding="utf-8"))
+            rows = payload.get("exchanges") if isinstance(payload, dict) else payload
+            if isinstance(rows, list):
+                seen = {str(item or "").strip().upper() for item in rows if str(item or "").strip()}
+        except (OSError, json.JSONDecodeError):
+            seen = set()
+    if not seen:
+        seen = {
+            str(item.get("exchange") or "").strip().upper()
+            for item in _ticker_search_index()
+            if str(item.get("exchange") or "").strip()
+        }
+    ordered = [exchange for exchange in preferred if exchange in seen or exchange in {"NYSE", "NASDAQ", "HKEX", "TSE"}]
+    ordered.extend(exchange for exchange in sorted(seen) if exchange not in set(ordered))
+    return tuple(ordered)
+
+
+@lru_cache(maxsize=1)
 def _cached_primary_listing_hints() -> dict[str, dict[str, str]]:
     hints: dict[str, dict[str, str]] = {}
     for payload_path in sorted(_CACHE_DIR.glob("eodhd_fund_*.json")):
@@ -540,6 +580,7 @@ def _seedable_issuer_key(item: dict[str, object], hints: dict[str, dict[str, str
 
 def invalidate_ticker_search_index() -> None:
     _ticker_search_index.cache_clear()
+    available_exchanges.cache_clear()
     _cached_primary_listing_hints.cache_clear()
     _recent_seed_symbol_health.cache_clear()
 
@@ -736,13 +777,22 @@ def _search_source_priority(item: dict[str, object]) -> int:
     }.get(source, 9)
 
 
+def _listing_exchange_priority(item: dict[str, object]) -> int:
+    exchange = str(item.get("exchange") or "").strip().upper()
+    if exchange in {"PINK", "OTC", "OTCQB", "OTCQX", "GREY"}:
+        return 3
+    if exchange in {"US", "NYSE", "NASDAQ", "LSE", "XETRA", "AS", "PA", "SW", "TO", "V", "KO", "KQ", "TSE", "HK", "HKEX", "AU"}:
+        return 0
+    return 1
+
+
 def search_tickers(query: str, limit: int = 12, exchange: str = "auto") -> list[dict[str, str]]:
     query_key = _normalise_search_text(query)
     if not query_key:
         return []
 
     exchange_key = str(exchange or "auto").strip().upper()
-    matches: list[tuple[tuple[int, int, int, str], dict[str, object]]] = []
+    matches: list[tuple[tuple[object, ...], dict[str, object]]] = []
     for item in _search_candidates(query):
         score = _match_score(query_key, item)
         if score is None:
@@ -760,8 +810,27 @@ def search_tickers(query: str, limit: int = 12, exchange: str = "auto") -> list[
                 exchange_penalty = 0 if item_exchange == exchange_key else 1
         instrument_priority = _instrument_priority(item)
         primary_penalty = 0 if bool(item.get("is_primary")) else 1
+        listing_exchange_priority = _listing_exchange_priority(item)
+        fundamentals_penalty = 0 if bool(item.get("has_fundamentals")) else 1
         source_priority = _search_source_priority(item)
-        matches.append(((score[0], exchange_penalty, instrument_priority, primary_penalty, source_priority, score[1], score[2]), item))
+        market_cap_rank = -_safe_float(item.get("market_cap"))
+        history_rank = -max(int(item.get("history_years") or 0), 0)
+        matches.append((
+            (
+                score[0],
+                exchange_penalty,
+                listing_exchange_priority,
+                primary_penalty,
+                instrument_priority,
+                fundamentals_penalty,
+                source_priority,
+                market_cap_rank,
+                history_rank,
+                score[1],
+                score[2],
+            ),
+            item,
+        ))
 
     matches.sort(key=lambda pair: pair[0])
 
@@ -815,5 +884,10 @@ def resolve_search_input(value: str, exchange: str = "auto") -> str | None:
             prefix_matches = [item for item in prefix_matches if str(item["ticker"]) in preferred_tickers] or prefix_matches
     if len(prefix_matches) == 1:
         return str(prefix_matches[0]["ticker"])
+
+    if prefix_matches:
+        preferred = search_tickers(value, limit=1, exchange=exchange)
+        if preferred:
+            return str(preferred[0]["ticker"])
 
     return None

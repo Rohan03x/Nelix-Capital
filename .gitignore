@@ -22,7 +22,10 @@ env/
 output/
 logs/
 public/
-webapp/data/cache/
+webapp/data/cache/*
+!webapp/data/cache/
+!webapp/data/cache/search_shard_*.json
+!webapp/data/cache/search_exchanges.json
 *.db
 auto_valuation/learning/ledger/
 auto_valuation/learning/db/

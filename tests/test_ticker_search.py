@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import webapp.data.eodhd_client as eodhd_client
 
 from webapp.data import ticker_search
@@ -36,6 +38,97 @@ def test_search_tickers_keeps_same_code_across_multiple_exchanges(monkeypatch):
 
     assert "RIO.LSE" in tickers
     assert "RIO.ASX" in tickers
+
+
+def test_search_tickers_uses_full_index_when_shard_misses(monkeypatch):
+    monkeypatch.setattr(
+        ticker_search,
+        "_load_search_shard",
+        lambda _letter: (
+            ticker_search._build_search_item(
+                ticker="SAP.XETRA",
+                code="SAP",
+                name="SAP SE",
+                exchange="XETRA",
+                country="Germany",
+                source="cache",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        ticker_search,
+        "_ticker_search_index",
+        lambda: (
+            ticker_search._build_search_item(
+                ticker="LIGHT.AS",
+                code="LIGHT",
+                name="Signify N.V.",
+                exchange="AS",
+                country="Netherlands",
+                source="cache",
+                instrument_type="Common Stock",
+                is_primary=True,
+                has_fundamentals=True,
+            ),
+        ),
+    )
+
+    def _fail_live(_query):
+        raise AssertionError("live search should not run while cached index can answer")
+
+    monkeypatch.setattr(ticker_search, "_live_search_items", _fail_live)
+
+    results = ticker_search.search_tickers("signify", limit=5)
+
+    assert [item["ticker"] for item in results] == ["LIGHT.AS"]
+
+
+def test_resolve_search_input_uses_ranked_prefix_match(monkeypatch):
+    candidates = [
+        ticker_search._build_search_item(
+            ticker="PHPPY.US",
+            code="PHPPY",
+            name="Signify N.V. ADR",
+            exchange="US",
+            country="USA",
+            source="search-cache",
+            instrument_type="Depositary Receipt",
+        ),
+        ticker_search._build_search_item(
+            ticker="LIGHT.AS",
+            code="LIGHT",
+            name="Signify N.V.",
+            exchange="AS",
+            country="Netherlands",
+            source="cache",
+            instrument_type="Common Stock",
+            is_primary=True,
+            market_cap=7_000_000_000,
+            history_years=10,
+            has_fundamentals=True,
+        ),
+    ]
+    monkeypatch.setattr(ticker_search, "_search_candidates", lambda _query: candidates)
+
+    assert ticker_search.resolve_search_input("signify") == "LIGHT.AS"
+
+
+def test_available_exchanges_uses_manifest_without_loading_full_index(tmp_path, monkeypatch):
+    manifest_path = tmp_path / "search_exchanges.json"
+    manifest_path.write_text(json.dumps({"exchanges": ["US", "LSE", "KO"]}), encoding="utf-8")
+    ticker_search.available_exchanges.cache_clear()
+    monkeypatch.setattr(ticker_search, "_EXCHANGE_MANIFEST_PATH", manifest_path)
+    monkeypatch.setattr(
+        ticker_search,
+        "_ticker_search_index",
+        lambda: (_ for _ in ()).throw(AssertionError("full index should not load for manifest-backed exchanges")),
+    )
+
+    assert ticker_search.available_exchanges()[:3] == ("US", "NYSE", "NASDAQ")
+    assert "LSE" in ticker_search.available_exchanges()
+    assert "KO" in ticker_search.available_exchanges()
+
+    ticker_search.available_exchanges.cache_clear()
 
 
 def test_search_tickers_prefers_primary_common_stock_before_aliases_and_non_stocks(monkeypatch):
@@ -148,6 +241,8 @@ def test_seedable_tickers_prefers_primary_common_stock(monkeypatch):
             ),
         ),
     )
+    monkeypatch.setattr(ticker_search, "_cached_primary_listing_hints", lambda: {})
+    monkeypatch.setattr(ticker_search, "_recent_seed_symbol_health", lambda: {})
 
     tickers = ticker_search.seedable_tickers(limit=3, common_stock_only=True)
 
