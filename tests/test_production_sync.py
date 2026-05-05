@@ -41,6 +41,16 @@ def test_dsn_accepts_supabase_aliases(monkeypatch):
     assert production_sync._dsn() == "postgresql://user:pass@host:5432/postgres?sslmode=require"
 
 
+def test_dsn_prefers_vercel_postgres_before_supabase_direct(monkeypatch):
+    for env_key in production_sync._DSN_ENV_KEYS:
+        monkeypatch.delenv(env_key, raising=False)
+
+    monkeypatch.setenv("SUPABASE_DB_URL", "postgres://bad:bad@direct.supabase.local:5432/postgres")
+    monkeypatch.setenv("POSTGRES_URL", "postgres://good:good@pooler.vercel.local:5432/postgres")
+
+    assert production_sync._dsn() == "postgresql://good:good@pooler.vercel.local:5432/postgres"
+
+
 def test_component_specs_include_calibration_and_maintenance_state():
     specs = production_sync._component_specs()
 
