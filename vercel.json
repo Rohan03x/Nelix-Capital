@@ -1,9 +1,30 @@
 {
   "buildCommand": "python build.py",
-  "rewrites": [
+  "builds": [
     {
-      "source": "/api/ticker-search",
-      "destination": "/api/ticker_search"
+      "src": "api/ticker_search.py",
+      "use": "@vercel/python"
+    },
+    {
+      "src": "app.py",
+      "use": "@vercel/python"
+    },
+    {
+      "src": "public/**/*",
+      "use": "@vercel/static"
+    }
+  ],
+  "routes": [
+    {
+      "src": "^/api/ticker-search$",
+      "dest": "/api/ticker_search.py"
+    },
+    {
+      "handle": "filesystem"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/app.py"
     }
   ],
   "crons": [
