@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import webapp.app as webapp_module
 from auto_valuation.learning import production_sync
@@ -220,6 +221,38 @@ def test_r2_raw_restore_replaces_empty_sqlite_file(monkeypatch, tmp_path):
         assert conn.execute("SELECT id FROM sample").fetchall() == [("one",)]
     finally:
         conn.close()
+
+
+def test_r2_raw_restore_uses_direct_sqlite_path_on_serverless(monkeypatch, tmp_path):
+    local_db = tmp_path / "local.db"
+    source_db = tmp_path / "source.db"
+    conn = sqlite3.connect(source_db)
+    try:
+        conn.execute("CREATE TABLE sample (id TEXT PRIMARY KEY)")
+        conn.execute("INSERT INTO sample(id) VALUES ('one')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    destinations: list[Path] = []
+
+    def _download_file(_key, destination):
+        destination = Path(destination)
+        destinations.append(destination)
+        destination.write_bytes(source_db.read_bytes())
+        return True
+
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setattr(production_sync, "_r2_raw_component_sync_enabled", lambda: True)
+    monkeypatch.setattr("auto_valuation.learning.r2_store.download_file", _download_file)
+
+    restored = production_sync._restore_r2_raw_component(
+        "sample",
+        {"kind": "sqlite", "path": local_db, "tables": ("sample",), "r2_key": "brain/db/sample.db"},
+    )
+
+    assert restored == 1
+    assert destinations == [local_db]
 
 
 def test_snapshot_save_falls_back_to_supabase_storage(monkeypatch):

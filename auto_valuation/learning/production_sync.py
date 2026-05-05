@@ -554,6 +554,13 @@ def _r2_component_object_key(namespace: str, spec: dict[str, Any]) -> str:
     return str(spec.get("r2_key") or f"brain/db/{Path(spec['path']).name}")
 
 
+def _serverless_runtime() -> bool:
+    return any(
+        str(os.environ.get(name) or "").strip()
+        for name in ("VERCEL", "AWS_LAMBDA_FUNCTION_NAME", "FUNCTIONS_WORKER_RUNTIME")
+    )
+
+
 def _backup_sqlite_for_upload(source: Path, temp_dir: Path) -> Path:
     backup_path = temp_dir / source.name
     try:
@@ -604,6 +611,16 @@ def _restore_r2_raw_component(namespace: str, spec: dict[str, Any], *, force: bo
             return 1
     object_key = _r2_component_object_key(namespace, spec)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if spec["kind"] == "sqlite" and _serverless_runtime():
+        _remove_sqlite_sidecars(path)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if not download_file(object_key, path):
+            return None
+        return _sqlite_table_count(path, tuple(spec["tables"]))
+
     with tempfile.TemporaryDirectory(prefix="nelix-r2-restore-") as tmp_name:
         download_path = Path(tmp_name) / path.name
         if not download_file(object_key, download_path):
