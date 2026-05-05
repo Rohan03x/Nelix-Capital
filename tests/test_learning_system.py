@@ -489,6 +489,64 @@ class TestCalibrator:
         assert calibrated.calibration_diagnostics.assumptions["ufcf_margin"].evidence_count > 0
         assert calibrated.calibration_diagnostics.assumptions["reinvestment_rate"].evidence_count > 0
 
+    def test_extreme_residuals_are_capped_before_saving_priors(self, tmp_path):
+        raw = _make_raw_assumptions()
+        store = CalibrationStore(tmp_path / "capped.db")
+        observations = [
+            CalibrationObservation(
+                sector="Technology",
+                industry="Software",
+                data_vintage_years=6,
+                market_cap_regime="mid",
+                macro_regime="neutral",
+                predicted_revenue_growth=0.08,
+                actual_revenue_growth=10.0,
+                predicted_ebit_margin=0.18,
+                actual_ebit_margin=4.0,
+                predicted_wacc=0.09,
+                actual_wacc=1.0,
+                predicted_terminal_growth=0.03,
+                actual_terminal_growth=0.50,
+                predicted_beta=1.1,
+                actual_beta=20.0,
+                predicted_ufcf_margin=0.12,
+                actual_ufcf_margin=-4.0,
+                predicted_reinvestment_rate=0.01,
+                actual_reinvestment_rate=2.0,
+                quality_score=1.0,
+            )
+            for _ in range(8)
+        ]
+
+        calibrated = calibrate(
+            raw,
+            "Technology",
+            "Software",
+            6,
+            "mid",
+            "neutral",
+            observations=observations,
+            base_wacc=0.09,
+            base_terminal_growth=0.03,
+            base_beta=1.1,
+            calibration_store=store,
+        )
+
+        summaries = calibrated.calibration_diagnostics.assumptions
+        assert summaries["revenue_growth"].residual_adjustment == pytest.approx(0.30)
+        assert summaries["ebit_margin"].residual_adjustment == pytest.approx(0.15)
+        assert summaries["wacc"].residual_adjustment == pytest.approx(0.04)
+        assert summaries["terminal_growth"].residual_adjustment == pytest.approx(0.01)
+        assert summaries["beta"].residual_adjustment == pytest.approx(0.75)
+        assert summaries["ufcf_margin"].residual_adjustment == pytest.approx(-0.20)
+        assert summaries["reinvestment_rate"].residual_adjustment == pytest.approx(0.15)
+
+        import sqlite3
+
+        with sqlite3.connect(store.db_path) as conn:
+            largest_abs = conn.execute("SELECT MAX(ABS(correction_mean)) FROM calibration_priors").fetchone()[0]
+        assert largest_abs <= 0.75
+
 
 class TestCrossIndustryAnalogs:
     def test_similarity_and_same_sector_exclusion(self):

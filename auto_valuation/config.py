@@ -214,6 +214,7 @@ GLOBAL_DEFAULTS: dict[str, Any] = {
 LEARNING_CONFIG: dict[str, Any] = {
     "learning_enabled": True,
     "learning_observation_limit": 1000,
+    "learning_candidate_pool_limit": 12000,
     "symbol_universe_enabled": True,
     "symbol_universe_priority_limit": 500,
     "symbol_universe_recent_days": 21,
@@ -229,7 +230,7 @@ LEARNING_CONFIG: dict[str, Any] = {
     "background_runner_exchange_refresh_batch": 10,
     "background_runner_exchange_refresh_per_exchange_limit": 500,
     "background_runner_exchange_cache_ttl_sec": 86400,
-    "background_runner_concurrent_workers": 32,
+    "background_runner_concurrent_workers": 16,
     "bulk_seed_on_startup": False,
     "bulk_seed_daily_budget": 95000,
     "background_runner_seed_exchanges": [
@@ -268,6 +269,9 @@ LEARNING_CONFIG: dict[str, Any] = {
     "monte_carlo_enabled": True,
     "monte_carlo_samples": 1000,
     "monte_carlo_seed": 42,
+    "market_residual_overlay_enabled": True,
+    "market_residual_sample_limit": 4000,
+    "historical_replay_limit": 4000,
     "annual_postmortem_enabled": True,
     "quinquennial_postmortem_enabled": True,
     "scheduled_postmortem_enabled": True,

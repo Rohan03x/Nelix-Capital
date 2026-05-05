@@ -506,6 +506,20 @@ def api_internal_learning_status():
     except Exception as exc:
         payload["sync"] = {"error": str(exc)}
 
+    try:
+        from auto_valuation.learning.performance_report import build_learning_performance_report
+
+        report = build_learning_performance_report(chunk_size=1000)
+        payload["performance"] = {
+            "latest_chunk": report.get("cohorts", {}).get("latest_chunk", {}),
+            "latest_stable_only": report.get("cohorts", {}).get("latest_stable_only", {}),
+            "calibration": report.get("calibration", {}),
+            "throughput": report.get("throughput", {}),
+            "targets": report.get("targets", {}),
+        }
+    except Exception as exc:
+        payload["performance"] = {"error": str(exc)}
+
     return jsonify({"ok": True, **payload})
 
 

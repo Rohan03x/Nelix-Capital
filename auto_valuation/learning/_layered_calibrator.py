@@ -13,6 +13,10 @@ from typing import Any, Iterable
 
 from auto_valuation.assumptions.engine import AssumptionSet
 from auto_valuation.learning.cross_industry import cosine_similarity
+from auto_valuation.learning.residual_controls import (
+    clamp_assumption_residual,
+    robust_bounded_std,
+)
 from auto_valuation.learning.storage_paths import learning_db_dir
 
 try:
@@ -47,6 +51,7 @@ class CalibrationObservation:
     actual_reinvestment_rate: float | None = None
     structural_break_flag: bool = False
     feature_vector: dict[str, float] | tuple[float, ...] | list[float] | None = None
+    quality_score: float = 1.0
     # ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (S2/S3/M3) — point-in-time + growth dim
     as_of_year: int | None = None
     rf_rate_at_time: float | None = None
@@ -226,14 +231,27 @@ def maturity_bucket(data_vintage_years: int) -> str:
     return "21+"
 
 
-def _error_series(observations: list[Any], actual_key: str, predicted_key: str) -> list[float]:
+def _error_series(
+    observations: list[Any],
+    actual_key: str,
+    predicted_key: str,
+    *,
+    assumption_name: str | None = None,
+) -> list[float]:
     errors: list[float] = []
     for observation in observations:
         actual = _get(observation, actual_key)
         predicted = _get(observation, predicted_key)
         if actual is None or predicted is None:
             continue
-        errors.append(float(actual) - float(predicted))
+        raw_error = float(actual) - float(predicted)
+        if assumption_name:
+            bounded_error = clamp_assumption_residual(assumption_name, raw_error)
+            if bounded_error is None:
+                continue
+            errors.append(bounded_error)
+        else:
+            errors.append(raw_error)
     return errors
 
 
@@ -251,7 +269,13 @@ def _observation_weight(observation: Any, current_year: int) -> float:
         age = max(0.0, float(current_year) - float(as_of))
     except (TypeError, ValueError):
         return 1.0
-    return math.exp(-_TIME_DECAY_RATE * age)
+    time_weight = math.exp(-_TIME_DECAY_RATE * age)
+    quality_weight = _get(observation, "quality_score", 1.0)
+    try:
+        quality_weight = _clamp(float(quality_weight), 0.05, 1.0)
+    except (TypeError, ValueError):
+        quality_weight = 1.0
+    return time_weight * quality_weight
 
 
 def _weighted_robust_mean(
@@ -259,6 +283,7 @@ def _weighted_robust_mean(
     actual_key: str,
     predicted_key: str,
     *,
+    assumption_name: str | None = None,
     current_year: int | None = None,
 ) -> float:
     """Trimmed weighted mean of (actual - predicted) with exponential time decay.
@@ -271,6 +296,11 @@ def _weighted_robust_mean(
         if a is None or p is None:
             continue
         err = float(a) - float(p)
+        if assumption_name:
+            bounded_err = clamp_assumption_residual(assumption_name, err)
+            if bounded_err is None:
+                continue
+            err = bounded_err
         w = _observation_weight(o, cur)
         if w <= 0:
             continue
@@ -632,12 +662,17 @@ def _build_assumption_summary(
 ) -> AssumptionCalibrationSummary:
     layer_payloads: list[tuple[str, int, float, float, float, str]] = []
     for layer_name, cohort, priority, rationale in layer_sources:
-        errors = _error_series(cohort, spec.actual_key, spec.predicted_key)
+        errors = _error_series(cohort, spec.actual_key, spec.predicted_key, assumption_name=assumption_name)
         if not errors:
             continue
         # S3 — exponential time-decay weighted residual (recent obs > older obs).
-        residual_mean = _weighted_robust_mean(cohort, spec.actual_key, spec.predicted_key)
-        residual_std = max(_robust_std(errors), spec.min_sigma)
+        residual_mean = _weighted_robust_mean(
+            cohort,
+            spec.actual_key,
+            spec.predicted_key,
+            assumption_name=assumption_name,
+        )
+        residual_std = max(robust_bounded_std(assumption_name, errors), spec.min_sigma)
         scale_penalty = 1.0 + (residual_std / max(spec.min_sigma, 1e-6))
         raw_weight = priority * math.sqrt(len(errors)) / scale_penalty
         if layer_name in {"company_memory", "cohort_memory", "sector_memory"} and structural_break.detected:
@@ -691,6 +726,8 @@ def _build_assumption_summary(
         uncertainty *= 1.0 + (0.75 * structural_break.score)
 
     adjustment = sum(layer.weight * layer.residual_mean for layer in layers)
+    bounded_adjustment = clamp_assumption_residual(assumption_name, adjustment)
+    adjustment = bounded_adjustment if bounded_adjustment is not None else 0.0
     if weak_evidence:
         adjustment = 0.0
 

@@ -31,7 +31,6 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from pathlib import Path
-from statistics import mean, pstdev
 from typing import Any
 
 from auto_valuation.config import LEARNING_CONFIG
@@ -40,6 +39,11 @@ from auto_valuation.learning._layered_calibrator import (
     CalibrationPrior,
     CalibrationStore,
     maturity_bucket,
+)
+from auto_valuation.learning.residual_controls import (
+    clamp_assumption_residual,
+    robust_bounded_mean,
+    robust_bounded_std,
 )
 from auto_valuation.learning.maintenance import (
     _annual_periods_by_year,
@@ -347,14 +351,15 @@ def update_calibration_from_observations(
     for (sector, industry, bucket, cap, macro), cohort in groups.items():
         for assumption_name, actual_key, pred_key in specs:
             errors = [
-                getattr(o, actual_key) - getattr(o, pred_key)
+                clamp_assumption_residual(assumption_name, getattr(o, actual_key) - getattr(o, pred_key))
                 for o in cohort
                 if getattr(o, actual_key) is not None and getattr(o, pred_key) is not None
             ]
+            errors = [error for error in errors if error is not None]
             if not errors:
                 continue
-            corr_mean = mean(errors)
-            corr_std = pstdev(errors) if len(errors) >= 2 else 0.0
+            corr_mean = robust_bounded_mean(assumption_name, errors)
+            corr_std = robust_bounded_std(assumption_name, errors) if len(errors) >= 2 else 0.0
             store.save_prior(CalibrationPrior(
                 prior_id=str(uuid.uuid4()),
                 sector=sector,

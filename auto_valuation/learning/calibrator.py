@@ -7,10 +7,14 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from statistics import mean, pstdev
 from typing import Any, Iterable
 
 from auto_valuation.assumptions.engine import AssumptionSet
+from auto_valuation.learning.residual_controls import (
+    clamp_assumption_residual,
+    robust_bounded_mean,
+    robust_bounded_std,
+)
 
 try:
     from auto_valuation.config import LEARNING_CONFIG as _LEARNING_CONFIG
@@ -100,14 +104,27 @@ def _percentile(values: list[float], percentile: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * weight
 
 
-def _error_series(observations: list[Any], actual_key: str, predicted_key: str) -> list[float]:
+def _error_series(
+    observations: list[Any],
+    actual_key: str,
+    predicted_key: str,
+    *,
+    assumption_name: str | None = None,
+) -> list[float]:
     errors: list[float] = []
     for observation in observations:
         actual = _get(observation, actual_key)
         predicted = _get(observation, predicted_key)
         if actual is None or predicted is None:
             continue
-        errors.append(float(actual) - float(predicted))
+        raw_error = float(actual) - float(predicted)
+        if assumption_name:
+            bounded_error = clamp_assumption_residual(assumption_name, raw_error)
+            if bounded_error is None:
+                continue
+            errors.append(bounded_error)
+        else:
+            errors.append(raw_error)
     return errors
 
 
@@ -225,8 +242,8 @@ def _prior_from_errors(
         cap_regime=market_cap_regime,
         macro_regime=macro_regime,
         assumption_name=assumption_name,
-        correction_mean=mean(errors) if errors else 0.0,
-        correction_std=pstdev(errors) if len(errors) > 1 else 0.0,
+        correction_mean=robust_bounded_mean(assumption_name, errors) if errors else 0.0,
+        correction_std=robust_bounded_std(assumption_name, errors) if len(errors) > 1 else 0.0,
         cohort_size=len(errors),
         last_updated=date.today(),
     )
@@ -288,11 +305,11 @@ def calibrate(
 
     cohort_size = len(cohort)
     confidence = _cohort_confidence(cohort_size, min_observations)
-    revenue_errors = _error_series(cohort, "actual_revenue_growth", "predicted_revenue_growth")
-    margin_errors = _error_series(cohort, "actual_ebit_margin", "predicted_ebit_margin")
-    wacc_errors = _error_series(cohort, "actual_wacc", "predicted_wacc")
-    terminal_growth_errors = _error_series(cohort, "actual_terminal_growth", "predicted_terminal_growth")
-    beta_errors = _error_series(cohort, "actual_beta", "predicted_beta")
+    revenue_errors = _error_series(cohort, "actual_revenue_growth", "predicted_revenue_growth", assumption_name="revenue_growth")
+    margin_errors = _error_series(cohort, "actual_ebit_margin", "predicted_ebit_margin", assumption_name="ebit_margin")
+    wacc_errors = _error_series(cohort, "actual_wacc", "predicted_wacc", assumption_name="wacc")
+    terminal_growth_errors = _error_series(cohort, "actual_terminal_growth", "predicted_terminal_growth", assumption_name="terminal_growth")
+    beta_errors = _error_series(cohort, "actual_beta", "predicted_beta", assumption_name="beta")
 
     priors = {
         "revenue_growth": _prior_from_errors(

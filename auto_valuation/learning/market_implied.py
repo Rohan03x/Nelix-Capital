@@ -8,6 +8,11 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .quality import assess_prediction_record, as_decimal, safe_float, sector_specialist_reason
+from .residual_controls import (
+    clamp_market_applied_adjustment,
+    clamp_market_residual,
+    market_residual_is_extreme,
+)
 
 
 @dataclass(frozen=True)
@@ -82,7 +87,9 @@ def compute_market_implied_snapshot(record: Any) -> MarketImpliedSnapshot | None
     if not predicted_ev or predicted_ev <= 1.0 or actual_ev is None or actual_ev <= 1.0:
         return None
     valuation_residual_pct = actual_ev / predicted_ev - 1.0
-    if abs(valuation_residual_pct) > 10.0:
+    if market_residual_is_extreme(valuation_residual_pct):
+        return None
+    if abs(valuation_residual_pct) > 1.5:
         reasons.append("valuation_residual_outlier")
 
     price_return_error_pct = None
@@ -204,7 +211,9 @@ def build_market_residual_overlay(
         )
         if match_score < 0.32:
             continue
-        residual = _clamp(snapshot.valuation_residual_pct, -3.0, 3.0)
+        residual = clamp_market_residual(snapshot.valuation_residual_pct)
+        if residual is None:
+            continue
         weight = max(0.0, match_score) * max(0.05, snapshot.quality_score)
         weighted_residuals.append((residual, weight))
         scopes[scope] = scopes.get(scope, 0) + 1
@@ -227,10 +236,10 @@ def build_market_residual_overlay(
     average_quality = sum(quality_scores) / len(quality_scores) if quality_scores else 0.0
     average_match = sum(weight for _value, weight in weighted_residuals) / max(len(weighted_residuals), 1)
     confidence = _clamp(min(1.0, cohort_size / 25.0) * average_quality * _clamp(average_match, 0.25, 1.0), 0.0, 1.0)
-    residual_weight = _clamp(0.08 + confidence * 0.26, 0.08, 0.34)
+    residual_weight = _clamp(0.12 + confidence * 0.43, 0.12, 0.55)
     if confidence < 0.22:
         residual_weight = 0.0
-    applied_adjustment = _clamp(raw_residual * residual_weight, -0.25, 0.18)
+    applied_adjustment = clamp_market_applied_adjustment(raw_residual * residual_weight)
     dominant_scope = max(scopes.items(), key=lambda item: item[1])[0] if scopes else "global"
     residuals_for_band = sorted(value for value, _weight in weighted_residuals)
     p10_index = int(max(0, min(len(residuals_for_band) - 1, len(residuals_for_band) * 0.10)))
@@ -252,6 +261,7 @@ def build_market_residual_overlay(
         "dcf_weight": round(1.0 - residual_weight, 3),
         "applied_adjustment_decimal": round(applied_adjustment, 5),
         "applied_adjustment_pct": round(applied_adjustment * 100.0, 1),
+        "optimism_bias_signal": raw_residual < -0.20,
         "expected_residual_band_pct": {"p10": round(p10 * 100.0, 1), "p50": round(raw_residual * 100.0, 1), "p90": round(p90 * 100.0, 1)},
         "top_evidence": [snapshot.to_dict() for snapshot in snapshots[:5]],
         "note": (

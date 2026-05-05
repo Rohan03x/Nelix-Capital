@@ -138,6 +138,40 @@ def test_market_implied_snapshot_and_overlay_use_quality_gated_ev_labels():
     assert overlay["applied_adjustment_decimal"] > 0
 
 
+def test_market_overlay_rejects_extreme_ev_labels():
+    record = _record(actual_ev_mm=900.0)
+
+    assert compute_market_implied_snapshot(record) is None
+
+    overlay = build_market_residual_overlay(
+        [replace(_record(record_id=f"bad-{idx}"), actual_ev_mm=900.0) for idx in range(6)],
+        ticker="ACME",
+        sector="Technology",
+        industry="Software",
+        market_cap_regime="mid",
+        macro_regime="neutral",
+    )
+    assert overlay["enabled"] is False
+    assert overlay["reason"] == "insufficient_market_residual_evidence"
+
+
+def test_market_overlay_can_apply_stronger_negative_optimism_correction():
+    records = [replace(_record(record_id=f"over-{idx}"), actual_ev_mm=30.0) for idx in range(30)]
+
+    overlay = build_market_residual_overlay(
+        records,
+        ticker="ACME",
+        sector="Technology",
+        industry="Software",
+        market_cap_regime="mid",
+        macro_regime="neutral",
+    )
+
+    assert overlay["enabled"] is True
+    assert overlay["optimism_bias_signal"] is True
+    assert overlay["applied_adjustment_decimal"] < -0.25
+
+
 def test_stratified_sampler_does_not_drop_smaller_valid_segments():
     tech = [_record(record_id=f"tech-{idx}", ticker=f"TECH{idx}", sector="Technology") for idx in range(8)]
     health = [_record(record_id=f"health-{idx}", ticker=f"HLTH{idx}", sector="Healthcare") for idx in range(2)]

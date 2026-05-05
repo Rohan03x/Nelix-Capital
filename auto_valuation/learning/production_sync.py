@@ -29,6 +29,7 @@ _HYDRATE_TTL_SEC = 30.0
 _LAST_PERSIST_AT = 0.0
 _PERSIST_MIN_INTERVAL_SEC = 300.0  # max 1 push per 5 minutes (unless force=True)
 _LAST_PERSIST_RESULT: dict[str, Any] = {}
+_SYNC_CHUNK_ROWS_ENV = "LEARNING_SYNC_CHUNK_ROWS"
 _DSN_ENV_KEYS = (
     "LEARNING_STORE_DSN",
     "LEARNING_POSTGRES_DSN",
@@ -100,6 +101,13 @@ def _dsn() -> str:
 
 def external_learning_enabled() -> bool:
     return bool(_dsn() or _supabase_storage_configs())
+
+
+def _sync_chunk_rows() -> int:
+    try:
+        return max(int(str(os.environ.get(_SYNC_CHUNK_ROWS_ENV) or "500").strip()), 1)
+    except (TypeError, ValueError):
+        return 500
 
 
 def _supabase_storage_configs() -> list[dict[str, str]]:
@@ -247,7 +255,7 @@ def _ensure_remote_schema(conn: Any) -> None:
         )
 
 
-def load_remote_snapshot(namespace: str) -> dict[str, Any] | None:
+def _load_remote_snapshot_raw(namespace: str) -> dict[str, Any] | None:
     try:
         conn = _connect_remote()
         if conn is not None:
@@ -266,6 +274,34 @@ def load_remote_snapshot(namespace: str) -> dict[str, Any] | None:
     except Exception as exc:
         logger.warning("Postgres learning snapshot load failed for %s: %s", namespace, exc)
     return _load_storage_snapshot(namespace)
+
+
+def _expand_chunked_snapshot(namespace: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if not payload.get("chunked"):
+        return payload
+    chunks = list(payload.get("chunks") or [])
+    tables: dict[str, list[dict[str, Any]]] = {str(table): [] for table in dict(payload.get("tables") or {})}
+    for chunk in chunks:
+        chunk_namespace = str(chunk.get("namespace") or "").strip()
+        table = str(chunk.get("table") or "").strip()
+        if not chunk_namespace or not table:
+            raise RuntimeError(f"Chunked learning snapshot {namespace} has an invalid chunk manifest")
+        chunk_payload = _load_remote_snapshot_raw(chunk_namespace)
+        if not chunk_payload:
+            raise RuntimeError(f"Chunked learning snapshot {namespace} is missing chunk {chunk_namespace}")
+        tables.setdefault(table, []).extend(list(chunk_payload.get("rows") or []))
+    expanded = dict(payload)
+    expanded.pop("chunked", None)
+    expanded.pop("chunks", None)
+    expanded["tables"] = tables
+    return expanded
+
+
+def load_remote_snapshot(namespace: str) -> dict[str, Any] | None:
+    payload = _load_remote_snapshot_raw(namespace)
+    if not payload:
+        return None
+    return _expand_chunked_snapshot(namespace, payload)
 
 
 def save_remote_snapshot(namespace: str, payload: dict[str, Any]) -> bool:
@@ -290,6 +326,58 @@ def save_remote_snapshot(namespace: str, payload: dict[str, Any]) -> bool:
     except Exception as exc:
         logger.warning("Postgres learning snapshot save failed for %s: %s", namespace, exc)
     return _save_storage_snapshot(namespace, payload)
+
+
+def _chunk_namespace(namespace: str, table: str, index: int) -> str:
+    safe_table = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in table)
+    return f"{namespace}__{safe_table}__{index:04d}"
+
+
+def _split_sqlite_snapshot(namespace: str, snapshot: dict[str, Any], *, rows_per_chunk: int | None = None) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any]]]]:
+    chunk_size = max(int(rows_per_chunk or _sync_chunk_rows()), 1)
+    tables = dict(snapshot.get("tables") or {})
+    total_rows = sum(len(list(rows or [])) for rows in tables.values())
+    if total_rows <= chunk_size:
+        return snapshot, []
+
+    manifest_tables = {str(table): [] for table in tables}
+    manifest_chunks: list[dict[str, Any]] = []
+    chunk_payloads: list[tuple[str, dict[str, Any]]] = []
+    for table, raw_rows in tables.items():
+        rows = list(raw_rows or [])
+        for start in range(0, len(rows), chunk_size):
+            chunk_rows = rows[start : start + chunk_size]
+            chunk_index = len(chunk_payloads)
+            chunk_name = _chunk_namespace(namespace, str(table), chunk_index)
+            manifest_chunks.append({"namespace": chunk_name, "table": str(table), "row_count": len(chunk_rows)})
+            chunk_payloads.append(
+                (
+                    chunk_name,
+                    {
+                        "parent_namespace": namespace,
+                        "table": str(table),
+                        "chunk_index": chunk_index,
+                        "rows": chunk_rows,
+                        "captured_at": snapshot.get("captured_at") or _utcnow_iso(),
+                    },
+                )
+            )
+
+    manifest = dict(snapshot)
+    manifest["tables"] = manifest_tables
+    manifest["chunked"] = True
+    manifest["chunk_rows"] = chunk_size
+    manifest["total_rows"] = total_rows
+    manifest["chunks"] = manifest_chunks
+    return manifest, chunk_payloads
+
+
+def _save_sqlite_snapshot(namespace: str, snapshot: dict[str, Any]) -> bool:
+    manifest, chunks = _split_sqlite_snapshot(namespace, snapshot)
+    for chunk_namespace, chunk_payload in chunks:
+        if not save_remote_snapshot(chunk_namespace, chunk_payload):
+            return False
+    return save_remote_snapshot(namespace, manifest)
 
 
 def _snapshot_sqlite_db(db_path: Path, tables: tuple[str, ...]) -> dict[str, Any]:
@@ -439,9 +527,10 @@ def persist_external_learning_state(*, force: bool = False) -> dict[str, Any]:
                 if spec["kind"] == "sqlite":
                     spec["ensure"]()
                     snapshot = _snapshot_sqlite_db(Path(spec["path"]), tuple(spec["tables"]))
+                    persisted[namespace] = _save_sqlite_snapshot(namespace, snapshot)
                 else:
                     snapshot = _snapshot_json_file(Path(spec["path"]))
-                persisted[namespace] = save_remote_snapshot(namespace, snapshot)
+                    persisted[namespace] = save_remote_snapshot(namespace, snapshot)
             except Exception as exc:
                 persisted[namespace] = False
                 errors[namespace] = str(exc)

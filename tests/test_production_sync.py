@@ -123,6 +123,27 @@ def test_snapshot_load_falls_back_to_supabase_storage(monkeypatch):
 
     assert production_sync.load_remote_snapshot("runner_state") == {"namespace": "runner_state"}
 
+
+def test_chunked_sqlite_snapshot_roundtrip_uses_manifest(monkeypatch):
+    stored: dict[str, dict[str, object]] = {}
+    snapshot = {
+        "db_path": "state.db",
+        "captured_at": "2026-01-01T00:00:00+00:00",
+        "tables": {"sample": [{"id": "one"}, {"id": "two"}, {"id": "three"}]},
+    }
+
+    monkeypatch.setenv("LEARNING_SYNC_CHUNK_ROWS", "2")
+    monkeypatch.setattr(production_sync, "_connect_remote", lambda: None)
+    monkeypatch.setattr(production_sync, "_save_storage_snapshot", lambda namespace, payload: stored.setdefault(namespace, payload) is payload)
+    monkeypatch.setattr(production_sync, "_load_storage_snapshot", lambda namespace: stored.get(namespace))
+
+    assert production_sync._save_sqlite_snapshot("ledger", snapshot) is True
+    assert stored["ledger"]["chunked"] is True
+    assert [chunk["namespace"] for chunk in stored["ledger"]["chunks"]] == ["ledger__sample__0000", "ledger__sample__0001"]
+
+    restored = production_sync.load_remote_snapshot("ledger")
+    assert restored["tables"] == snapshot["tables"]
+
 def test_storage_snapshot_saves_object_without_bucket_create(monkeypatch):
     calls: list[tuple[str, str]] = []
 

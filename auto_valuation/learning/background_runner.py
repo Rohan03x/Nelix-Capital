@@ -135,12 +135,12 @@ class _TokenBucket:
             _time.sleep(wait)
 
 
-# EODHD paid plan: 100,000 req/day; tested ceiling ~19 req/sec at 100 concurrent.
-# 19 req/sec with burst=40 supports 32 concurrent workers (cache hits bypass limiter).
+# EODHD paid plan: 100,000 req/day; tested ceiling ~19 req/sec at high concurrency.
+# Keep the local worker cap at 16 to match this workstation's available threads.
 _EODHD_RATE_LIMITER = _TokenBucket(rate=19.0, capacity=40.0)
 
 # Number of concurrent workers for parallel fundamentals pre-fetching.
-_CONCURRENT_WORKERS: int = 32
+_CONCURRENT_WORKERS: int = 16
 
 
 def _default_fundamentals_provider(ticker: str) -> dict[str, Any] | None:
