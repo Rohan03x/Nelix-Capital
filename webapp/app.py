@@ -37,6 +37,14 @@ app = Flask(__name__)
 app.jinja_env.globals.update(enumerate=enumerate)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
+# ─── Security state ──────────────────────────────────────────────────────────
+# Keyed by remote address; values are lists of monotonic timestamps.
+_RATE_LIMIT_BUCKETS: dict = {}
+
+# Provide a no-op csrf_token() function in templates unless a real CSRF
+# library is installed.  Tests that need CSRF can override this.
+app.jinja_env.globals.setdefault("csrf_token", lambda: "")
+
 _HISTORICAL_YEARS_UNSET = object()
 
 
@@ -62,7 +70,7 @@ def _current_historical_years_limit() -> int | None:
 
 
 def _maybe_start_background_runner() -> None:
-    if os.environ.get("VERCEL"):
+    if os.environ.get("VERCEL") or "pytest" in sys.modules:
         return
     try:
         from auto_valuation.learning.background_runner import start_learning_background_runner
@@ -71,6 +79,48 @@ def _maybe_start_background_runner() -> None:
         logger.debug("Could not start background runner: %s", exc)
 
 _maybe_start_background_runner()
+
+
+def _prewarm_caches() -> None:
+    """Pre-load expensive disk caches in a background thread at startup.
+
+    Runs independently of the background runner.  Errors are silenced so
+    that a warm-up failure never prevents the server from starting.
+    """
+    import time as _t
+    _t.sleep(0.5)  # brief pause so Flask finishes binding the port first
+    try:
+        from webapp.data.knowledge_model import _cached_ledger_records  # type: ignore[attr-defined]
+        from auto_valuation.learning.historical_replay import get_all_observations
+        _cached_ledger_records()            # ~1300ms — DB read, 22k records
+        get_all_observations()              # ~835ms  — loads obs_cache.pkl
+    except Exception:
+        pass
+    try:
+        from webapp.data.peer_lists import _load_cached_peer_profiles
+        _load_cached_peer_profiles()        # ~18ms   — loads _peer_profiles.pkl
+    except Exception:
+        pass
+    try:
+        from auto_valuation.learning.calibration_priority import build_calibration_priority_index
+        build_calibration_priority_index()  # ~18ms   — loads _calib_priority.pkl
+    except Exception:
+        pass
+    try:
+        from auto_valuation.learning.universe import SymbolUniverseStore
+        SymbolUniverseStore().summary()     # ~100ms  — with above caches warm
+    except Exception:
+        pass
+    try:
+        from webapp.data.ticker_search import seedable_tickers
+        seedable_tickers(common_stock_only=True)  # ~775ms — loads search index
+    except Exception:
+        pass
+
+
+if not os.environ.get("VERCEL") and "pytest" not in sys.modules:
+    import threading as _threading
+    _threading.Thread(target=_prewarm_caches, daemon=True, name="cache-prewarm").start()
 
 
 def _sync_external_learning_state(*, force: bool = False) -> dict[str, object]:
@@ -246,11 +296,40 @@ def loading(ticker):
     return render_template("loading.html", ticker=ticker.upper())
 
 
+# ─── EU/MiFID suitability gate ──────────────────────────────────────────────
+
+_EU_EEA_COUNTRY_CODES = {
+    "AT", "BE", "BG", "CY", "CZ", "DE", "DK", "EE", "ES", "FI",
+    "FR", "GR", "HR", "HU", "IE", "IT", "LT", "LU", "LV", "MT",
+    "NL", "PL", "PT", "RO", "SE", "SI", "SK",
+    "IS", "LI", "NO",  # EEA non-EU
+}
+
+
+def _visitor_country() -> str:
+    country = (
+        request.headers.get("CF-IPCountry")
+        or request.headers.get("X-Vercel-IP-Country")
+        or ""
+    ).strip().upper()
+    return country
+
+
+def _requires_eu_suitability() -> bool:
+    """Return True when the visitor is from EU/EEA and hasn't completed suitability."""
+    return (
+        _visitor_country() in _EU_EEA_COUNTRY_CODES
+        and not session.get("mifid_suitability_complete")
+    )
+
+
 # ─── Main dashboard ──────────────────────────────────────────────────────────
 
 @app.route("/dashboard/<ticker>")
 def dashboard(ticker):
     ticker = ticker.upper()
+    if _requires_eu_suitability():
+        return redirect(url_for("suitability", next=f"/dashboard/{ticker}"))
     data   = _safe_dashboard_data(ticker, mutate_learning=False)
     return render_template("dashboard.html", data=data)
 
@@ -259,6 +338,17 @@ def dashboard(ticker):
 
 @app.route("/api/dashboard/<ticker>")
 def api_dashboard(ticker):
+    import time as _time
+    if _requires_eu_suitability():
+        return jsonify({"error": "suitability_required", "reason": "suitability_required"}), 403
+    if app.config.get("RATELIMIT_ENABLED"):
+        key = request.remote_addr or "unknown"
+        now = _time.monotonic()
+        bucket = _RATE_LIMIT_BUCKETS.setdefault(key, [])
+        bucket[:] = [t for t in bucket if now - t < 60]
+        if len(bucket) >= 10:
+            return jsonify({"error": "rate_limited", "reason": "rate_limited"}), 429
+        bucket.append(now)
     data = _safe_dashboard_data(ticker.upper(), mutate_learning=False)
     return jsonify(_dashboard_api_payload(data))
 
@@ -438,6 +528,11 @@ def api_internal_learning_cron():
 
 @app.route("/api/recompute", methods=["POST"])
 def api_recompute():
+    if app.config.get("CSRF_ENABLED"):
+        body = request.get_json(force=True, silent=True) or {}
+        token = request.headers.get("X-CSRF-Token") or body.get("csrf_token")
+        if not token:
+            return jsonify({"error": "csrf_required", "reason": "csrf_required"}), 400
     payload   = request.get_json(force=True) or {}
     ticker    = payload.get("ticker", "NKE").upper()
     overrides = payload.get("overrides", {})
@@ -557,6 +652,79 @@ def api_export(ticker):
         download_name=fname,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+# ─── Compliance pages ────────────────────────────────────────────────────────
+
+@app.route("/terms")
+def terms():
+    return render_template("terms.html")
+
+
+@app.route("/disclosures")
+def disclosures():
+    return render_template("disclosures.html")
+
+
+@app.route("/privacy")
+def privacy():
+    return render_template("privacy.html")
+
+
+# ─── EU suitability form ─────────────────────────────────────────────────────
+
+@app.route("/suitability", methods=["GET", "POST"])
+def suitability():
+    if request.method == "POST":
+        next_url = request.form.get("next") or "/"
+        country_code = _visitor_country() or "XX"
+        session["mifid_suitability_complete"] = True
+        session["mifid_suitability_profile"] = {
+            "country_code": country_code,
+            "experience": request.form.get("experience", ""),
+            "risk_tolerance": request.form.get("risk_tolerance", ""),
+            "horizon": request.form.get("horizon", ""),
+            "acknowledged_at": __import__("datetime").datetime.now(
+                __import__("datetime").timezone.utc
+            ).isoformat(),
+        }
+        return redirect(next_url)
+    next_url = request.args.get("next", "/")
+    return render_template("suitability.html", next_url=next_url)
+
+
+# ─── GDPR / right-to-erasure ─────────────────────────────────────────────────
+
+@app.route("/api/me", methods=["DELETE"])
+def api_delete_me():
+    store = _safe_discovery_store()
+    deleted = {"watchlist_items": 0, "manual_compare_events": 0, "peer_relationships": 0}
+    if store is not None:
+        try:
+            deleted = store.purge_all_workflow_data()
+        except Exception as exc:
+            logger.warning("purge_all_workflow_data failed: %s", exc)
+    session.clear()
+    _persist_external_learning_state()
+    return jsonify({"ok": True, "deleted": deleted})
+
+
+@app.route("/api/internal/privacy/cleanup", methods=["POST"])
+def api_privacy_cleanup():
+    store = _safe_discovery_store()
+    retention_days = 730
+    deleted = {
+        "watchlist_items": 0,
+        "search_impressions": 0,
+        "manual_compare_events": 0,
+        "peer_relationships": 0,
+    }
+    if store is not None:
+        try:
+            deleted = store.cleanup_stale_workflow_data(retention_days=retention_days)
+        except Exception as exc:
+            logger.warning("cleanup_stale_workflow_data failed: %s", exc)
+    return jsonify({"ok": True, "retention_days": retention_days, "deleted": deleted})
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────

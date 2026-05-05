@@ -44,6 +44,9 @@ flask_out.txt
 flask_err.txt
 flask_stdout.txt
 flask_stderr.txt
+check_single.py
+profile_dashboard.py
+training_quality.py
 
 *.docx
 *.xlsx

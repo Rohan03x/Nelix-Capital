@@ -333,8 +333,17 @@ class CalibrationStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
 
+    def _connect_db(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=10000")
+        except Exception:
+            pass
+        return conn
+
     def _ensure_schema(self) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect_db() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS calibration_priors (
@@ -356,7 +365,7 @@ class CalibrationStore:
             conn.commit()
 
     def save_prior(self, prior: CalibrationPrior) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect_db() as conn:
             conn.execute(
                 """
                 INSERT INTO calibration_priors (

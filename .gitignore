@@ -48,6 +48,9 @@ ui_*.png
 *.xlsx
 *.png
 arch_plan*.txt
+check_single.py
+profile_dashboard.py
+training_quality.py
 
 # ── Damodaran / cache files ───────────────────────────────────────────────────
 *.cache

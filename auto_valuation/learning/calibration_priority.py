@@ -2,12 +2,30 @@
 
 from __future__ import annotations
 
+import time as _time_mod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from auto_valuation.config import LEARNING_CONFIG
 
 from .ledger import LedgerReader
+
+_WEBAPP_CACHE_DIR = Path(__file__).resolve().parents[2] / "webapp" / "data" / "cache"
+_CALIB_PKL_PATH = _WEBAPP_CACHE_DIR / "_calib_priority.pkl"
+_CALIB_PKL_TTL: float = 6 * 3600.0  # 6 hours (same as peer profiles)
+
+# Short in-process TTL cache so the default (no-reader) call is re-used within a request
+# cycle and across multiple summary() calls without hitting the DB every time.
+_CALIB_PRIORITY_CACHE: dict[str, dict[Any, "CalibrationBucket"]] | None = None
+_CALIB_PRIORITY_CACHE_TS: float = 0.0
+_CALIB_PRIORITY_CACHE_TTL: float = 30.0  # seconds
+
+
+def invalidate_calibration_priority_index_cache() -> None:
+    global _CALIB_PRIORITY_CACHE, _CALIB_PRIORITY_CACHE_TS
+    _CALIB_PRIORITY_CACHE = None
+    _CALIB_PRIORITY_CACHE_TS = 0.0
 
 
 def _safe_float(value: Any) -> float:
@@ -37,6 +55,28 @@ class CalibrationBucket:
 
 
 def build_calibration_priority_index(ledger_reader: LedgerReader | None = None) -> dict[str, dict[Any, CalibrationBucket]]:
+    global _CALIB_PRIORITY_CACHE, _CALIB_PRIORITY_CACHE_TS
+    # Use the process-level cache only for the default (no custom reader) path.
+    if ledger_reader is None:
+        now = _time_mod.monotonic()
+        if _CALIB_PRIORITY_CACHE is not None and (now - _CALIB_PRIORITY_CACHE_TS) < _CALIB_PRIORITY_CACHE_TTL:
+            return _CALIB_PRIORITY_CACHE
+        # Try disk pickle cache to skip full ledger scan on cold start.
+        try:
+            import pickle as _pickle
+            import time as _t
+            if _CALIB_PKL_PATH.exists():
+                age = _t.time() - _CALIB_PKL_PATH.stat().st_mtime
+                if age < _CALIB_PKL_TTL:
+                    with _CALIB_PKL_PATH.open("rb") as _f:
+                        snap = _pickle.load(_f)
+                    if isinstance(snap, dict) and snap:
+                        _CALIB_PRIORITY_CACHE = snap
+                        _CALIB_PRIORITY_CACHE_TS = now
+                        return snap
+        except Exception:
+            pass
+
     reader = ledger_reader or LedgerReader()
     predictions = {record.record_id: record for record in reader.query(limit=5000)}
 
@@ -80,6 +120,19 @@ def build_calibration_priority_index(ledger_reader: LedgerReader | None = None) 
                 mean_abs_error_pct=round(mean_abs_error, 4),
                 structural_break_rate=round(structural_break_rate, 4),
             )
+    if ledger_reader is None:
+        _CALIB_PRIORITY_CACHE = index
+        _CALIB_PRIORITY_CACHE_TS = _time_mod.monotonic()
+        # Persist to disk so next cold start loads in ~18ms instead of ~1.5s.
+        try:
+            import pickle as _pickle
+            _CALIB_PKL_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _CALIB_PKL_PATH.with_suffix(".pkl.tmp")
+            with tmp.open("wb") as _f:
+                _pickle.dump(index, _f, protocol=_pickle.HIGHEST_PROTOCOL)
+            tmp.replace(_CALIB_PKL_PATH)
+        except Exception:
+            pass
     return index
 
 

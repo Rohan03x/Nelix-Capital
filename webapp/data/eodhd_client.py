@@ -102,7 +102,15 @@ except ImportError:
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _api_key() -> str:
-    return os.environ.get("EODHD_API_KEY", _EODHD_KEY_DEFAULT)
+    key = os.environ.get("EODHD_API_KEY") or os.environ.get("EOD_API_KEY") or ""
+    if not key:
+        if os.environ.get("VERCEL"):
+            raise RuntimeError(
+                "EODHD_API_KEY environment variable is required in production (Vercel). "
+                "Set it in the Vercel project settings."
+            )
+        return _EODHD_KEY_DEFAULT
+    return key
 
 
 def _sf(val: Any, default: float = 0.0) -> float:
@@ -2645,6 +2653,33 @@ def build_dashboard_data(
         equity_value = max(0, ev - net_debt)
         iv           = equity_value / diluted_shares if diluted_shares > 0 else 0
         upside       = (iv - price) / price * 100 if price > 0 else 0
+        base_dcf_ev = ev
+        base_dcf_equity_value = equity_value
+        base_dcf_iv = iv
+        base_dcf_upside = upside
+        market_residual_overlay = dict((knowledge_model_payload or {}).get("market_residual_overlay") or {})
+        market_residual_applied = False
+        market_residual_adjustment_pct = 0.0
+        if market_residual_overlay.get("enabled"):
+            adjustment_decimal = float(market_residual_overlay.get("applied_adjustment_decimal") or 0.0)
+            if abs(adjustment_decimal) >= 0.001:
+                adjusted_ev = max(0.0, ev * (1.0 + adjustment_decimal))
+                ev = round(adjusted_ev)
+                equity_value = max(0, ev - net_debt)
+                iv = equity_value / diluted_shares if diluted_shares > 0 else 0
+                upside = (iv - price) / price * 100 if price > 0 else 0
+                market_residual_applied = True
+                market_residual_adjustment_pct = round(adjustment_decimal * 100.0, 1)
+                market_residual_overlay["applied_to_dashboard_value"] = True
+                market_residual_overlay["base_dcf_enterprise_value_m"] = round(base_dcf_ev)
+                market_residual_overlay["hybrid_enterprise_value_m"] = round(ev)
+                market_residual_overlay["base_dcf_intrinsic_value"] = round(base_dcf_iv, 2)
+                market_residual_overlay["hybrid_intrinsic_value"] = round(iv, 2)
+                if knowledge_model_payload is not None:
+                    knowledge_model_payload["market_residual_overlay"] = market_residual_overlay
+                    layered_payload = dict(knowledge_model_payload.get("layered_learning") or {})
+                    layered_payload["market_residual_overlay"] = market_residual_overlay
+                    knowledge_model_payload["layered_learning"] = layered_payload
         tv_pct       = round(pv_tv / ev * 100, 1) if ev > 0 else 0
 
         rec       = "Undervalued" if upside >= 15 else ("Fairly Valued" if upside >= -10 else "Overvalued")
@@ -2887,6 +2922,14 @@ def build_dashboard_data(
             "enterprise_value":    round(ev),
             "enterprise_value_m":  round(ev),
             "equity_value":        round(equity_value),
+            "base_dcf_enterprise_value": round(base_dcf_ev),
+            "base_dcf_enterprise_value_m": round(base_dcf_ev),
+            "base_dcf_equity_value": round(base_dcf_equity_value),
+            "base_dcf_intrinsic_value": round(base_dcf_iv, 2),
+            "base_dcf_upside_pct": round(base_dcf_upside, 1),
+            "hybrid_value_applied": market_residual_applied,
+            "market_residual_adjustment_pct": market_residual_adjustment_pct,
+            "market_residual_overlay": market_residual_overlay,
             "pv_ufcfs":            pv_ufcfs,
             "pv_terminal":         pv_tv,
             "tv_pct":              tv_pct,

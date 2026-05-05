@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time as _time_mod
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -17,6 +18,12 @@ from .storage_paths import learning_db_dir
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 SYMBOL_UNIVERSE_DB_PATH = learning_db_dir() / "symbol_universe.db"
+
+# Short TTL cache for summary() so that many dashboard requests within a minute
+# don't each pay the full 2+ second calibration-priority DB cost.
+_SUMMARY_CACHE: dict[str, Any] | None = None
+_SUMMARY_CACHE_TS: float = 0.0
+_SUMMARY_CACHE_TTL: float = 30.0  # seconds
 
 
 def _utcnow() -> datetime:
@@ -465,7 +472,99 @@ class SymbolUniverseStore:
                 break
         return candidates
 
+    def _priority_tickers_from_entries(self, entries: list[dict[str, Any]], *, limit: int = 24) -> list[str]:
+        """Same as priority_tickers() but accepts pre-computed entries to avoid a duplicate DB call."""
+        if not entries or limit <= 0:
+            return []
+        picked: list[str] = []
+        seen_tickers: set[str] = set()
+        seen_groups: set[str] = set()
+        for entry in entries:
+            row = entry["row"]
+            ticker = entry["ticker"]
+            if not ticker or ticker in seen_tickers:
+                continue
+            metadata = dict(row.get("metadata") or {})
+            group = str(
+                metadata.get("industry_family")
+                or metadata.get("industry_cluster")
+                or row.get("sector")
+                or row.get("exchange")
+                or "unknown"
+            ).strip().lower()
+            if group in seen_groups:
+                continue
+            picked.append(ticker)
+            seen_tickers.add(ticker)
+            seen_groups.add(group)
+            if len(picked) >= limit:
+                return picked
+        for entry in entries:
+            ticker = entry["ticker"]
+            if not ticker or ticker in seen_tickers:
+                continue
+            picked.append(ticker)
+            seen_tickers.add(ticker)
+            if len(picked) >= limit:
+                break
+        return picked
+
+    def _calibration_candidates_from_entries(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        priority_tickers_set: set[str],
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Same as calibration_priority_candidates() but accepts pre-computed entries."""
+        candidates: list[dict[str, Any]] = []
+        for entry in entries:
+            ticker = entry["ticker"]
+            if ticker not in priority_tickers_set:
+                continue
+            calibration = dict(entry["calibration"])
+            if float(calibration.get("score") or 0.0) <= 0.0:
+                continue
+            row = entry["row"]
+            candidates.append(
+                {
+                    "ticker": ticker,
+                    "score": round(float(entry["score"]), 3),
+                    "sector": str(row.get("sector") or ""),
+                    "exchange": str(row.get("exchange") or ""),
+                    **calibration,
+                }
+            )
+            if len(candidates) >= limit:
+                break
+        return candidates
+
     def summary(self, *, stale_after_hours: int = 18, recent_days: int = 14) -> dict[str, Any]:
+        global _SUMMARY_CACHE, _SUMMARY_CACHE_TS
+        import sys as _sys
+        # In test mode use a per-instance cache keyed by db path to prevent
+        # production data from bleeding into isolated test stores.
+        if "pytest" in _sys.modules:
+            now_mono = _time_mod.monotonic()
+            _inst_cache = getattr(self, "_summary_cache", None)
+            _inst_cache_ts: float = getattr(self, "_summary_cache_ts", 0.0)
+            if _inst_cache is not None and (now_mono - _inst_cache_ts) < _SUMMARY_CACHE_TTL:
+                return dict(_inst_cache)
+            result = self._compute_summary(stale_after_hours=stale_after_hours, recent_days=recent_days)
+            self._summary_cache = result
+            self._summary_cache_ts = now_mono
+            return dict(result)
+
+        now_mono = _time_mod.monotonic()
+        if _SUMMARY_CACHE is not None and (now_mono - _SUMMARY_CACHE_TS) < _SUMMARY_CACHE_TTL:
+            return dict(_SUMMARY_CACHE)
+
+        result = self._compute_summary(stale_after_hours=stale_after_hours, recent_days=recent_days)
+        _SUMMARY_CACHE = result
+        _SUMMARY_CACHE_TS = now_mono
+        return dict(result)
+
+    def _compute_summary(self, *, stale_after_hours: int = 18, recent_days: int = 14) -> dict[str, Any]:
         rows = self.list_symbols()
         now = _utcnow()
         stale_cutoff = timedelta(hours=max(int(stale_after_hours or 18), 1))
@@ -503,6 +602,14 @@ class SymbolUniverseStore:
             for label, count in sorted(sector_counts.items(), key=lambda item: (-item[1], item[0]))[:5]
         ]
 
+        # Compute _priority_entries once and reuse it for both priority_tickers
+        # and calibration_priority_candidates to avoid duplicate DB round-trips.
+        priority_entries = self._priority_entries(stale_after_hours=stale_after_hours)
+        priority_tickers = self._priority_tickers_from_entries(priority_entries, limit=5)
+        calibration_candidates = self._calibration_candidates_from_entries(
+            priority_entries, priority_tickers_set=set(priority_tickers), limit=3
+        )
+
         return {
             "tracked_symbols": len(rows),
             "sector_span": len(sector_counts),
@@ -511,8 +618,8 @@ class SymbolUniverseStore:
             "cached_fundamentals": cached_fundamentals,
             "recently_valued_symbols": recently_valued_symbols,
             "stale_bootstrap_symbols": stale_bootstrap_symbols,
-            "priority_candidates": self.priority_tickers(limit=5, stale_after_hours=stale_after_hours),
-            "calibration_priority_candidates": self.calibration_priority_candidates(limit=3, stale_after_hours=stale_after_hours),
+            "priority_candidates": priority_tickers,
+            "calibration_priority_candidates": calibration_candidates,
             "top_sectors": top_sectors,
         }
 

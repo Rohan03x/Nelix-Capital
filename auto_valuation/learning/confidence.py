@@ -353,7 +353,7 @@ def build_ranked_confidence_model(payload: dict[str, Any]) -> dict[str, Any]:
             3.5,
             4.0
             + 10.0 * (1.0 - assumption_confidence)
-            + 7.0 * (1.0 - discount_rate_sensitivity)
+            + 2.0 * (1.0 - discount_rate_sensitivity)
             + 4.5 * structural_break_score
             + 4.0 * scenario_penalty
             + 3.5 * (1.0 - analog_stability)

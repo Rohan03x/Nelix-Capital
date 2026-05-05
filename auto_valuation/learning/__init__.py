@@ -37,7 +37,11 @@ _EXPORTS = {
     "build_symbol_features": ("feature_space", "build_symbol_features"),
     "LedgerReader": ("ledger", "LedgerReader"),
     "LedgerWriter": ("ledger", "LedgerWriter"),
+    "LearningDataset": ("datasets", "LearningDataset"),
+    "LearningLabel": ("labels", "LearningLabel"),
+    "LearningObservationQuality": ("quality", "LearningObservationQuality"),
     "LiveEvidenceBootstrapResult": ("live_evidence_bootstrap", "LiveEvidenceBootstrapResult"),
+    "MarketImpliedSnapshot": ("market_implied", "MarketImpliedSnapshot"),
     "PredictionRecord": ("ledger", "PredictionRecord"),
     "LearningMaintenanceResult": ("maintenance", "LearningMaintenanceResult"),
     "extract_actuals_from_fundamentals": ("maintenance", "extract_actuals_from_fundamentals"),
@@ -53,6 +57,12 @@ _EXPORTS = {
     "run_annual_postmortem": ("postmortem", "run_annual_postmortem"),
     "should_run_quinquennial": ("postmortem", "should_run_quinquennial"),
     "SymbolUniverseStore": ("universe", "SymbolUniverseStore"),
+    "assess_prediction_record": ("quality", "assess_prediction_record"),
+    "build_labels": ("labels", "build_labels"),
+    "build_learning_datasets": ("datasets", "build_learning_datasets"),
+    "build_market_residual_overlay": ("market_implied", "build_market_residual_overlay"),
+    "compute_market_implied_snapshot": ("market_implied", "compute_market_implied_snapshot"),
+    "stratified_sample_records": ("sampling", "stratified_sample_records"),
 }
 
 _SUBMODULES = {
@@ -64,11 +74,15 @@ _SUBMODULES = {
     "cross_industry",
     "feature_space",
     "ledger",
+    "labels",
     "live_evidence_bootstrap",
     "maintenance",
+    "market_implied",
     "online_research",
     "postmortem",
+    "quality",
     "relationship_graph",
+    "sampling",
     "universe",
 }
 

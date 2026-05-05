@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -456,7 +457,8 @@ def run_background_learning_cycle(
             "maintenance": {"enabled": False, "ran": False, "reason": "disabled"},
         }
 
-    _restore_background_runner_cursors(state_path)
+    if state_path is not None or fundamentals_provider is None:
+        _restore_background_runner_cursors(state_path)
     provider = fundamentals_provider or _default_fundamentals_provider
     seed_refresh = _refresh_background_seed_cache()
     bootstrap_max_tickers = int(LEARNING_CONFIG.get("background_runner_bootstrap_max_tickers", 500))
@@ -657,6 +659,11 @@ class LearningBackgroundRunner:
         return run_background_learning_cycle(fundamentals_provider=self.fundamentals_provider)
 
     def _run_loop(self) -> None:
+        # Startup grace period: let the server handle early requests before
+        # the first heavy background cycle (universe replay, etc.) fires.
+        startup_grace = int(LEARNING_CONFIG.get("background_runner_startup_grace_sec", 90))
+        if startup_grace > 0 and self._stop_event.wait(startup_grace):
+            return
         while not self._stop_event.is_set():
             try:
                 self.run_cycle()
@@ -685,6 +692,9 @@ def _push_to_remote_async() -> None:
 
 def start_learning_background_runner() -> LearningBackgroundRunner | None:
     global _RUNNER
+
+    if "pytest" in sys.modules:
+        return None
 
     if not bool(LEARNING_CONFIG.get("learning_enabled", True) and LEARNING_CONFIG.get("background_runner_enabled", True)):
         return None

@@ -358,6 +358,23 @@ def _normalize_exchange_ticker(code: str, exchange: str) -> str | None:
 @lru_cache(maxsize=1)
 def _load_cached_peer_profiles() -> tuple[dict[str, Any], ...]:
     cache_dir = Path(__file__).with_name("cache")
+    snapshot_path = cache_dir / "_peer_profiles.pkl"
+    snapshot_ttl_sec = 6 * 3600.0  # 6 hours — same TTL as _build_eodhd_multiples_index
+
+    # Fast path: load from pickle snapshot to avoid scanning 12k+ JSON files.
+    try:
+        import pickle as _pickle
+        import time as _t
+        if snapshot_path.exists():
+            age = _t.time() - snapshot_path.stat().st_mtime
+            if age < snapshot_ttl_sec:
+                with snapshot_path.open("rb") as _f:
+                    snap = _pickle.load(_f)
+                if isinstance(snap, tuple) and snap:
+                    return snap
+    except Exception:
+        pass
+
     profiles: list[dict[str, Any]] = []
     for path in cache_dir.glob("eodhd_fund_*.json"):
         try:
@@ -386,7 +403,19 @@ def _load_cached_peer_profiles() -> tuple[dict[str, Any], ...]:
                 "market_cap_mln": float(highlights.get("MarketCapitalizationMln") or 0.0),
             }
         )
-    return tuple(profiles)
+
+    result = tuple(profiles)
+    # Persist snapshot so subsequent cold starts skip the JSON scan.
+    try:
+        import pickle as _pickle
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = snapshot_path.with_suffix(".pkl.tmp")
+        with tmp.open("wb") as _f:
+            _pickle.dump(result, _f, protocol=_pickle.HIGHEST_PROTOCOL)
+        tmp.replace(snapshot_path)
+    except Exception:
+        pass
+    return result
 
 
 def _discover_cached_peers(

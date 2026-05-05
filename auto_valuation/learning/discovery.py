@@ -593,4 +593,38 @@ class DiscoveryStore:
         return items
 
 
+    def purge_all_workflow_data(self) -> dict[str, int]:
+        """Delete all user workflow data (watchlist, compares, peer relationships).
+        Used by DELETE /api/me to fulfil right-to-erasure requests.
+        Returns counts of deleted rows per table.
+        """
+        return {
+            "watchlist_items": self._execute("DELETE FROM watchlist_items"),
+            "manual_compare_events": self._execute("DELETE FROM manual_compare_events"),
+            "peer_relationships": self._execute("DELETE FROM peer_relationships"),
+        }
+
+    def cleanup_stale_workflow_data(self, retention_days: int = 730) -> dict[str, int]:
+        """Delete workflow records older than *retention_days*.
+        Used by POST /api/internal/privacy/cleanup for automated data retention.
+        Returns counts of deleted rows per table.
+        """
+        from datetime import timedelta as _td
+        cutoff = (datetime.now(timezone.utc) - _td(days=int(retention_days or 730))).isoformat()
+        return {
+            "watchlist_items": self._execute(
+                "DELETE FROM watchlist_items WHERE last_touched_at < :cutoff", {"cutoff": cutoff}
+            ),
+            "search_impressions": self._execute(
+                "DELETE FROM search_impressions WHERE created_at < :cutoff", {"cutoff": cutoff}
+            ),
+            "manual_compare_events": self._execute(
+                "DELETE FROM manual_compare_events WHERE created_at < :cutoff", {"cutoff": cutoff}
+            ),
+            "peer_relationships": self._execute(
+                "DELETE FROM peer_relationships WHERE last_seen_at < :cutoff", {"cutoff": cutoff}
+            ),
+        }
+
+
 __all__ = ["DISCOVERY_DB_PATH", "DiscoveryStore"]

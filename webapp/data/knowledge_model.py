@@ -33,8 +33,11 @@ from auto_valuation.learning.deployment_seed import analog_observations as seede
 from auto_valuation.learning.deployment_seed import cohort_observations as seeded_cohort_observations
 from auto_valuation.learning.historical_replay import get_all_observations as _get_historical_observations
 from auto_valuation.learning.ledger import LedgerReader
+from auto_valuation.learning.market_implied import build_market_residual_overlay
 from auto_valuation.learning.postmortem import should_run_quinquennial
+from auto_valuation.learning.quality import assess_prediction_record
 from auto_valuation.learning.relationship_graph import build_relationship_graph
+from auto_valuation.learning.sampling import stratified_sample_records
 
 
 _SECTOR_ALIASES = {
@@ -53,6 +56,78 @@ class _LiveCalibrationStore:
 
 
 _LIVE_CALIBRATION_STORE = _LiveCalibrationStore()
+_LAST_LEARNING_SAMPLE_DIAGNOSTICS: dict[str, Any] = {}
+
+# ── Short-TTL cache for the full ledger query so that three sub-functions
+#    within a single refine_live_assumptions() call share one DB round-trip
+#    instead of making three separate full-table scans of 22k+ records.
+import time as _time_mod
+_LEDGER_RECORDS_CACHE: list | None = None
+_LEDGER_RECORDS_CACHE_TS: float = 0.0
+_LEDGER_RECORDS_CACHE_TTL: float = 30.0  # seconds
+
+# ── Cache stratified-sample results so that _load_learning_cohort and
+#    _load_analog_candidates (same params) don't each run assess_prediction_record
+#    over all 23k records separately.
+_SAMPLED_RECORDS_CACHE: dict[str, list] = {}  # key → (ts, records)
+_SAMPLED_RECORDS_CACHE_TS: dict[str, float] = {}
+_SAMPLED_RECORDS_CACHE_TTL: float = 30.0  # seconds
+
+
+def _cached_stratified_sample(records: list, *, max_records: int, target: str) -> list:
+    """Run stratified_sample_records with a 30-second result cache keyed on (len, max_records, target)."""
+    global _LAST_LEARNING_SAMPLE_DIAGNOSTICS
+    import sys as _sys
+    # In test mode skip the process-level sample cache so patched LedgerReaders
+    # propagate correctly to load-cohort and load-analog functions.
+    if "pytest" in _sys.modules:
+        sampled = stratified_sample_records(records, max_records=max_records, target=target)
+        if target == "full_dcf":
+            _LAST_LEARNING_SAMPLE_DIAGNOSTICS = sampled.diagnostics
+        return list(sampled.records)
+    cache_key = f"{len(records)}:{max_records}:{target}"
+    now = _time_mod.monotonic()
+    if cache_key in _SAMPLED_RECORDS_CACHE:
+        if (now - _SAMPLED_RECORDS_CACHE_TS.get(cache_key, 0.0)) < _SAMPLED_RECORDS_CACHE_TTL:
+            return list(_SAMPLED_RECORDS_CACHE[cache_key])
+    sampled = stratified_sample_records(records, max_records=max_records, target=target)
+    _SAMPLED_RECORDS_CACHE[cache_key] = sampled.records
+    _SAMPLED_RECORDS_CACHE_TS[cache_key] = now
+    # Also update global sample diagnostics for the full_dcf target.
+    if target == "full_dcf":
+        _LAST_LEARNING_SAMPLE_DIAGNOSTICS = sampled.diagnostics
+    return list(sampled.records)
+
+
+def _cached_ledger_records(limit: int | None = None) -> list:
+    """Return all ledger records, reusing a 30-second in-process cache."""
+    global _LEDGER_RECORDS_CACHE, _LEDGER_RECORDS_CACHE_TS
+    import sys as _sys
+    # In test mode bypass the process-level cache so monkeypatched LedgerReaders
+    # are not hidden behind stale real-data entries.
+    if "pytest" in _sys.modules:
+        try:
+            reader = LedgerReader()
+            return list(reader.query(limit=limit))
+        except Exception:
+            return []
+    now = _time_mod.monotonic()
+    if _LEDGER_RECORDS_CACHE is not None and (now - _LEDGER_RECORDS_CACHE_TS) < _LEDGER_RECORDS_CACHE_TTL:
+        return list(_LEDGER_RECORDS_CACHE)
+    try:
+        reader = LedgerReader()
+        records = reader.query(limit=limit)
+        _LEDGER_RECORDS_CACHE = records
+        _LEDGER_RECORDS_CACHE_TS = now
+        return list(records)
+    except Exception:
+        return []
+
+
+def _invalidate_ledger_records_cache() -> None:
+    global _LEDGER_RECORDS_CACHE, _LEDGER_RECORDS_CACHE_TS
+    _LEDGER_RECORDS_CACHE = None
+    _LEDGER_RECORDS_CACHE_TS = 0.0
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -91,6 +166,16 @@ def _learning_pool_limit(default: int = 1000) -> int:
         return max(int(LEARNING_CONFIG.get("learning_observation_limit", default)), default)
     except Exception:
         return default
+
+
+def _learning_candidate_limit(target_limit: int) -> int | None:
+    configured = LEARNING_CONFIG.get("learning_candidate_pool_limit")
+    if configured in (None, 0, ""):
+        return None
+    try:
+        return max(int(configured), int(target_limit))
+    except Exception:
+        return None
 
 
 def _classify_macro_regime(rf_rate: float) -> str:
@@ -710,6 +795,26 @@ def _build_data_gaps(
             }
         )
 
+    quality_gate = dict(layered_learning.get("quality_gate") or {})
+    if quality_gate and int(quality_gate.get("excluded_rows") or 0) > 0:
+        gaps.append(
+            {
+                "title": "Training rows were quality-gated",
+                "detail": f"{int(quality_gate.get('excluded_rows') or 0)} ledger row(s) were excluded from full DCF calibration before this request because their targets were invalid or restricted.",
+                "severity": "amber",
+            }
+        )
+
+    market_residual = dict(layered_learning.get("market_residual_overlay") or {})
+    if not market_residual.get("enabled"):
+        gaps.append(
+            {
+                "title": "Market residual evidence is not active",
+                "detail": str(market_residual.get("reason") or "EV/price residual learning needs more quality-gated annual outcomes before it can move the point estimate."),
+                "severity": "amber",
+            }
+        )
+
     # Quarterly verification is always active — no gap to flag for review cadence.
 
     return gaps
@@ -746,6 +851,8 @@ def _build_learning_explainability(
     structural_break = dict(layered_learning.get("structural_break") or {})
     uncertainty = dict(layered_learning.get("uncertainty") or {})
     learned_metrics = dict(layered_learning.get("learned_metrics") or {})
+    quality_gate = dict(layered_learning.get("quality_gate") or {})
+    market_residual = dict(layered_learning.get("market_residual_overlay") or {})
 
     avg_company_weight = int(company_mix.get("weight_pct") or 0)
     avg_sector_weight = int(sector_mix.get("weight_pct") or 0)
@@ -837,6 +944,11 @@ def _build_learning_explainability(
             "label": "Global brain",
             "score": round(float(global_learning.get("confidence") or 0.0) * 100),
             "detail": global_learning.get("note") or "Global cross-symbol overlays are inactive until enough realised evidence exists.",
+        },
+        {
+            "label": "Market residual",
+            "score": round(float(market_residual.get("confidence") or 0.0) * 100),
+            "detail": market_residual.get("note") or market_residual.get("reason") or "Market-implied EV/price residual learning is waiting for enough quality-gated annual outcomes.",
         },
         {
             "label": "Regime stability",
@@ -939,6 +1051,8 @@ def _build_learning_explainability(
             "confidence": round(float(global_mix.get("confidence") or 0.0), 2),
             "note": global_mix.get("note"),
         },
+        "quality_gate": quality_gate,
+        "market_residual_overlay": market_residual,
         "relationship_graph": relationship_graph,
         "structural_break": structural_break,
         "uncertainty": uncertainty,
@@ -1336,14 +1450,20 @@ def _thin_evidence_margin_guardrail(
 
 
 def _load_learning_cohort(limit: int | None = None) -> list[Any]:
+    global _LAST_LEARNING_SAMPLE_DIAGNOSTICS
+    target_limit = int(limit or _learning_pool_limit())
     try:
-        reader = LedgerReader()
-        records = reader.query(limit=int(limit or _learning_pool_limit()))
+        all_records = _cached_ledger_records(limit=_learning_candidate_limit(target_limit))
+        records = _cached_stratified_sample(all_records, max_records=target_limit, target="full_dcf")
     except Exception:
         records = []
+        _LAST_LEARNING_SAMPLE_DIAGNOSTICS = {"enabled": False, "reason": "ledger_query_failed"}
 
     observations: list[Any] = []
     for record in records:
+        quality = assess_prediction_record(record)
+        if not quality.eligible("full_dcf"):
+            continue
         if record.actual_revenue_mm is None and record.actual_ebit_margin is None:
             continue
 
@@ -1415,16 +1535,22 @@ def _load_learning_cohort(limit: int | None = None) -> list[Any]:
                 "feature_vector": tuple(getattr(record, "feature_vector", None) or ()) or None,
                 "structural_break_flag": bool(getattr(record, "structural_break_hints", []) or []),
                 "structural_break_hints": list(getattr(record, "structural_break_hints", []) or []),
+                "quality_score": float(quality.quality_score),
+                "observation_type": quality.observation_type,
+                "target_eligibility": dict(quality.target_eligibility),
             }
         )
     if observations:
-        # Augment ledger records with historical quarterly/annual replay observations
-        # from every cached fundamentals file.  These give the sector and cohort layers
-        # the peer data they need (correct maturity-bucket alignment via
-        # data_vintage_years = min(available_annual_periods, 20)).
+        # Augment ledger records with historical quarterly/annual replay observations.
+        # Cap to avoid iterating 300k+ observations in refine_live_assumptions.
         try:
             historical = _get_historical_observations()
             if historical:
+                historical_limit = int(
+                    LEARNING_CONFIG.get("historical_replay_limit", 4000) or 4000
+                )
+                if len(historical) > historical_limit:
+                    historical = historical[:historical_limit]
                 observations = list(observations) + list(historical)
         except Exception:
             pass
@@ -1433,15 +1559,44 @@ def _load_learning_cohort(limit: int | None = None) -> list[Any]:
 
 
 def _load_analog_candidates(limit: int | None = None):
+    target_limit = int(limit or _learning_pool_limit())
     try:
-        reader = LedgerReader()
-        records = reader.query(limit=int(limit or _learning_pool_limit()))
+        all_records = _cached_ledger_records(limit=_learning_candidate_limit(target_limit))
+        records = _cached_stratified_sample(all_records, max_records=target_limit, target="full_dcf")
     except Exception:
         records = []
     analogs = build_analog_observations(records)
     if analogs:
         return analogs
     return seeded_analog_observations(limit=int(limit or _learning_pool_limit()))
+
+
+def _market_residual_overlay_for_subject(
+    *,
+    ticker: str,
+    sector: str,
+    industry: str,
+    market_cap_regime: str,
+    macro_regime: str,
+) -> dict[str, Any]:
+    if LEARNING_CONFIG.get("market_residual_overlay_enabled", True) is False:
+        return {"enabled": False, "reason": "market_residual_overlay_disabled", "cohort_size": 0, "confidence": 0.0}
+    target_limit = max(250, int(LEARNING_CONFIG.get("market_residual_sample_limit", _learning_pool_limit(1000)) or 1000))
+    try:
+        all_records = _cached_ledger_records(limit=_learning_candidate_limit(target_limit))
+        sampled_records = _cached_stratified_sample(all_records, max_records=target_limit, target="valuation_ev")
+        overlay = build_market_residual_overlay(
+            sampled_records,
+            ticker=ticker,
+            sector=sector,
+            industry=industry,
+            market_cap_regime=market_cap_regime,
+            macro_regime=macro_regime,
+        )
+        overlay["sample_diagnostics"] = {"cached": True}
+        return overlay
+    except Exception as exc:
+        return {"enabled": False, "reason": f"market_residual_overlay_failed: {exc}", "cohort_size": 0, "confidence": 0.0}
 
 
 def _disabled_analog_set(ticker: str, symbol_features: SymbolFeatures) -> AnalogSet:
@@ -1850,8 +2005,16 @@ def refine_live_assumptions(
 
     revenue_volatility = _safe_pstdev(_growth_rates(revenues[-(history_window_years + 1):]))
     margin_volatility = _safe_pstdev([margin / 100 for margin in ebit_margins[-history_window_years:]])
+    observations_provided = observations is not None
     observations = list(observations) if observations is not None else _load_learning_cohort()
-    analog_candidates = _load_analog_candidates()
+    learning_sample_diagnostics = (
+        {"enabled": False, "reason": "caller_supplied_observations", "candidate_rows": len(observations)}
+        if observations_provided
+        else dict(_LAST_LEARNING_SAMPLE_DIAGNOSTICS or {})
+    )
+    analog_candidates = (
+        build_analog_observations(observations) if observations_provided and len(observations) >= 5 else []
+    ) if observations_provided else _load_analog_candidates()
     symbol_features = build_symbol_features(
         ticker=ticker,
         sector=sector,
@@ -1979,6 +2142,17 @@ def refine_live_assumptions(
     )
     analog_overlay_eligible = bool(analog_learning.get("enabled")) and len(analog_set.analogs) >= 2
     global_learning = analog_learning if analog_overlay_eligible else fallback_global_learning
+    market_residual_overlay = (
+        {"enabled": False, "reason": "caller_supplied_observations", "cohort_size": 0, "confidence": 0.0}
+        if observations_provided
+        else _market_residual_overlay_for_subject(
+            ticker=ticker,
+            sector=sector,
+            industry=industry,
+            market_cap_regime=market_cap_regime,
+            macro_regime=current_macro_regime,
+        )
+    )
 
     growth_weights = _normalise_weights(
         _clamp(0.48 + 0.04 * history_window_years - 0.30 * min(revenue_volatility, 0.50), 0.38, 0.72),
@@ -2130,6 +2304,8 @@ def refine_live_assumptions(
         base_ufcf_margin=base_ufcf_margin,
         base_reinvestment_rate=base_reinvestment_rate,
     )
+    layered_learning["quality_gate"] = learning_sample_diagnostics
+    layered_learning["market_residual_overlay"] = market_residual_overlay
     learned_metrics = dict(layered_learning.get("learned_metrics") or {})
     uncertainty = dict(layered_learning.get("uncertainty") or {})
     structural_break = dict(layered_learning.get("structural_break") or {})
@@ -2159,6 +2335,30 @@ def refine_live_assumptions(
     if margin_guardrail["applied"]:
         refined_margin_target = min(refined_margin_target, float(margin_guardrail["max_margin_target_pct"]))
     layered_learning["margin_guardrail"] = margin_guardrail
+    stable_margin_floor_guardrail = {
+        "applied": False,
+        "min_margin_target_pct": round(float(ebit_margin_base_pct), 1),
+        "note": None,
+    }
+    unlearned_margin_weight_total = max(margin_company_weight + margin_sector_weight, 1e-9)
+    unlearned_margin_anchor_pct = (
+        company_margin_target_pct * margin_company_weight + sector_margin_pct * margin_sector_weight
+    ) / unlearned_margin_weight_total
+    stable_margin_floor_pct = max(float(ebit_margin_base_pct), unlearned_margin_anchor_pct + max(margin_pattern_pp, 0.0))
+    if (
+        refined_margin_target < stable_margin_floor_pct
+        and company_growth_pct >= -2.0
+        and not bool(structural_break.get("detected"))
+        and not bool(regime_guardrail.get("applied"))
+        and not bool(margin_guardrail.get("applied"))
+    ):
+        refined_margin_target = round(float(stable_margin_floor_pct), 1)
+        stable_margin_floor_guardrail = {
+            "applied": True,
+            "min_margin_target_pct": refined_margin_target,
+            "note": "Stable-margin floor applied: learned evidence cannot compress the target margin below the stable company/sector anchor without a declining or structural-break signal.",
+        }
+    layered_learning["stable_margin_floor_guardrail"] = stable_margin_floor_guardrail
     layered_learning["thin_evidence_margin_guardrail"] = thin_evidence_margin_guardrail
     learned_reinvestment_confidence = float(learned_metrics.get("reinvestment_confidence") or 0.0)
     if learned_reinvestment_confidence > 0:
@@ -2268,8 +2468,12 @@ def refine_live_assumptions(
         uncertainty_text += f" {thin_evidence_margin_guardrail['note']}"
     if margin_guardrail["applied"]:
         uncertainty_text += f" {margin_guardrail['note']}"
+    if stable_margin_floor_guardrail["applied"]:
+        uncertainty_text += f" {stable_margin_floor_guardrail['note']}"
     if regime_guardrail["applied"]:
         uncertainty_text += f" {regime_guardrail['note']}"
+    if market_residual_overlay.get("enabled"):
+        uncertainty_text += f" {market_residual_overlay.get('note', '')}"
     analog_text = ""
     if analog_set.analogs:
         analog_text = f" Nearest analogs: {', '.join(match.analog.ticker for match in analog_set.analogs[:3])}."
@@ -2310,8 +2514,8 @@ def refine_live_assumptions(
             "pattern_overlay_pp": margin_pattern_pp,
             "global_overlay_pp": global_margin_pp,
             "relationship_overlay_pp": relationship_margin_pp,
-            "source": margin_source + global_margin_source + relationship_margin_source + margin_normalisation["source_suffix"] + ("; thin-evidence margin gate applied" if thin_evidence_margin_guardrail["applied"] else "") + ("; margin-volatility safeguard applied" if margin_guardrail["applied"] else "") + ("; declining/structural-break safeguard applied" if regime_guardrail["applied"] else ""),
-            "warn": _merge_guardrail_warn(margin_normalisation["note"] or margin_warn, thin_evidence_margin_guardrail, margin_guardrail, regime_guardrail),
+            "source": margin_source + global_margin_source + relationship_margin_source + margin_normalisation["source_suffix"] + ("; thin-evidence margin gate applied" if thin_evidence_margin_guardrail["applied"] else "") + ("; margin-volatility safeguard applied" if margin_guardrail["applied"] else "") + ("; stable-margin floor applied" if stable_margin_floor_guardrail["applied"] else "") + ("; declining/structural-break safeguard applied" if regime_guardrail["applied"] else ""),
+            "warn": _merge_guardrail_warn(margin_normalisation["note"] or margin_warn, thin_evidence_margin_guardrail, margin_guardrail, stable_margin_floor_guardrail, regime_guardrail),
         },
         "beta": {
             **{key: round(value, 2) for key, value in risk_weights.items()},
@@ -2457,6 +2661,8 @@ def refine_live_assumptions(
             "analogs": analog_payload,
             "relationship_graph": relationship_graph,
             "layered_learning": layered_learning,
+            "quality_gate": learning_sample_diagnostics,
+            "market_residual_overlay": market_residual_overlay,
             "explainability": explainability,
         }
     )
@@ -2497,9 +2703,12 @@ def refine_live_assumptions(
         "global_learning": global_learning,
         "relationship_graph": relationship_graph,
         "layered_learning": layered_learning,
+        "quality_gate": learning_sample_diagnostics,
+        "market_residual_overlay": market_residual_overlay,
         "margin_normalisation": margin_normalisation,
         "thin_evidence_margin_guardrail": thin_evidence_margin_guardrail,
         "margin_guardrail": margin_guardrail,
+        "stable_margin_floor_guardrail": stable_margin_floor_guardrail,
         "regime_guardrail": regime_guardrail,
         "scenario_width_multiplier": float(uncertainty.get("scenario_width_multiplier") or margin_normalisation["scenario_width_multiplier"]),
         "confidence_model": confidence_model,

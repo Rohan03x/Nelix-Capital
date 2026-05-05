@@ -230,7 +230,7 @@ LEARNING_CONFIG: dict[str, Any] = {
     "background_runner_exchange_refresh_per_exchange_limit": 500,
     "background_runner_exchange_cache_ttl_sec": 86400,
     "background_runner_concurrent_workers": 32,
-    "bulk_seed_on_startup": True,
+    "bulk_seed_on_startup": False,
     "bulk_seed_daily_budget": 95000,
     "background_runner_seed_exchanges": [
         "US",

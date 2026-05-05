@@ -7,9 +7,29 @@ from pathlib import Path
 from threading import Lock
 from typing import Callable
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine, URL
 from sqlalchemy.pool import NullPool
+
+
+def _set_sqlite_wal(dbapi_conn, connection_record):  # noqa: ARG001
+    """Enable WAL mode and a 10-second busy timeout for every new SQLite connection.
+
+    WAL allows concurrent readers while the writer holds the lock, preventing
+    'database is locked' errors when the background runner writes while Flask
+    dashboard requests read simultaneously.
+    """
+    try:
+        dbapi_conn.execute("PRAGMA journal_mode=WAL")
+        dbapi_conn.execute("PRAGMA busy_timeout=10000")
+    except Exception:
+        pass
+
+
+def _sqlite_engine(url, **kwargs) -> Engine:
+    engine = create_engine(url, **kwargs)
+    event.listen(engine, "connect", _set_sqlite_wal)
+    return engine
 
 
 _DATABASE_ENV_KEYS = (
@@ -62,7 +82,7 @@ def resolve_shared_brain_backend(
         cache_key = f"sqlite-file::{database_path.resolve()}"
         engine = _cached_engine(
             cache_key,
-            lambda: create_engine(
+            lambda: _sqlite_engine(
                 _sqlite_url(database_path),
                 connect_args={"check_same_thread": False},
             ),
@@ -76,7 +96,7 @@ def resolve_shared_brain_backend(
         if backend == "sqlite-url":
             engine = _cached_engine(
                 cache_key,
-                lambda: create_engine(
+                lambda: _sqlite_engine(
                     database_url,
                     connect_args={"check_same_thread": False},
                 ),
@@ -97,7 +117,7 @@ def resolve_shared_brain_backend(
     cache_key = f"sqlite-file::{database_path.resolve()}"
     engine = _cached_engine(
         cache_key,
-        lambda: create_engine(
+        lambda: _sqlite_engine(
             _sqlite_url(database_path),
             connect_args={"check_same_thread": False},
         ),
