@@ -32,13 +32,43 @@ _LAST_PERSIST_RESULT: dict[str, Any] = {}
 _DSN_ENV_KEYS = (
     "LEARNING_STORE_DSN",
     "LEARNING_POSTGRES_DSN",
-    "POSTGRES_URL",
     "POSTGRES_PRISMA_URL",
+    "POSTGRES_URL",
     "POSTGRES_URL_NON_POOLING",
+    "SUPABASE_POOLER_URL",
     "SUPABASE_DB_URL",
     "SUPABASE_DIRECT_URL",
-    "SUPABASE_POOLER_URL",
 )
+
+_LIBPQ_URI_QUERY_KEYS = {
+    "application_name",
+    "channel_binding",
+    "connect_timeout",
+    "fallback_application_name",
+    "gssencmode",
+    "keepalives",
+    "keepalives_count",
+    "keepalives_idle",
+    "keepalives_interval",
+    "load_balance_hosts",
+    "options",
+    "passfile",
+    "require_auth",
+    "requiressl",
+    "service",
+    "sslcert",
+    "sslcompression",
+    "sslcrl",
+    "sslcrldir",
+    "sslkey",
+    "sslmode",
+    "sslnegotiation",
+    "sslpassword",
+    "sslrootcert",
+    "sslsni",
+    "target_session_attrs",
+    "tcp_user_timeout",
+}
 
 
 def _utcnow_iso() -> str:
@@ -54,7 +84,7 @@ def _normalize_dsn(value: str) -> str:
         query = [
             (key, value)
             for key, value in parse_qsl(parts.query, keep_blank_values=True)
-            if key.lower() not in {"supa"}
+            if key.lower() in _LIBPQ_URI_QUERY_KEYS
         ]
         dsn = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
     return dsn
