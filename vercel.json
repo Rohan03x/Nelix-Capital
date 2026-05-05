@@ -30,7 +30,7 @@
   "crons": [
     {
       "path": "/api/internal/learning/cron",
-      "schedule": "*/5 * * * *"
+      "schedule": "0 0 * * *"
     }
   ]
 }
