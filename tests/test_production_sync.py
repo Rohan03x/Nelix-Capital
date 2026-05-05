@@ -51,6 +51,18 @@ def test_dsn_prefers_vercel_postgres_before_supabase_direct(monkeypatch):
     assert production_sync._dsn() == "postgresql://good:good@pooler.vercel.local:5432/postgres"
 
 
+def test_dsn_strips_supabase_pooler_hint_for_psycopg(monkeypatch):
+    for env_key in production_sync._DSN_ENV_KEYS:
+        monkeypatch.delenv(env_key, raising=False)
+
+    monkeypatch.setenv(
+        "POSTGRES_URL",
+        "postgres://user:pass@pooler.example.com:5432/postgres?sslmode=require&supa=base-pooler.x",
+    )
+
+    assert production_sync._dsn() == "postgresql://user:pass@pooler.example.com:5432/postgres?sslmode=require"
+
+
 def test_component_specs_include_calibration_and_maintenance_state():
     specs = production_sync._component_specs()
 

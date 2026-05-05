@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ._layered_calibrator import CALIBRATION_DB_PATH, CalibrationStore
 from .background_runner import BACKGROUND_RUNNER_STATE_PATH
@@ -47,7 +48,15 @@ def _utcnow_iso() -> str:
 def _normalize_dsn(value: str) -> str:
     dsn = str(value or "").strip()
     if dsn.startswith("postgres://"):
-        return "postgresql://" + dsn[len("postgres://") :]
+        dsn = "postgresql://" + dsn[len("postgres://") :]
+    if dsn.startswith(("postgresql://", "postgresql+psycopg://")) and "?" in dsn:
+        parts = urlsplit(dsn)
+        query = [
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key.lower() not in {"supa"}
+        ]
+        dsn = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
     return dsn
 
 
