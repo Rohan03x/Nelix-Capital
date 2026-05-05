@@ -34,10 +34,29 @@ BACKGROUND_RUNNER_STATE_PATH = learning_db_dir() / "background_runner_state.json
 
 _RUNNER_LOCK = threading.Lock()
 _RUNNER: "LearningBackgroundRunner | None" = None
+_CYCLE_LOCK = threading.Lock()
 _SEED_CURSOR_LOCK = threading.Lock()
 _BACKGROUND_SEED_CURSOR = 0
 _EXCHANGE_CURSOR_LOCK = threading.Lock()
 _BACKGROUND_EXCHANGE_CURSOR = 0
+
+
+def _cycle_skipped_payload(reason: str, error: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "enabled": True,
+        "reason": reason,
+        "bootstrap": {"enabled": True, "ran": False, "reason": reason},
+        "maintenance": {"enabled": True, "ran": False, "reason": reason},
+        "replay": {"enabled": True, "ran": False, "reason": reason},
+    }
+    if error:
+        payload["error"] = error
+    return payload
+
+
+def _is_database_locked_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message
 
 
 def _env_int(name: str, default: int) -> int:
@@ -499,17 +518,27 @@ def run_background_learning_cycle(
     fundamentals_provider: Callable[[str], dict[str, Any] | None] | None = None,
     state_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    serverless_overrides = _serverless_learning_overrides()
-    if serverless_overrides:
-        with _temporary_learning_config(serverless_overrides):
-            return _run_background_learning_cycle(
-                fundamentals_provider=fundamentals_provider,
-                state_path=state_path,
-            )
-    return _run_background_learning_cycle(
-        fundamentals_provider=fundamentals_provider,
-        state_path=state_path,
-    )
+    if not _CYCLE_LOCK.acquire(blocking=False):
+        return _cycle_skipped_payload("learning-store-busy")
+    try:
+        serverless_overrides = _serverless_learning_overrides()
+        if serverless_overrides:
+            with _temporary_learning_config(serverless_overrides):
+                return _run_background_learning_cycle(
+                    fundamentals_provider=fundamentals_provider,
+                    state_path=state_path,
+                )
+        return _run_background_learning_cycle(
+            fundamentals_provider=fundamentals_provider,
+            state_path=state_path,
+        )
+    except Exception as exc:
+        if _is_database_locked_error(exc):
+            logger.info("Background learning cycle skipped: %s", exc)
+            return _cycle_skipped_payload("database-locked", error=str(exc))
+        raise
+    finally:
+        _CYCLE_LOCK.release()
 
 
 def _run_background_learning_cycle(
@@ -736,20 +765,25 @@ class LearningBackgroundRunner:
         if startup_grace > 0 and self._stop_event.wait(startup_grace):
             return
         while not self._stop_event.is_set():
+            cycle_result: dict[str, Any] | None = None
             try:
-                self.run_cycle()
+                cycle_result = self.run_cycle()
             except Exception as exc:
                 logger.warning("Background learning cycle failed: %s", exc)
             # Push latest learning state to remote (Supabase) in a daemon thread
             # so it doesn't delay the next cycle. Throttled to max once per 5 min.
-            _t = threading.Thread(target=_push_to_remote_async, daemon=True, name="learning-sync")
-            _t.start()
+            if not cycle_result or cycle_result.get("reason") not in {"learning-store-busy", "database-locked"}:
+                _t = threading.Thread(target=_push_to_remote_async, daemon=True, name="learning-sync")
+                _t.start()
             if self._stop_event.wait(self.loop_seconds):
                 break
 
 
 def _push_to_remote_async() -> None:
     """Fire-and-forget push of all learning state to remote (Supabase). Throttled."""
+    if not _CYCLE_LOCK.acquire(blocking=False):
+        logger.debug("Remote learning sync skipped: learning store is busy.")
+        return
     try:
         from auto_valuation.learning.production_sync import persist_external_learning_state
         result = persist_external_learning_state()
@@ -758,7 +792,12 @@ def _push_to_remote_async() -> None:
         elif result.get("enabled") and result.get("reason") is None:
             logger.debug("Remote learning sync: pushed %d namespaces", len(result.get("persisted") or {}))
     except Exception as exc:
-        logger.debug("Remote learning sync failed (will retry next cycle): %s", exc)
+        if _is_database_locked_error(exc):
+            logger.debug("Remote learning sync skipped: %s", exc)
+        else:
+            logger.debug("Remote learning sync failed (will retry next cycle): %s", exc)
+    finally:
+        _CYCLE_LOCK.release()
 
 
 def start_learning_background_runner() -> LearningBackgroundRunner | None:

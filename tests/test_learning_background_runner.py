@@ -138,6 +138,12 @@ def test_background_cycle_runs_bootstrap_and_maintenance(monkeypatch):
         "auto_valuation.learning.background_runner.run_scheduled_learning_maintenance",
         lambda **kwargs: (calls.append("maintenance"), _Result(enabled=True, ran=True, reason=None))[1],
     )
+    monkeypatch.setattr(background_runner_module, "_refresh_background_seed_cache", lambda: {"requested_exchanges": []})
+    monkeypatch.setattr(background_runner_module, "_build_background_bootstrap_tickers", lambda limit: ["ACME"])
+    monkeypatch.setattr(background_runner_module, "_prefetch_fundamentals_parallel", lambda *args, **kwargs: {})
+    monkeypatch.setattr(background_runner_module, "_safe_tracked_symbol_count", lambda: 0)
+    monkeypatch.setattr(background_runner_module, "_load_background_seed_tickers", lambda limit: [])
+    monkeypatch.setitem(background_runner_module.LEARNING_CONFIG, "background_runner_replay_enabled", False)
 
     payload = run_background_learning_cycle(fundamentals_provider=lambda _ticker: {})
 
@@ -145,6 +151,35 @@ def test_background_cycle_runs_bootstrap_and_maintenance(monkeypatch):
     assert payload["enabled"] is True
     assert payload["bootstrap"]["ran"] is True
     assert payload["maintenance"]["ran"] is True
+
+
+def test_background_cycle_skips_when_learning_store_busy(monkeypatch):
+    acquired = background_runner_module._CYCLE_LOCK.acquire(blocking=False)
+    assert acquired is True
+    try:
+        payload = run_background_learning_cycle(fundamentals_provider=lambda _ticker: {})
+    finally:
+        background_runner_module._CYCLE_LOCK.release()
+
+    assert payload["enabled"] is True
+    assert payload["reason"] == "learning-store-busy"
+    assert payload["bootstrap"]["ran"] is False
+    assert payload["maintenance"]["ran"] is False
+
+
+def test_background_cycle_returns_skipped_payload_for_sqlite_lock(monkeypatch):
+    monkeypatch.setattr(
+        background_runner_module,
+        "_run_background_learning_cycle",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("database is locked")),
+    )
+
+    payload = run_background_learning_cycle(fundamentals_provider=lambda _ticker: {})
+
+    assert payload["enabled"] is True
+    assert payload["reason"] == "database-locked"
+    assert payload["bootstrap"]["ran"] is False
+    assert "database is locked" in payload["error"]
 
 
 def test_background_cycle_reserves_rotating_seed_slots(monkeypatch):
