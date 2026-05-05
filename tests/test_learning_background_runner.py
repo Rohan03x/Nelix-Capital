@@ -237,3 +237,65 @@ def test_background_cycle_persists_exchange_refresh_state(tmp_path, monkeypatch)
     assert saved_state["exchange_discovered_symbols"] == 3
     assert saved_state["exchange_enrolled_symbols"] == 3
     assert saved_state["tracked_symbols"] == 42
+
+
+def test_background_cycle_uses_bounded_serverless_batch(monkeypatch):
+    captured_bootstrap: list[dict[str, object]] = []
+    captured_maintenance: list[dict[str, object]] = []
+
+    class _Result:
+        def __init__(self, **payload):
+            self._payload = payload
+
+        def to_dict(self):
+            return dict(self._payload)
+
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setenv("VERCEL_BACKGROUND_BOOTSTRAP_MAX_TICKERS", "3")
+    monkeypatch.setenv("VERCEL_BACKGROUND_MAINTENANCE_MAX_TICKERS", "2")
+    monkeypatch.setenv("VERCEL_BACKGROUND_CONCURRENT_WORKERS", "2")
+    monkeypatch.setattr(background_runner_module, "_refresh_background_seed_cache", lambda: {"requested_exchanges": []})
+    monkeypatch.setattr(
+        background_runner_module,
+        "_build_background_bootstrap_tickers",
+        lambda limit: ["ACME", "BETA", "CHARLIE", "DELTA"][:limit],
+    )
+    monkeypatch.setattr(background_runner_module, "_load_background_seed_tickers", lambda limit: ["ACME", "BETA"])
+    monkeypatch.setattr(background_runner_module, "_safe_tracked_symbol_count", lambda: 7)
+    monkeypatch.setattr(
+        background_runner_module,
+        "run_live_evidence_bootstrap",
+        lambda **kwargs: (captured_bootstrap.append(kwargs), _Result(enabled=True, ran=True, reason=None))[1],
+    )
+    monkeypatch.setattr(
+        background_runner_module,
+        "run_scheduled_learning_maintenance",
+        lambda **kwargs: (captured_maintenance.append(kwargs), _Result(enabled=True, ran=True, reason=None))[1],
+    )
+    monkeypatch.setattr(
+        background_runner_module,
+        "run_full_universe_replay",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("serverless cron must not run full replay")),
+    )
+
+    payload = run_background_learning_cycle(fundamentals_provider=lambda _ticker: {})
+
+    assert captured_bootstrap[0]["tickers"] == ["ACME", "BETA", "CHARLIE"]
+    assert captured_bootstrap[0]["max_tickers"] == 3
+    assert captured_maintenance[0]["max_tickers"] == 2
+    assert payload["replay"] == {"enabled": False, "ran": False, "reason": "disabled"}
+    assert payload["state"]["tracked_symbols"] == 7
+
+
+def test_daily_stats_handles_missing_runner_timestamp(monkeypatch):
+    monkeypatch.setattr(
+        background_runner_module,
+        "read_background_runner_state",
+        lambda: {"last_run_at": None, "requested_tickers": ["ACME"]},
+    )
+    monkeypatch.setattr(background_runner_module, "_RUNNER", None)
+
+    stats = background_runner_module.get_daily_stats()
+
+    assert stats["tickers_processed_today"] == 0
+    assert stats["last_run_at"] is None

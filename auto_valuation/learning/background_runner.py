@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -37,6 +38,55 @@ _SEED_CURSOR_LOCK = threading.Lock()
 _BACKGROUND_SEED_CURSOR = 0
 _EXCHANGE_CURSOR_LOCK = threading.Lock()
 _BACKGROUND_EXCHANGE_CURSOR = 0
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.environ.get(name) or "").strip() or default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _serverless_learning_overrides() -> dict[str, Any]:
+    """Return bounded background-runner settings for serverless cron requests.
+
+    Local/dev runners can use the full high-throughput loop. Vercel requests
+    have a finite function window, so production cron should process the
+    largest batch that can reliably complete and persist state.
+    """
+    if not os.environ.get("VERCEL"):
+        return {}
+    return {
+        "background_runner_bootstrap_max_tickers": _env_int("VERCEL_BACKGROUND_BOOTSTRAP_MAX_TICKERS", 24),
+        "background_runner_maintenance_max_tickers": _env_int("VERCEL_BACKGROUND_MAINTENANCE_MAX_TICKERS", 4),
+        "background_runner_seed_prefix_per_cycle": _env_int("VERCEL_BACKGROUND_SEED_PREFIX_PER_CYCLE", 8),
+        "background_runner_seed_pool_limit": _env_int("VERCEL_BACKGROUND_SEED_POOL_LIMIT", 2000),
+        "background_runner_exchange_refresh_batch": _env_int("VERCEL_BACKGROUND_EXCHANGE_REFRESH_BATCH", 1),
+        "background_runner_exchange_refresh_per_exchange_limit": _env_int(
+            "VERCEL_BACKGROUND_EXCHANGE_REFRESH_PER_EXCHANGE_LIMIT",
+            120,
+        ),
+        "background_runner_concurrent_workers": _env_int("VERCEL_BACKGROUND_CONCURRENT_WORKERS", 8),
+        "background_runner_replay_enabled": False,
+    }
+
+
+class _temporary_learning_config:
+    def __init__(self, overrides: dict[str, Any]) -> None:
+        self.overrides = dict(overrides or {})
+        self.original: dict[str, Any] = {}
+
+    def __enter__(self) -> None:
+        for key, value in self.overrides.items():
+            self.original[key] = LEARNING_CONFIG.get(key)
+            LEARNING_CONFIG[key] = value
+
+    def __exit__(self, *_exc: object) -> None:
+        for key, value in self.original.items():
+            if value is None:
+                LEARNING_CONFIG.pop(key, None)
+            else:
+                LEARNING_CONFIG[key] = value
 
 
 class _TokenBucket:
@@ -449,6 +499,24 @@ def run_background_learning_cycle(
     fundamentals_provider: Callable[[str], dict[str, Any] | None] | None = None,
     state_path: str | Path | None = None,
 ) -> dict[str, Any]:
+    serverless_overrides = _serverless_learning_overrides()
+    if serverless_overrides:
+        with _temporary_learning_config(serverless_overrides):
+            return _run_background_learning_cycle(
+                fundamentals_provider=fundamentals_provider,
+                state_path=state_path,
+            )
+    return _run_background_learning_cycle(
+        fundamentals_provider=fundamentals_provider,
+        state_path=state_path,
+    )
+
+
+def _run_background_learning_cycle(
+    *,
+    fundamentals_provider: Callable[[str], dict[str, Any] | None] | None = None,
+    state_path: str | Path | None = None,
+) -> dict[str, Any]:
     if not bool(LEARNING_CONFIG.get("learning_enabled", True) and LEARNING_CONFIG.get("background_runner_enabled", True)):
         return {
             "enabled": False,
@@ -491,12 +559,15 @@ def run_background_learning_cycle(
     # up to date.  This also primes the in-process get_all_observations() cache
     # so sector/cohort layers have peer data on the next model call.
     # Runs at most once per day (interval_hours=24).
-    replay_interval = int(LEARNING_CONFIG.get("historical_replay_interval_hours", 24))
-    replay = run_full_universe_replay(
-        start_year=int(LEARNING_CONFIG.get("historical_replay_start_year", 2016)),
-        quarterly=True,
-        checkpoint_every=20,
-    ) if _should_run_replay(replay_interval) else {"enabled": True, "ran": False, "reason": "interval"}
+    if bool(LEARNING_CONFIG.get("background_runner_replay_enabled", True)):
+        replay_interval = int(LEARNING_CONFIG.get("historical_replay_interval_hours", 24))
+        replay = run_full_universe_replay(
+            start_year=int(LEARNING_CONFIG.get("historical_replay_start_year", 2016)),
+            quarterly=True,
+            checkpoint_every=20,
+        ) if _should_run_replay(replay_interval) else {"enabled": True, "ran": False, "reason": "interval"}
+    else:
+        replay = {"enabled": False, "ran": False, "reason": "disabled"}
 
     bootstrap_payload = bootstrap.to_dict() if hasattr(bootstrap, "to_dict") else dict(bootstrap)
     maintenance_payload = maintenance.to_dict() if hasattr(maintenance, "to_dict") else dict(maintenance)
@@ -732,7 +803,7 @@ def get_daily_stats() -> dict[str, Any]:
     today = _date.today().isoformat()
     state = read_background_runner_state()
     # Count tickers from last recorded run; reset to 0 if last_run_at is not today
-    last_run = state.get("last_run_at", "")[:10]
+    last_run = str(state.get("last_run_at") or "")[:10]
     if last_run == today:
         tickers = len(state.get("requested_tickers") or [])
     else:
