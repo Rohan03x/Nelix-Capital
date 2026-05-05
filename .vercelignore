@@ -19,9 +19,18 @@ webapp/data/cache/eodhd_ticker_search_*.json
 webapp/data/cache/eodhd_exchange_symbols_*.json
 # All other eodhd_ raw data caches
 webapp/data/cache/eodhd_*.json
+# Peer caches and index (ephemeral, re-fetched per request)
+webapp/data/cache/*_peers.json
+webapp/data/cache/_peer_index.pkl
 # Learning DB and ledger (rebuilt from Supabase at runtime)
+# Use file-type wildcards because Vercel ignores .gitignore when .vercelignore exists
 auto_valuation/learning/db/
 auto_valuation/learning/ledger/
+auto_valuation/learning/data/
+# Large binary/data file types — never needed at runtime in Lambda
+*.db
+*.pkl
+*.jsonl
 overrides/
 
 ADAPTIVE_DCF_PROMPT.md
