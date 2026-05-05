@@ -27,6 +27,8 @@ logs/
 output/
 learning/
 tests/
+api/
+api/**
 
 # Large/ephemeral cache files — excluded from bundle
 # Keep webapp/data/cache/search_shard_*.json and search_exchanges.json in the

@@ -63,3 +63,6 @@ Thumbs.db
 *.swp
 .vercel
 .env*.local
+.python-version
+pyproject.toml
+uv.lock

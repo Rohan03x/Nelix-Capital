@@ -3,7 +3,10 @@
   "builds": [
     {
       "src": "app.py",
-      "use": "@vercel/python"
+      "use": "@vercel/python",
+      "config": {
+        "excludeFiles": "{webapp/data/cache/{eodhd_*.json,*_peers.json,_peer_index.pkl,search_index_prebuilt.json},auto_valuation/learning/{db,ledger}/**,tests/**,*.{xlsx,docx,png}}"
+      }
     },
     {
       "src": "public/**/*",
