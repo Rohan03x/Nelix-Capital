@@ -678,27 +678,32 @@ def hydrate_external_learning_state(*, force: bool = False) -> dict[str, Any]:
         return {"enabled": True, "reason": "cached"}
 
     restored: dict[str, int] = {}
+    errors: dict[str, str] = {}
     with _SYNC_LOCK:
         for namespace, spec in _component_specs().items():
-            if _prefer_object_storage() and _r2_raw_component_sync_enabled():
-                restored_count = _restore_r2_raw_component(namespace, spec, force=force)
-                if restored_count is not None:
-                    restored[namespace] = restored_count
+            try:
+                if _prefer_object_storage() and _r2_raw_component_sync_enabled():
+                    restored_count = _restore_r2_raw_component(namespace, spec, force=force)
+                    if restored_count is not None:
+                        restored[namespace] = restored_count
+                        continue
+                snapshot = load_remote_snapshot(namespace)
+                if not snapshot:
                     continue
-            snapshot = load_remote_snapshot(namespace)
-            if not snapshot:
-                continue
-            if spec["kind"] == "sqlite":
-                restored[namespace] = _restore_sqlite_db(
-                    Path(spec["path"]),
-                    tuple(spec["tables"]),
-                    snapshot,
-                    spec["ensure"],
-                )
-            else:
-                restored[namespace] = _restore_json_file(Path(spec["path"]), snapshot)
+                if spec["kind"] == "sqlite":
+                    restored[namespace] = _restore_sqlite_db(
+                        Path(spec["path"]),
+                        tuple(spec["tables"]),
+                        snapshot,
+                        spec["ensure"],
+                    )
+                else:
+                    restored[namespace] = _restore_json_file(Path(spec["path"]), snapshot)
+            except Exception as exc:
+                errors[namespace] = str(exc)
         _LAST_HYDRATE_AT = time.monotonic()
-    return {"enabled": True, "reason": None, "restored": restored}
+    reason = None if not errors else "partial-failure"
+    return {"enabled": True, "reason": reason, "restored": restored, "errors": errors}
 
 
 def persist_external_learning_state(*, force: bool = False) -> dict[str, Any]:

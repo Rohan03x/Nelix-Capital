@@ -437,10 +437,16 @@ def api_manual_compare():
 
 @app.route("/api/internal/learning/status", methods=["GET"])
 def api_internal_learning_status():
-    # On Vercel (serverless) hydrate from Supabase so counts reflect real data.
-    if os.environ.get("VERCEL"):
-        _sync_external_learning_state()
+    hydrate_force = str(request.args.get("hydrate") or request.args.get("force") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     payload: dict = {}
+    # On Vercel (serverless) hydrate from external storage so counts reflect real data.
+    if os.environ.get("VERCEL"):
+        payload["sync_in"] = _sync_external_learning_state(force=hydrate_force)
     try:
         from auto_valuation.learning.background_runner import (
             read_background_runner_state,
