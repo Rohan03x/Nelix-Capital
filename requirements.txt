@@ -1,16 +1,15 @@
 # ── Data & numerics ───────────────────────────────────────────────────────────
 pandas==2.2.2
 numpy==1.26.4
-scipy==1.13.0
+# scipy and matplotlib are optional — only needed for local chart generation
+# (not used in web/serverless path). Install manually if needed:
+#   pip install scipy==1.13.0 matplotlib==3.9.0
 
 # ── API clients ───────────────────────────────────────────────────────────────
 requests==2.32.3
 
 # ── Excel output ──────────────────────────────────────────────────────────────
 openpyxl==3.1.2
-
-# ── Charts (optional — matplotlib PNG fallback for football field) ────────────
-matplotlib==3.9.0
 
 # ── Configuration & environment ───────────────────────────────────────────────
 python-dotenv==1.0.1
