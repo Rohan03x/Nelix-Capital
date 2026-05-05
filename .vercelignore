@@ -25,10 +25,16 @@ webapp/data/cache/_peer_index.pkl
 # Learning DB and ledger (rebuilt from Supabase at runtime)
 # Use file-type wildcards because Vercel ignores .gitignore when .vercelignore exists
 auto_valuation/learning/db/
+auto_valuation/learning/db/**
 auto_valuation/learning/ledger/
+auto_valuation/learning/ledger/**
 auto_valuation/learning/data/
+auto_valuation/learning/data/**
 # Large binary/data file types — never needed at runtime in Lambda
 *.db
+*.db-*
+*.sqlite
+*.sqlite-*
 *.pkl
 *.jsonl
 overrides/
