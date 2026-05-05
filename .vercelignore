@@ -19,8 +19,9 @@ webapp/data/cache/eodhd_ticker_search_*.json
 webapp/data/cache/eodhd_exchange_symbols_*.json
 # All other eodhd_ raw data caches
 webapp/data/cache/eodhd_*.json
-# Learning DB (rebuilt from Supabase at runtime)
+# Learning DB and ledger (rebuilt from Supabase at runtime)
 auto_valuation/learning/db/
+auto_valuation/learning/ledger/
 overrides/
 
 ADAPTIVE_DCF_PROMPT.md
