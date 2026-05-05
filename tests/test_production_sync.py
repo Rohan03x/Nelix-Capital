@@ -185,6 +185,43 @@ def test_load_remote_snapshot_prefers_r2_over_postgres_when_configured(monkeypat
     assert calls == ["runner_state"]
 
 
+def test_r2_raw_restore_replaces_empty_sqlite_file(monkeypatch, tmp_path):
+    local_db = tmp_path / "local.db"
+    source_db = tmp_path / "source.db"
+    conn = sqlite3.connect(local_db)
+    try:
+        conn.execute("CREATE TABLE sample (id TEXT PRIMARY KEY)")
+        conn.commit()
+    finally:
+        conn.close()
+    conn = sqlite3.connect(source_db)
+    try:
+        conn.execute("CREATE TABLE sample (id TEXT PRIMARY KEY)")
+        conn.execute("INSERT INTO sample(id) VALUES ('one')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    def _download_file(_key, destination):
+        destination.write_bytes(source_db.read_bytes())
+        return True
+
+    monkeypatch.setattr(production_sync, "_r2_raw_component_sync_enabled", lambda: True)
+    monkeypatch.setattr("auto_valuation.learning.r2_store.download_file", _download_file)
+
+    restored = production_sync._restore_r2_raw_component(
+        "sample",
+        {"kind": "sqlite", "path": local_db, "tables": ("sample",), "r2_key": "brain/db/sample.db"},
+    )
+
+    assert restored == 1
+    conn = sqlite3.connect(local_db)
+    try:
+        assert conn.execute("SELECT id FROM sample").fetchall() == [("one",)]
+    finally:
+        conn.close()
+
+
 def test_snapshot_save_falls_back_to_supabase_storage(monkeypatch):
     captured: dict[str, object] = {}
 

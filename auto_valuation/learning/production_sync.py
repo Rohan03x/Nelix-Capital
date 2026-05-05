@@ -533,7 +533,8 @@ def _sqlite_table_count(db_path: Path, tables: tuple[str, ...]) -> int:
     if not db_path.exists():
         return 0
     try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
             available_tables = {
                 str(row[0])
                 for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
@@ -543,6 +544,8 @@ def _sqlite_table_count(db_path: Path, tables: tuple[str, ...]) -> int:
                 for table in tables
                 if table in available_tables
             )
+        finally:
+            conn.close()
     except Exception:
         return 0
 
@@ -594,8 +597,11 @@ def _restore_r2_raw_component(namespace: str, spec: dict[str, Any], *, force: bo
     path = Path(spec["path"])
     if path.exists() and path.stat().st_size > 0 and not force:
         if spec["kind"] == "sqlite":
-            return _sqlite_table_count(path, tuple(spec["tables"]))
-        return 1
+            existing_rows = _sqlite_table_count(path, tuple(spec["tables"]))
+            if existing_rows > 0:
+                return existing_rows
+        else:
+            return 1
     object_key = _r2_component_object_key(namespace, spec)
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="nelix-r2-restore-") as tmp_name:
@@ -604,6 +610,10 @@ def _restore_r2_raw_component(namespace: str, spec: dict[str, Any], *, force: bo
             return None
         if spec["kind"] == "sqlite":
             _remove_sqlite_sidecars(path)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
         os.replace(download_path, path)
     if spec["kind"] == "sqlite":
         return _sqlite_table_count(path, tuple(spec["tables"]))
