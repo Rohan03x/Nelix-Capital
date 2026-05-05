@@ -99,23 +99,31 @@ def _dsn() -> str:
 
 
 def external_learning_enabled() -> bool:
-    return bool(_dsn() or _supabase_storage_config())
+    return bool(_dsn() or _supabase_storage_configs())
+
+
+def _supabase_storage_configs() -> list[dict[str, str]]:
+    url = str(os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
+    if not url:
+        return []
+    bucket = str(os.environ.get("LEARNING_SNAPSHOT_BUCKET") or "learning-state").strip() or "learning-state"
+    keys = [
+        str(os.environ.get("SUPABASE_SECRET_KEY") or "").strip(),
+        str(os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip(),
+    ]
+    configs: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for key in keys:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        configs.append({"url": url, "key": key, "bucket": bucket})
+    return configs
 
 
 def _supabase_storage_config() -> dict[str, str]:
-    url = str(os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
-    key = str(
-        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-        or os.environ.get("SUPABASE_SECRET_KEY")
-        or ""
-    ).strip()
-    if not url or not key:
-        return {}
-    return {
-        "url": url,
-        "key": key,
-        "bucket": str(os.environ.get("LEARNING_SNAPSHOT_BUCKET") or "learning-state").strip() or "learning-state",
-    }
+    configs = _supabase_storage_configs()
+    return configs[0] if configs else {}
 
 
 def _supabase_storage_headers(config: dict[str, str], *, content_type: str | None = None) -> dict[str, str]:
@@ -165,43 +173,53 @@ def _ensure_supabase_storage_bucket(config: dict[str, str]) -> bool:
 def _load_storage_snapshot(namespace: str) -> dict[str, Any] | None:
     import requests
 
-    config = _supabase_storage_config()
-    if not config:
+    configs = _supabase_storage_configs()
+    if not configs:
         return None
     object_name = f"{namespace}.json"
-    response = requests.get(
-        f"{config['url']}/storage/v1/object/{config['bucket']}/{object_name}",
-        headers=_supabase_storage_headers(config),
-        timeout=30,
-    )
-    if response.status_code == 404:
-        return None
-    response.raise_for_status()
-    payload = response.json()
-    return dict(payload or {}) if isinstance(payload, dict) else None
+    errors: list[str] = []
+    for config in configs:
+        response = requests.get(
+            f"{config['url']}/storage/v1/object/{config['bucket']}/{object_name}",
+            headers=_supabase_storage_headers(config),
+            timeout=30,
+        )
+        if response.status_code == 404:
+            return None
+        if response.status_code != 200:
+            errors.append(_storage_error_message(response))
+            continue
+        payload = response.json()
+        return dict(payload or {}) if isinstance(payload, dict) else None
+    if errors:
+        raise RuntimeError(f"Supabase storage snapshot load failed for {namespace}: {'; '.join(errors)}")
+    return None
 
 
 def _save_storage_snapshot(namespace: str, payload: dict[str, Any]) -> bool:
     import requests
 
-    config = _supabase_storage_config()
-    if not config:
+    configs = _supabase_storage_configs()
+    if not configs:
         return False
     encoded = json.dumps(payload, default=str).encode("utf-8")
     object_name = f"{namespace}.json"
-    object_url = f"{config['url']}/storage/v1/object/{config['bucket']}/{object_name}"
-    headers = {
-        **_supabase_storage_headers(config, content_type="application/json"),
-        "x-upsert": "true",
-    }
-    response = requests.post(object_url, headers=headers, data=encoded, timeout=60)
-    body = str(getattr(response, "text", "") or "").lower()
-    if response.status_code in {400, 404} and "bucket" in body:
+    errors: list[str] = []
+    for config in configs:
+        object_url = f"{config['url']}/storage/v1/object/{config['bucket']}/{object_name}"
+        headers = {
+            **_supabase_storage_headers(config, content_type="application/json"),
+            "x-upsert": "true",
+        }
+        response = requests.post(object_url, headers=headers, data=encoded, timeout=60)
+        if response.status_code in {200, 201}:
+            return True
         _ensure_supabase_storage_bucket(config)
         response = requests.post(object_url, headers=headers, data=encoded, timeout=60)
-    if response.status_code not in {200, 201}:
-        raise RuntimeError(f"Supabase storage snapshot save failed for {namespace}: {_storage_error_message(response)}")
-    return True
+        if response.status_code in {200, 201}:
+            return True
+        errors.append(_storage_error_message(response))
+    raise RuntimeError(f"Supabase storage snapshot save failed for {namespace}: {'; '.join(errors)}")
 
 
 def _connect_remote():

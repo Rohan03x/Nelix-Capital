@@ -178,6 +178,33 @@ def test_storage_snapshot_creates_bucket_only_when_missing(monkeypatch):
     ]
 
 
+def test_storage_snapshot_retries_alternate_supabase_key(monkeypatch):
+    auth_headers: list[str] = []
+
+    class Response:
+        def __init__(self, status_code, text="{}", reason="OK"):
+            self.status_code = status_code
+            self.text = text
+            self.reason = reason
+
+    def post(url, headers=None, data=None, json=None, timeout=None):
+        auth_headers.append(headers["Authorization"])
+        return Response(200 if headers["Authorization"] == "Bearer service-role" else 500)
+
+    def get(url, headers=None, timeout=None):
+        return Response(500)
+
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SECRET_KEY", "secret-key")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setattr("requests.post", post)
+    monkeypatch.setattr("requests.get", get)
+
+    assert production_sync._save_storage_snapshot("ledger", {"ok": True}) is True
+    assert "Bearer secret-key" in auth_headers
+    assert "Bearer service-role" in auth_headers
+
+
 def test_api_internal_learning_cron_runs_cycle_and_sync(monkeypatch):
     webapp_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
     monkeypatch.setenv("LEARNING_CRON_SECRET", "secret")
