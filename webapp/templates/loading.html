@@ -68,7 +68,7 @@
     </div>
 
     <div class="loading-cta" id="loadingCta" style="display:none;">
-      <a href="/dashboard/{{ ticker }}" class="btn btn--primary btn--large">
+      <a href="{{ url_for('dashboard', ticker=ticker) }}" class="btn btn--primary btn--large" id="dashboardLink">
         View Dashboard →
       </a>
     </div>
@@ -83,16 +83,42 @@
   const fill         = document.getElementById('progressFill');
   const cta          = document.getElementById('loadingCta');
   const waitMsg      = document.getElementById('waitMsg');
-  const dashboardUrl = '/dashboard/{{ ticker }}';
+  const dashboardLink = document.getElementById('dashboardLink');
+  const dashboardUrl = {{ url_for('dashboard', ticker=ticker)|tojson }};
   const total        = steps.length;
 
   const delays = [120, 200, 160, 140, 220, 300, 350, 400, 450, 250, 200, 350];
 
-  let current   = 0;
-  let animDone  = false;
+  let current       = 0;
+  let animDone      = false;
+  let dashboardHtml = '';
+  let dashboardReady = false;
+  let dashboardError = false;
+  let rendered = false;
+
+  function renderDashboard() {
+    if (rendered) return;
+    rendered = true;
+
+    if (!dashboardHtml) {
+      window.location.assign(dashboardUrl);
+      return;
+    }
+
+    window.history.replaceState(null, '', dashboardUrl);
+    document.open();
+    document.write(dashboardHtml);
+    document.close();
+  }
 
   function tryComplete() {
     if (!animDone) return;
+
+    if (!dashboardReady) {
+      waitMsg.style.display = 'block';
+      fill.style.width = '96%';
+      return;
+    }
 
     var last = steps[total - 1];
     last.classList.remove('active');
@@ -104,9 +130,41 @@
     cta.style.display = 'block';
 
     setTimeout(function() {
-      window.location.assign(dashboardUrl);
-    }, 600);
+      if (!dashboardError) renderDashboard();
+    }, 500);
   }
+
+  dashboardLink.addEventListener('click', function(event) {
+    if (!dashboardReady || dashboardError) return;
+    event.preventDefault();
+    renderDashboard();
+  });
+
+  fetch(dashboardUrl, {
+    credentials: 'same-origin',
+    cache: 'no-store',
+    headers: { 'Accept': 'text/html', 'X-Nelix-Preload': '1' }
+  })
+    .then(function(response) {
+      if (!response.ok) throw new Error('Dashboard request failed');
+      return response.text();
+    })
+    .then(function(html) {
+      dashboardHtml = html;
+      dashboardReady = true;
+      tryComplete();
+    })
+    .catch(function() {
+      dashboardReady = true;
+      dashboardError = true;
+      dashboardLink.textContent = 'Retry Dashboard →';
+      waitMsg.textContent = 'Dashboard build timed out. Try opening it again.';
+      tryComplete();
+    });
+
+  setTimeout(function() {
+    if (!dashboardReady) waitMsg.style.display = 'block';
+  }, 8000);
 
   function advance() {
     if (current > 0) {

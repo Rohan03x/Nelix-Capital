@@ -1167,7 +1167,7 @@ def test_index_renders_company_search_autocomplete():
     assert '<option value="15">15 years</option>' in html
 
 
-def test_loading_page_does_not_fire_duplicate_model_fetches():
+def test_loading_page_preloads_dashboard_once_without_api_duplicate():
     import webapp.app as webapp_module
 
     webapp_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
@@ -1179,6 +1179,8 @@ def test_loading_page_does_not_fire_duplicate_model_fetches():
     assert response.status_code == 200
     assert "/api/snapshot" not in html
     assert "/api/dashboard" not in html
+    assert "fetch(dashboardUrl" in html
+    assert "document.write(dashboardHtml)" in html
 
 
 def test_safe_dashboard_data_passes_requested_history_window(monkeypatch):
