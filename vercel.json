@@ -2,10 +2,6 @@
   "buildCommand": "python build.py",
   "builds": [
     {
-      "src": "api/ticker_search.py",
-      "use": "@vercel/python"
-    },
-    {
       "src": "app.py",
       "use": "@vercel/python"
     },
@@ -17,7 +13,7 @@
   "routes": [
     {
       "src": "^/api/ticker-search$",
-      "dest": "/api/ticker_search.py"
+      "dest": "/app.py"
     },
     {
       "handle": "filesystem"

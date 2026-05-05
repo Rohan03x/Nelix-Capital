@@ -1,12 +1,19 @@
 .venv/
+.vercel/
 .vscode/
 .pytest_cache/
+.damodaran_cache/
+__replay_test__/
 __pycache__/
 .env
 .env.*
 *.env.local
+.python-version
+pyproject.toml
+uv.lock
 logs/
 output/
+learning/
 tests/
 
 # Large/ephemeral cache files — excluded from bundle
