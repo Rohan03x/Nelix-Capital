@@ -99,7 +99,88 @@ def _dsn() -> str:
 
 
 def external_learning_enabled() -> bool:
-    return bool(_dsn())
+    return bool(_dsn() or _supabase_storage_config())
+
+
+def _supabase_storage_config() -> dict[str, str]:
+    url = str(os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
+    key = str(
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("SUPABASE_SECRET_KEY")
+        or ""
+    ).strip()
+    if not url or not key:
+        return {}
+    return {
+        "url": url,
+        "key": key,
+        "bucket": str(os.environ.get("LEARNING_SNAPSHOT_BUCKET") or "learning-state").strip() or "learning-state",
+    }
+
+
+def _supabase_storage_headers(config: dict[str, str], *, content_type: str | None = None) -> dict[str, str]:
+    headers = {
+        "apikey": config["key"],
+        "Authorization": f"Bearer {config['key']}",
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def _ensure_supabase_storage_bucket(config: dict[str, str]) -> None:
+    import requests
+
+    response = requests.post(
+        f"{config['url']}/storage/v1/bucket",
+        headers=_supabase_storage_headers(config, content_type="application/json"),
+        json={"id": config["bucket"], "name": config["bucket"], "public": False},
+        timeout=15,
+    )
+    if response.status_code not in {200, 201, 409}:
+        response.raise_for_status()
+
+
+def _load_storage_snapshot(namespace: str) -> dict[str, Any] | None:
+    import requests
+
+    config = _supabase_storage_config()
+    if not config:
+        return None
+    object_name = f"{namespace}.json"
+    response = requests.get(
+        f"{config['url']}/storage/v1/object/{config['bucket']}/{object_name}",
+        headers=_supabase_storage_headers(config),
+        timeout=30,
+    )
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    payload = response.json()
+    return dict(payload or {}) if isinstance(payload, dict) else None
+
+
+def _save_storage_snapshot(namespace: str, payload: dict[str, Any]) -> bool:
+    import requests
+
+    config = _supabase_storage_config()
+    if not config:
+        return False
+    _ensure_supabase_storage_bucket(config)
+    encoded = json.dumps(payload, default=str).encode("utf-8")
+    object_name = f"{namespace}.json"
+    response = requests.post(
+        f"{config['url']}/storage/v1/object/{config['bucket']}/{object_name}",
+        headers={
+            **_supabase_storage_headers(config, content_type="application/json"),
+            "x-upsert": "true",
+        },
+        data=encoded,
+        timeout=60,
+    )
+    if response.status_code not in {200, 201}:
+        response.raise_for_status()
+    return True
 
 
 def _connect_remote():
@@ -128,43 +209,48 @@ def _ensure_remote_schema(conn: Any) -> None:
 
 
 def load_remote_snapshot(namespace: str) -> dict[str, Any] | None:
-    conn = _connect_remote()
-    if conn is None:
-        return None
-    with conn:
-        _ensure_remote_schema(conn)
-        with conn.cursor() as cursor:
-            cursor.execute(
-                f"SELECT payload_json, updated_at FROM {_SNAPSHOT_TABLE} WHERE namespace = %s",
-                (namespace,),
-            )
-            row = cursor.fetchone()
-    if not row:
-        return None
-    payload = dict(row[0] or {})
-    payload.setdefault("updated_at", row[1].isoformat() if row[1] is not None else None)
-    return payload
+    try:
+        conn = _connect_remote()
+        if conn is not None:
+            with conn:
+                _ensure_remote_schema(conn)
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        f"SELECT payload_json, updated_at FROM {_SNAPSHOT_TABLE} WHERE namespace = %s",
+                        (namespace,),
+                    )
+                    row = cursor.fetchone()
+            if row:
+                payload = dict(row[0] or {})
+                payload.setdefault("updated_at", row[1].isoformat() if row[1] is not None else None)
+                return payload
+    except Exception as exc:
+        logger.warning("Postgres learning snapshot load failed for %s: %s", namespace, exc)
+    return _load_storage_snapshot(namespace)
 
 
 def save_remote_snapshot(namespace: str, payload: dict[str, Any]) -> bool:
-    conn = _connect_remote()
-    if conn is None:
-        return False
-    encoded = json.dumps(payload, default=str)
-    with conn:
-        _ensure_remote_schema(conn)
-        with conn.cursor() as cursor:
-            cursor.execute(
-                f"""
-                INSERT INTO {_SNAPSHOT_TABLE}(namespace, payload_json, updated_at)
-                VALUES (%s, %s::jsonb, NOW())
-                ON CONFLICT(namespace) DO UPDATE
-                SET payload_json = EXCLUDED.payload_json,
-                    updated_at = NOW()
-                """,
-                (namespace, encoded),
-            )
-    return True
+    try:
+        conn = _connect_remote()
+        if conn is not None:
+            encoded = json.dumps(payload, default=str)
+            with conn:
+                _ensure_remote_schema(conn)
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        INSERT INTO {_SNAPSHOT_TABLE}(namespace, payload_json, updated_at)
+                        VALUES (%s, %s::jsonb, NOW())
+                        ON CONFLICT(namespace) DO UPDATE
+                        SET payload_json = EXCLUDED.payload_json,
+                            updated_at = NOW()
+                        """,
+                        (namespace, encoded),
+                    )
+            return True
+    except Exception as exc:
+        logger.warning("Postgres learning snapshot save failed for %s: %s", namespace, exc)
+    return _save_storage_snapshot(namespace, payload)
 
 
 def _snapshot_sqlite_db(db_path: Path, tables: tuple[str, ...]) -> dict[str, Any]:

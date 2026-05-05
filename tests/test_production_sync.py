@@ -86,6 +86,44 @@ def test_component_specs_include_calibration_and_maintenance_state():
     assert specs["maintenance_state"]["path"].name == "maintenance_state.json"
 
 
+def test_external_learning_enabled_with_supabase_storage(monkeypatch):
+    for env_key in production_sync._DSN_ENV_KEYS:
+        monkeypatch.delenv(env_key, raising=False)
+
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+
+    assert production_sync.external_learning_enabled() is True
+
+
+def test_snapshot_save_falls_back_to_supabase_storage(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _raise_connect():
+        raise RuntimeError("db unavailable")
+
+    def _fake_storage_save(namespace, payload):
+        captured["namespace"] = namespace
+        captured["payload"] = payload
+        return True
+
+    monkeypatch.setattr(production_sync, "_connect_remote", _raise_connect)
+    monkeypatch.setattr(production_sync, "_save_storage_snapshot", _fake_storage_save)
+
+    assert production_sync.save_remote_snapshot("runner_state", {"ok": True}) is True
+    assert captured == {"namespace": "runner_state", "payload": {"ok": True}}
+
+
+def test_snapshot_load_falls_back_to_supabase_storage(monkeypatch):
+    def _raise_connect():
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(production_sync, "_connect_remote", _raise_connect)
+    monkeypatch.setattr(production_sync, "_load_storage_snapshot", lambda namespace: {"namespace": namespace})
+
+    assert production_sync.load_remote_snapshot("runner_state") == {"namespace": "runner_state"}
+
+
 def test_api_internal_learning_cron_runs_cycle_and_sync(monkeypatch):
     webapp_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
     monkeypatch.setenv("LEARNING_CRON_SECRET", "secret")
