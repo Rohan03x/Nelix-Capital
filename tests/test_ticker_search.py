@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import importlib.util
+from pathlib import Path
 
 import webapp.data.eodhd_client as eodhd_client
 
@@ -129,6 +131,41 @@ def test_available_exchanges_uses_manifest_without_loading_full_index(tmp_path, 
     assert "KO" in ticker_search.available_exchanges()
 
     ticker_search.available_exchanges.cache_clear()
+
+
+def test_vercel_ticker_search_function_uses_shards(tmp_path, monkeypatch):
+    api_path = Path(__file__).resolve().parents[1] / "api" / "ticker-search" / "index.py"
+    spec = importlib.util.spec_from_file_location("vercel_ticker_search", api_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    shard_item = ticker_search._build_search_item(
+        ticker="LIGHT.AS",
+        code="LIGHT",
+        name="Signify N.V.",
+        exchange="AS",
+        country="Netherlands",
+        source="cache",
+        instrument_type="Common Stock",
+        is_primary=True,
+        has_fundamentals=True,
+    )
+    (tmp_path / "search_shard_s.json").write_text(json.dumps([shard_item]), encoding="utf-8")
+    monkeypatch.setattr(module, "_cache_dir", lambda: tmp_path)
+    module._load_search_shard.cache_clear()
+
+    payload = module.search_tickers_payload("signify", limit=20, exchange="auto")
+
+    assert payload["results"] == [
+        {
+            "ticker": "LIGHT.AS",
+            "code": "LIGHT",
+            "name": "Signify N.V.",
+            "exchange": "AS",
+            "country": "Netherlands",
+        }
+    ]
 
 
 def test_search_tickers_prefers_primary_common_stock_before_aliases_and_non_stocks(monkeypatch):
