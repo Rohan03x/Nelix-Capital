@@ -174,7 +174,9 @@ def _safe_dashboard_data(
 ) -> dict:
     if historical_years is _HISTORICAL_YEARS_UNSET:
         historical_years = _current_historical_years_limit()
-    if mutate_learning:
+    # Always hydrate from remote on Vercel (serverless = fresh empty DBs each request).
+    # On local dev, only hydrate when mutating to avoid redundant round-trips.
+    if mutate_learning or os.environ.get("VERCEL"):
         _sync_external_learning_state()
     try:
         kwargs = {"mutate_learning": mutate_learning, "historical_years": historical_years}
