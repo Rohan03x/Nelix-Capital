@@ -17,4 +17,4 @@ from webapp.app import app
 
 if __name__ == "__main__":
     start_learning_background_runner()
-    app.run(debug=True, port=5000, host="127.0.0.1")
+    app.run(debug=True, port=5000, host="127.0.0.1", use_reloader=False)

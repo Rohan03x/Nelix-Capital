@@ -5809,12 +5809,6 @@
         "pair_manual_compare_hits": 0
       },
       {
-        "peer_ticker": "MOBILEYE",
-        "pair_strength_score": 3.7048,
-        "pair_auto_peer_hits": 0,
-        "pair_manual_compare_hits": 0
-      },
-      {
         "peer_ticker": "UBER",
         "pair_strength_score": 3.7048,
         "pair_auto_peer_hits": 0,
@@ -6469,12 +6463,6 @@
         "pair_strength_score": 1.2512,
         "pair_auto_peer_hits": 0,
         "pair_manual_compare_hits": 0
-      },
-      {
-        "peer_ticker": "ROCHE",
-        "pair_strength_score": 1.2512,
-        "pair_auto_peer_hits": 0,
-        "pair_manual_compare_hits": 0
       }
     ],
     "033170.KQ": [
@@ -6524,12 +6512,6 @@
       },
       {
         "peer_ticker": "PFE",
-        "pair_strength_score": 1.2214,
-        "pair_auto_peer_hits": 0,
-        "pair_manual_compare_hits": 0
-      },
-      {
-        "peer_ticker": "ROCHE",
         "pair_strength_score": 1.2214,
         "pair_auto_peer_hits": 0,
         "pair_manual_compare_hits": 0
@@ -6754,12 +6736,6 @@
       },
       {
         "peer_ticker": "CVX",
-        "pair_strength_score": 1.1916,
-        "pair_auto_peer_hits": 0,
-        "pair_manual_compare_hits": 0
-      },
-      {
-        "peer_ticker": "ENI",
         "pair_strength_score": 1.1916,
         "pair_auto_peer_hits": 0,
         "pair_manual_compare_hits": 0
@@ -7494,12 +7470,6 @@
       },
       {
         "peer_ticker": "PFE",
-        "pair_strength_score": 1.1764,
-        "pair_auto_peer_hits": 0,
-        "pair_manual_compare_hits": 0
-      },
-      {
-        "peer_ticker": "ROCHE",
         "pair_strength_score": 1.1764,
         "pair_auto_peer_hits": 0,
         "pair_manual_compare_hits": 0

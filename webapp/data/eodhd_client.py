@@ -307,8 +307,14 @@ def _historical_ebit_margin_anchor(ebit_margins: list[float], fallback: float) -
     return round(ordered[peak_index], 1)
 
 
+_EODHD_SKIP_CODES = frozenset({402, 403, 404})
+
+
 def _get(endpoint: str, params: dict | None = None) -> Any | None:
-    """HTTP GET against EODHD API. Returns parsed JSON or None on failure."""
+    """HTTP GET against EODHD API. Returns parsed JSON or None on failure.
+    Returns the sentinel string '__skip__' when the API responds with a
+    non-retryable status code (402 Payment Required, 403 Forbidden, 404 Not Found).
+    """
     if not _REQUESTS_OK:
         return None
     p = {"api_token": _api_key(), "fmt": "json", **(params or {})}
@@ -318,6 +324,14 @@ def _get(endpoint: str, params: dict | None = None) -> Any | None:
         r.raise_for_status()
         return r.json()
     except Exception as exc:
+        try:
+            import requests as _rmod
+            if isinstance(exc, _rmod.HTTPError) and exc.response is not None:
+                if exc.response.status_code in _EODHD_SKIP_CODES:
+                    logger.warning("EODHD GET %s failed: %s", endpoint, exc)
+                    return "__skip__"
+        except Exception:
+            pass
         logger.warning("EODHD GET %s failed: %s", endpoint, exc)
         return None
 
@@ -335,16 +349,25 @@ def _fetch_price(eodhd_code: str) -> dict | None:
     return None
 
 
+_FUND_MISS_SENTINEL = "__not_available__"
+
+
 def _fetch_fundamentals(eodhd_code: str) -> dict | None:
-    """Fetch full fundamentals JSON. Returns raw dict or None."""
+    """Fetch full fundamentals JSON. Returns raw dict or None.
+    Failed 402/403/404 responses are cached for 24 h so they are not retried.
+    """
     cache_key = f"fund_{eodhd_code.replace('.','_')}"
     cached = _cache_read(cache_key, _TTL_FUND_SEC)
-    if cached:
+    if cached == _FUND_MISS_SENTINEL:
+        return None
+    if cached and isinstance(cached, dict):
         return cached
     data = _get(f"fundamentals/{eodhd_code}")
     if data and isinstance(data, dict) and data.get("General"):
         _cache_write(cache_key, data, ttl_sec=_TTL_FUND_SEC)
         return data
+    # Cache the miss so this ticker is not retried for 24 h
+    _cache_write(cache_key, _FUND_MISS_SENTINEL, ttl_sec=_TTL_FUND_SEC)
     return None
 
 
@@ -366,6 +389,12 @@ def fetch_historical_price_series(
     cached = _cache_read(cache_key, _TTL_EOD_HISTORY_SEC)
     if isinstance(cached, list):
         return sorted((dict(item) for item in cached if isinstance(item, dict)), key=lambda item: str(item.get("date") or ""))
+
+    try:
+        from auto_valuation.learning.background_runner import _EODHD_RATE_LIMITER
+        _EODHD_RATE_LIMITER.acquire()
+    except Exception:
+        pass
 
     payload = _get(
         f"eod/{eodhd_code}",
@@ -615,6 +644,26 @@ def _get_fx_rate(currency: str) -> float:
 
 # Exchange-suffix normalisation map: external convention → EODHD convention
 _EXCHANGE_SUFFIX_MAP: dict[str, str] = {
+    # US exchange venue codes → EODHD uses .US for all US-listed stocks
+    ".NASDAQ":  ".US",
+    ".NYSE":    ".US",
+    ".NYSEARCA": ".US",
+    ".NYSEAMERICAN": ".US",
+    ".AMEX":    ".US",
+    ".BATS":    ".US",
+    ".CBOE":    ".US",
+    ".OTCMKTS": ".US",
+    ".OTCQB":   ".US",
+    ".OTCQX":   ".US",
+    ".PINK":    ".US",
+    ".NMFQS":   ".US",  # mutual-fund codes; will 404 but correct format
+    # Additional US venue codes with spaces (MIC-based)
+    ".NYSE ARCA":    ".US",
+    ".NYSE MKT":     ".US",
+    ".NYSE AMERICAN": ".US",
+    ".OTCGREY":      ".US",
+    ".OTCCE":        ".US",
+    # Non-US exchange remaps
     ".KS":  ".KO",       # Korea Stock Exchange (Yahoo/Bloomberg) → EODHD
     ".KQ":  ".KQ",       # KOSDAQ stays the same
     ".AX":  ".AU",       # ASX
@@ -626,7 +675,7 @@ _EXCHANGE_SUFFIX_MAP: dict[str, str] = {
     ".MI":  ".MI",       # Borsa Italiana
     ".SW":  ".SW",       # SIX Swiss
     ".HK":  ".HK",       # Hong Kong Exchanges (already correct)
-    ".T":   ".TSE",      # Tokyo Stock Exchange
+    ".TSE": ".T",        # Stored legacy Tokyo suffix → EODHD .T
     ".TO":  ".TO",       # Toronto Stock Exchange
     ".V":   ".V",        # TSX Venture
     ".NZ":  ".NZ",       # New Zealand Exchange

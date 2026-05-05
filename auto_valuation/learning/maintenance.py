@@ -61,7 +61,7 @@ def extract_actuals_from_fundamentals(
     actuals: dict[int, dict[str, Any]] = {}
     prior_actuals: dict[str, Any] | None = None
     for year in sorted(set(income_by_year) | set(cash_flow_by_year) | set(balance_sheet_by_year)):
-        income_dict = dict(income_by_year[year] or {})
+        income_dict = dict(income_by_year.get(year) or {})
         cash_flow = dict(cash_flow_by_year.get(year) or {})
         balance_sheet = dict(balance_sheet_by_year.get(year) or {})
 

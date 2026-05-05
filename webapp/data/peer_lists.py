@@ -97,7 +97,7 @@ MULTI_SEGMENT_PEERS: dict[str, dict[str, list[str]]] = {
     "TSLA": {
         "EVs / Autos":            ["NIO", "RIVN", "GM", "F", "TM", "STLA"],
         "Energy / Storage":       ["ENPH", "SEDG", "NEE"],
-        "Autonomy / Software":    ["MOBILEYE", "UBER", "GOOGL"],
+        "Autonomy / Software":    ["UBER", "GOOGL", "AMZN"],
     },
 }
 
@@ -132,7 +132,7 @@ INDUSTRY_PEER_MAP: dict[str, list[str]] = {
     "Information Technology Services": ["INFY", "WIT", "ACN", "IBM", "CTSH", "TCS"],
     "Computer Hardware":          ["AAPL", "HPQ", "DELL", "HPE", "NTAP", "PSTG"],
     # Healthcare
-    "Drug Manufacturers—General": ["JNJ", "PFE", "MRK", "ABBV", "BMY", "LLY", "NVO", "ROCHE"],
+    "Drug Manufacturers—General": ["JNJ", "PFE", "MRK", "ABBV", "BMY", "LLY", "NVO", "ROG.SW"],
     "Drug Manufacturers—Specialty & Generic": ["AMGN", "GILD", "BIIB", "REGN", "VRTX"],
     "Medical Devices":            ["MDT", "ABT", "BSX", "SYK", "ZBH", "BDX", "EW", "ISRG"],
     "Healthcare Plans":           ["UNH", "CVS", "CI", "HUM", "CNC", "MOH", "ELV"],
@@ -148,7 +148,7 @@ INDUSTRY_PEER_MAP: dict[str, list[str]] = {
     "Capital Markets":            ["GS", "MS", "JPM", "C", "BX", "KKR", "APO"],
     "Credit Services":            ["V", "MA", "AXP", "DFS", "COF", "SYF"],
     # Energy
-    "Oil & Gas—Integrated":       ["XOM", "CVX", "SHEL", "BP", "TTE", "ENI"],
+    "Oil & Gas—Integrated":       ["XOM", "CVX", "SHEL", "BP", "TTE"],
     "Oil & Gas—E&P":              ["COP", "EOG", "PXD", "DVN", "MRO", "HES", "APA"],
     "Oil & Gas—Refining":         ["PSX", "MPC", "VLO", "PBF", "HFC"],
     "Oil & Gas—Midstream":        ["ET", "EPD", "WMB", "KMI", "OKE", "MPLX"],

@@ -66,11 +66,11 @@ class _TokenBucket:
 
 
 # EODHD paid plan: 100,000 req/day; tested ceiling ~19 req/sec at 100 concurrent.
-# 18 req/sec with burst=32 comfortably supports 16 concurrent workers.
-_EODHD_RATE_LIMITER = _TokenBucket(rate=18.0, capacity=32.0)
+# 19 req/sec with burst=40 supports 32 concurrent workers (cache hits bypass limiter).
+_EODHD_RATE_LIMITER = _TokenBucket(rate=19.0, capacity=40.0)
 
 # Number of concurrent workers for parallel fundamentals pre-fetching.
-_CONCURRENT_WORKERS: int = 16
+_CONCURRENT_WORKERS: int = 32
 
 
 def _default_fundamentals_provider(ticker: str) -> dict[str, Any] | None:
@@ -104,11 +104,14 @@ def _prefetch_fundamentals_parallel(
     Returns a ticker→data mapping.  As a side-effect, each successful fetch
     also writes to the on-disk cache so subsequent provider calls are instant
     cache hits (no API call or rate-limit wait).
+    Failed tickers are recorded as unavailable so they are excluded from the
+    seed pool for the next 72 hours.
     """
     if not tickers:
         return {}
     workers = max(1, min(int(max_workers), _CONCURRENT_WORKERS))
     results: dict[str, dict[str, Any]] = {}
+    failed: list[str] = []
     lock = threading.Lock()
 
     def _fetch(ticker: str) -> None:
@@ -116,9 +119,21 @@ def _prefetch_fundamentals_parallel(
         if isinstance(data, dict) and data:
             with lock:
                 results[ticker.upper()] = data
+        else:
+            with lock:
+                failed.append(ticker.upper())
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bg-fund") as pool:
         list(pool.map(_fetch, tickers))
+
+    if failed:
+        try:
+            from webapp.data.ticker_search import record_seed_symbol_health
+            for ticker in failed:
+                record_seed_symbol_health(ticker, available=False, source="prefetch-unavailable")
+        except Exception:
+            pass
+
     return results
 
 
