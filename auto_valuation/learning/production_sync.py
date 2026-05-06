@@ -602,7 +602,7 @@ def _restore_r2_raw_component(namespace: str, spec: dict[str, Any], *, force: bo
     from .r2_store import download_file
 
     path = Path(spec["path"])
-    if path.exists() and path.stat().st_size > 0 and not force:
+    if path.exists() and path.stat().st_size > 0 and not force and not _serverless_runtime():
         if spec["kind"] == "sqlite":
             existing_rows = _sqlite_table_count(path, tuple(spec["tables"]))
             if existing_rows > 0:
