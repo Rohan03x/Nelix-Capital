@@ -1072,8 +1072,31 @@ def _ledger_evidence_summary(ticker: str) -> dict[str, Any]:
             "prediction_records": len(predictions),
             "source": "ledger-readonly",
         }
-    except Exception as exc:
-        return {"enabled": False, "matured_records": 0, "updated_records": 0, "reason": str(exc)}
+    except Exception:
+        pass
+
+    # Fallback: use seeded ledger summary bundled at deploy time
+    try:
+        from auto_valuation.learning.deployment_seed import seeded_ledger_evidence
+
+        ticker_upper = str(ticker or "").upper()
+        summary = seeded_ledger_evidence(ticker_upper)
+        if summary:
+            return {
+                "enabled": True,
+                "matured_records": int(summary.get("matured_records") or 0),
+                "updated_records": 0,
+                "total_realized_records": int(summary.get("matured_records") or 0),
+                "complete_realized_records": int(summary.get("matured_records") or 0),
+                "partial_realized_records": 0,
+                "postmortem_records": 0,
+                "prediction_records": int(summary.get("prediction_records") or 0),
+                "source": "deployment-ledger-summary",
+            }
+    except Exception:
+        pass
+
+    return {"enabled": False, "matured_records": 0, "updated_records": 0, "reason": "ledger-unavailable"}
 
 
 def _historical_replay_evidence_summary(ticker: str) -> dict[str, Any]:

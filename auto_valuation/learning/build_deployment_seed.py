@@ -155,6 +155,38 @@ def _peer_relationships(limit: int) -> dict[str, list[dict[str, Any]]]:
     return grouped
 
 
+def _ledger_evidence_summary() -> dict[str, dict[str, Any]]:
+    """Build per-ticker realized evidence counts from the local prediction ledger."""
+    try:
+        from auto_valuation.learning.ledger import LedgerReader
+
+        reader = LedgerReader()
+        records = reader.query()
+    except Exception:
+        return {}
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for record in records:
+        ticker = str(getattr(record, "ticker", None) or "").strip().upper()
+        if not ticker:
+            continue
+        row = grouped.setdefault(ticker, {"prediction_records": 0, "matured_records": 0})
+        row["prediction_records"] += 1
+        has_actual = any(
+            getattr(record, field, None) is not None
+            for field in (
+                "actual_revenue_mm",
+                "actual_ebit_margin",
+                "actual_ufcf_mm",
+                "actual_ev_mm",
+                "actual_price_at_horizon",
+            )
+        )
+        if has_actual:
+            row["matured_records"] += 1
+    return grouped
+
+
 def _manual_compares(limit: int) -> dict[str, list[dict[str, Any]]]:
     from auto_valuation.learning.discovery import DiscoveryStore
 
@@ -178,10 +210,12 @@ def build_deployment_seed(
     cohort = _learning_cohort(cohort_limit)
     analogs = _analog_observations(analog_limit)
     replay_summary = _historical_replay_summary()
+    ledger_summary = _safe_call({}, _ledger_evidence_summary)
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "cohort_observations": cohort,
         "historical_replay_summary": replay_summary,
+        "ledger_evidence_summary": ledger_summary,
         "analog_observations": analogs,
         "universe_summary": _safe_call({}, _universe_summary),
         "background_runner_state": _safe_call({}, read_background_runner_state),
@@ -193,6 +227,7 @@ def build_deployment_seed(
             "historical_replay_symbols": len(replay_summary),
             "historical_replay_observations": sum(int(item.get("records") or 0) for item in replay_summary.values()),
             "analog_observations": len(analogs),
+            "ledger_evidence_tickers": len(ledger_summary),
         },
     }
     return _jsonable(payload)

@@ -46,7 +46,12 @@ def historical_replay_summary(subject_ticker: str | None = None) -> dict[str, An
     if not isinstance(payload, dict):
         return {}
     if subject_ticker:
-        item = payload.get(str(subject_ticker or "").strip().upper()) or {}
+        key = str(subject_ticker or "").strip().upper()
+        item = payload.get(key) or {}
+        if not item and "." in key:
+            # Fallback: US stocks are stored without the exchange suffix (e.g. "NKE.US" -> "NKE")
+            base_key = key.split(".")[0]
+            item = payload.get(base_key) or {}
         return dict(item) if isinstance(item, dict) else {}
     return {str(key): dict(value) for key, value in payload.items() if isinstance(value, dict)}
 
@@ -157,6 +162,21 @@ def manual_compare_items(subject_ticker: str | None = None, limit: int | None = 
     if limit is not None and int(limit) > 0:
         items = items[: int(limit)]
     return [dict(item) for item in items if isinstance(item, dict)]
+
+
+def seeded_ledger_evidence(subject_ticker: str | None = None) -> dict[str, Any]:
+    """Return the seeded ledger back-test counts for a ticker (or all tickers if None)."""
+    payload = _load_seed_payload().get("ledger_evidence_summary") or {}
+    if not isinstance(payload, dict):
+        return {}
+    if subject_ticker:
+        key = str(subject_ticker or "").strip().upper()
+        item = payload.get(key) or {}
+        if not item and "." in key:
+            base_key = key.split(".")[0]
+            item = payload.get(base_key) or {}
+        return dict(item) if isinstance(item, dict) else {}
+    return {str(k): dict(v) for k, v in payload.items() if isinstance(v, dict)}
 
 
 def seed_summary() -> dict[str, Any]:
