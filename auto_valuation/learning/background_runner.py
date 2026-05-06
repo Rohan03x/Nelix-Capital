@@ -759,6 +759,16 @@ def _run_background_learning_cycle(
             "ran": bool(maintenance_payload.get("ran")),
             "reason": maintenance_payload.get("reason"),
         },
+        "replay": {
+            "ran": bool(replay.get("ran")),
+            "reason": replay.get("reason"),
+        },
+        "cagr_train": {
+            "ran": bool(cagr_train_result.get("ran")),
+            "reason": cagr_train_result.get("reason"),
+            "total_samples": cagr_train_result.get("total_samples"),
+            "sample_counts": cagr_train_result.get("sample_counts"),
+        },
     }
     _write_background_runner_state(state_payload, state_path)
     return {
