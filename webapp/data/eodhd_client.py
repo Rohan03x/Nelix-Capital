@@ -1733,12 +1733,26 @@ def _global_universe_summary(universe_store: Any | None) -> dict[str, Any]:
     except Exception:
         seed_pool_size = 0
 
+    def _reconcile_background_runner_state(state: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
+        runner_state = dict(state or {})
+        live_tracked = int(summary.get("tracked_symbols") or 0)
+        state_tracked = int(runner_state.get("tracked_symbols") or 0)
+        if live_tracked > 0 and (state_tracked <= 0 or state_tracked < max(12, live_tracked // 10)):
+            runner_state["tracked_symbols"] = live_tracked
+            runner_state["seed_pool_size"] = max(int(runner_state.get("seed_pool_size") or 0), seed_pool_size)
+            runner_state["state_reconciled"] = True
+            runner_state["reconciled_reason"] = "runner-state-lower-than-live-universe"
+            if state_tracked and state_tracked < 12:
+                runner_state["requested_tickers"] = []
+                runner_state["bootstrap"] = {**dict(runner_state.get("bootstrap") or {}), "requested_tickers": []}
+        return runner_state
+
     snapshot_payload = {
         **(snapshot_summary or {}),
         "background_target_symbols": seed_target,
         "background_seed_prefix_per_cycle": seed_prefix,
         "background_seed_pool_size": seed_pool_size,
-        "background_runner": background_runner_state,
+        "background_runner": _reconcile_background_runner_state(background_runner_state, snapshot_summary or {}),
     }
 
     if universe_store is None:
@@ -1763,7 +1777,7 @@ def _global_universe_summary(universe_store: Any | None) -> dict[str, Any]:
         }
 
     try:
-        live_summary = {
+        live_summary_base = {
             "enabled": True,
             **universe_store.summary(
                 stale_after_hours=int(LEARNING_CONFIG.get("symbol_universe_bootstrap_interval_hours", 18)),
@@ -1772,7 +1786,10 @@ def _global_universe_summary(universe_store: Any | None) -> dict[str, Any]:
             "background_target_symbols": seed_target,
             "background_seed_prefix_per_cycle": seed_prefix,
             "background_seed_pool_size": seed_pool_size,
-            "background_runner": background_runner_state,
+        }
+        live_summary = {
+            **live_summary_base,
+            "background_runner": _reconcile_background_runner_state(background_runner_state, live_summary_base),
         }
         if int(live_summary.get("tracked_symbols") or 0) > 0 or not snapshot_summary:
             return live_summary

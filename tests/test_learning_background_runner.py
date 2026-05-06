@@ -120,7 +120,7 @@ def test_live_evidence_bootstrap_can_throttle_independently(tmp_path):
     assert result.maintenance_run_id == "bootstrap-1"
 
 
-def test_background_cycle_runs_bootstrap_and_maintenance(monkeypatch):
+def test_background_cycle_runs_bootstrap_and_maintenance(monkeypatch, tmp_path):
     calls: list[str] = []
 
     class _Result:
@@ -145,7 +145,10 @@ def test_background_cycle_runs_bootstrap_and_maintenance(monkeypatch):
     monkeypatch.setattr(background_runner_module, "_load_background_seed_tickers", lambda limit: [])
     monkeypatch.setitem(background_runner_module.LEARNING_CONFIG, "background_runner_replay_enabled", False)
 
-    payload = run_background_learning_cycle(fundamentals_provider=lambda _ticker: {})
+    payload = run_background_learning_cycle(
+        fundamentals_provider=lambda _ticker: {},
+        state_path=tmp_path / "background-cycle.json",
+    )
 
     assert calls == ["bootstrap", "maintenance"]
     assert payload["enabled"] is True
@@ -182,7 +185,7 @@ def test_background_cycle_returns_skipped_payload_for_sqlite_lock(monkeypatch):
     assert "database is locked" in payload["error"]
 
 
-def test_background_cycle_reserves_rotating_seed_slots(monkeypatch):
+def test_background_cycle_reserves_rotating_seed_slots(monkeypatch, tmp_path):
     captured: list[dict[str, object]] = []
 
     class _Result:
@@ -214,8 +217,9 @@ def test_background_cycle_reserves_rotating_seed_slots(monkeypatch):
         lambda **kwargs: _Result(enabled=True, ran=True, reason=None),
     )
 
-    first = run_background_learning_cycle(fundamentals_provider=lambda _ticker: {})
-    second = run_background_learning_cycle(fundamentals_provider=lambda _ticker: {})
+    state_path = tmp_path / "rotating-seed-state.json"
+    first = run_background_learning_cycle(fundamentals_provider=lambda _ticker: {}, state_path=state_path)
+    second = run_background_learning_cycle(fundamentals_provider=lambda _ticker: {}, state_path=state_path)
 
     assert captured[0]["tickers"][:4] == ["PRI1", "PRI2", "PRI3", "PRI4"]
     assert captured[0]["tickers"][4:] == ["SEED1", "SEED2"]
@@ -276,7 +280,7 @@ def test_background_cycle_persists_exchange_refresh_state(tmp_path, monkeypatch)
     assert saved_state["tracked_symbols"] == 42
 
 
-def test_background_cycle_uses_bounded_serverless_batch(monkeypatch):
+def test_background_cycle_uses_bounded_serverless_batch(monkeypatch, tmp_path):
     captured_bootstrap: list[dict[str, object]] = []
     captured_maintenance: list[dict[str, object]] = []
 
@@ -315,7 +319,10 @@ def test_background_cycle_uses_bounded_serverless_batch(monkeypatch):
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("serverless cron must not run full replay")),
     )
 
-    payload = run_background_learning_cycle(fundamentals_provider=lambda _ticker: {})
+    payload = run_background_learning_cycle(
+        fundamentals_provider=lambda _ticker: {},
+        state_path=tmp_path / "serverless_background_state.json",
+    )
 
     assert captured_bootstrap[0]["tickers"] == ["ACME", "BETA", "CHARLIE"]
     assert captured_bootstrap[0]["max_tickers"] == 3
