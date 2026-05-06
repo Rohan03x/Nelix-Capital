@@ -503,6 +503,10 @@ def _build_background_bootstrap_tickers(max_tickers: int) -> list[str]:
 _LAST_REPLAY_TS: float = 0.0
 # Timestamp of the last CAGR model training run (Layer F Tier 2).
 _LAST_CAGR_TRAIN_TS: float = 0.0
+# Timestamp of the last scenario labeling run.
+_LAST_SCENARIO_LABEL_TS: float = 0.0
+# Timestamp of the last scenario prior build.
+_LAST_SCENARIO_PRIOR_TS: float = 0.0
 
 
 def _should_run_replay(interval_hours: int) -> bool:
@@ -523,6 +527,74 @@ def _should_train_cagr_models(interval_hours: int) -> bool:
         _LAST_CAGR_TRAIN_TS = _time.monotonic()
         return True
     return False
+
+
+def _should_run_scenario_labeling(interval_hours: int) -> bool:
+    """Return True if scenario labeling hasn't run within *interval_hours*."""
+    global _LAST_SCENARIO_LABEL_TS  # noqa: PLW0603
+    import time as _time
+    if _time.monotonic() - _LAST_SCENARIO_LABEL_TS >= interval_hours * 3600:
+        _LAST_SCENARIO_LABEL_TS = _time.monotonic()
+        return True
+    return False
+
+
+def _should_run_scenario_priors(interval_hours: int) -> bool:
+    """Return True if scenario prior building hasn't run within *interval_hours*."""
+    global _LAST_SCENARIO_PRIOR_TS  # noqa: PLW0603
+    import time as _time
+    if _time.monotonic() - _LAST_SCENARIO_PRIOR_TS >= interval_hours * 3600:
+        _LAST_SCENARIO_PRIOR_TS = _time.monotonic()
+        return True
+    return False
+
+
+def _run_scenario_labeling() -> dict[str, Any]:
+    """
+    Label matured scenario outcome records (quarterly + annual).
+
+    Uses a lightweight price fetcher backed by the EODHD cache.  Records that
+    cannot be priced are skipped silently — they will be retried next cycle.
+    """
+    try:
+        from auto_valuation.learning.scenario_calibrator import label_matured_outcomes
+
+        def _price_fetcher(ticker: str) -> float | None:
+            """Try to get a recent price from the EODHD fundamentals cache."""
+            try:
+                from webapp.data.cache import FundamentalsCache
+                cache = FundamentalsCache()
+                cached = cache.get(ticker)
+                if cached and isinstance(cached, dict):
+                    price = float(cached.get("price") or 0)
+                    return price if price > 0 else None
+            except Exception:
+                pass
+            return None
+
+        result = label_matured_outcomes(
+            _price_fetcher,
+            max_labels=int(LEARNING_CONFIG.get("scenario_label_max_per_cycle", 100)),
+        )
+        result["ran"] = True
+        return result
+    except Exception as exc:
+        logger.warning("Scenario labeling failed: %s", exc)
+        return {"ran": False, "reason": str(exc)}
+
+
+def _run_scenario_prior_build() -> dict[str, Any]:
+    """Rebuild scenario calibration priors from all labeled outcomes."""
+    try:
+        from auto_valuation.learning.scenario_calibrator import build_scenario_priors
+        result = build_scenario_priors(
+            min_observations=int(LEARNING_CONFIG.get("scenario_prior_min_observations", 10)),
+        )
+        result["ran"] = True
+        return result
+    except Exception as exc:
+        logger.warning("Scenario prior build failed: %s", exc)
+        return {"ran": False, "reason": str(exc)}
 
 
 def _train_cagr_models_from_ledger() -> dict[str, Any]:
@@ -728,6 +800,21 @@ def _run_background_learning_cycle(
     else:
         cagr_train_result = {"ran": False, "reason": "interval", "sample_counts": {}}
 
+    # Scenario calibration — label matured predictions and rebuild priors.
+    # Labeling: every 6 h so we quickly pick up outcomes as horizons expire.
+    # Prior build: every 12 h (cheap aggregation from labeled rows).
+    scenario_label_interval = int(LEARNING_CONFIG.get("scenario_label_interval_hours", 6))
+    if _should_run_scenario_labeling(scenario_label_interval):
+        scenario_label_result = _run_scenario_labeling()
+    else:
+        scenario_label_result = {"ran": False, "reason": "interval"}
+
+    scenario_prior_interval = int(LEARNING_CONFIG.get("scenario_prior_interval_hours", 12))
+    if _should_run_scenario_priors(scenario_prior_interval):
+        scenario_prior_result = _run_scenario_prior_build()
+    else:
+        scenario_prior_result = {"ran": False, "reason": "interval"}
+
     bootstrap_payload = bootstrap.to_dict() if hasattr(bootstrap, "to_dict") else dict(bootstrap)
     maintenance_payload = maintenance.to_dict() if hasattr(maintenance, "to_dict") else dict(maintenance)
     bootstrap_payload.setdefault("requested_tickers", bootstrap_tickers)
@@ -769,6 +856,17 @@ def _run_background_learning_cycle(
             "total_samples": cagr_train_result.get("total_samples"),
             "sample_counts": cagr_train_result.get("sample_counts"),
         },
+        "scenario_label": {
+            "ran": bool(scenario_label_result.get("ran")),
+            "reason": scenario_label_result.get("reason"),
+            "quarterly_labeled": scenario_label_result.get("quarterly_labeled"),
+            "annual_labeled": scenario_label_result.get("annual_labeled"),
+        },
+        "scenario_priors": {
+            "ran": bool(scenario_prior_result.get("ran")),
+            "reason": scenario_prior_result.get("reason"),
+            "cohorts_updated": scenario_prior_result.get("cohorts_updated"),
+        },
     }
     _write_background_runner_state(state_payload, state_path)
     return {
@@ -778,6 +876,8 @@ def _run_background_learning_cycle(
         "maintenance": maintenance_payload,
         "replay": replay,
         "cagr_train": cagr_train_result,
+        "scenario_label": scenario_label_result,
+        "scenario_priors": scenario_prior_result,
         "seed_refresh": seed_refresh,
         "state": state_payload,
     }

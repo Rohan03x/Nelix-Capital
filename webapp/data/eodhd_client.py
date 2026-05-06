@@ -3967,6 +3967,50 @@ def build_dashboard_data(
             )
             _result["knowledge_model"] = knowledge_model_payload
 
+        # ── Scenario outcome recording (fire-and-forget) ──────────────────
+        if mutate_learning:
+            try:
+                from auto_valuation.learning.scenario_calibrator import record_scenario_prediction
+                _km_tg_layer = dict(
+                    (dict(knowledge_model_payload or {}).get("layered_learning") or {}).get("terminal_growth") or {}
+                )
+                _sc_revenue_regime = str(_km_tg_layer.get("revenue_regime") or "stable")
+                _sc_macro_regime = _macro_regime_from_rf(float(rf_rate) / 100)
+                _sc_mkt_cap_regime = str((knowledge_model_payload or {}).get("market_cap_regime") or "mid_cap")
+                _sc_scenarios = _result.get("scenarios") or {}
+                _sc_base = _sc_scenarios.get("base") or {}
+                _sc_bull = _sc_scenarios.get("bull") or {}
+                _sc_bear = _sc_scenarios.get("bear") or {}
+                record_scenario_prediction(
+                    ticker=ticker,
+                    base_iv=float(_sc_base.get("iv") or iv),
+                    bull_iv=float(_sc_bull.get("iv") or bull_iv),
+                    bear_iv=float(_sc_bear.get("iv") or bear_iv),
+                    base_g=float(_sc_base.get("g") or terminal_growth),
+                    bull_g=float(_sc_bull.get("g") or bull_g),
+                    bear_g=float(_sc_bear.get("g") or bear_g),
+                    base_wacc=float(_sc_base.get("wacc") or wacc),
+                    bull_wacc=float(_sc_bull.get("wacc") or bull_wacc),
+                    bear_wacc=float(_sc_bear.get("wacc") or bear_wacc),
+                    base_rev_growth=float(_sc_base.get("rev_growth") or revenue_growth_near),
+                    bull_rev_growth=float(_sc_bull.get("rev_growth") or bull_growth),
+                    bear_rev_growth=float(_sc_bear.get("rev_growth") or bear_growth),
+                    base_margin=float(_sc_base.get("margin_target") or ebit_margin_target),
+                    bull_margin=float(_sc_bull.get("margin_target") or bull_margin),
+                    bear_margin=float(_sc_bear.get("margin_target") or bear_margin),
+                    base_probability=float(_sc_base.get("probability") or base_probability),
+                    bull_probability=float(_sc_bull.get("probability") or bull_probability),
+                    bear_probability=float(_sc_bear.get("probability") or bear_probability),
+                    price_at_prediction=float(price),
+                    sector=str(sector),
+                    industry=str(industry),
+                    macro_regime=_sc_macro_regime,
+                    revenue_regime=_sc_revenue_regime,
+                    market_cap_regime=_sc_mkt_cap_regime,
+                )
+            except Exception as _sc_exc:
+                logger.debug("scenario_calibrator record failed for %s: %s", ticker, _sc_exc)
+
         return _result
 
     except Exception as exc:

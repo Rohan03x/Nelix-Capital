@@ -2858,6 +2858,44 @@ def refine_live_assumptions(
     )
     explainability["memory_hierarchy"] = memory_hierarchy
 
+    # ── Scenario calibration prior (quarterly + annual) ───────────────────
+    # Load the learned P(bear/base/bull) for this cohort from scenario_outcomes.db.
+    # When enough observations exist (≥10), we blend the learned width_adj into
+    # the existing scenario_width_multiplier so predictions are calibrated.
+    _scenario_prior_q = None
+    _scenario_prior_a = None
+    _raw_swm = float(uncertainty.get("scenario_width_multiplier") or margin_normalisation["scenario_width_multiplier"])
+    _calibrated_swm = _raw_swm
+    try:
+        from auto_valuation.learning.scenario_calibrator import get_scenario_prior
+        _scenario_prior_q = get_scenario_prior(
+            sector=sector,
+            industry=industry,
+            macro_regime=current_macro_regime,
+            revenue_regime=_revenue_regime,
+            market_cap_regime=market_cap_regime,
+            horizon="quarterly",
+        )
+        _scenario_prior_a = get_scenario_prior(
+            sector=sector,
+            industry=industry,
+            macro_regime=current_macro_regime,
+            revenue_regime=_revenue_regime,
+            market_cap_regime=market_cap_regime,
+            horizon="annual",
+        )
+        # Blend quarterly and annual width adjustments (annual weighted more)
+        if _scenario_prior_q.confident or _scenario_prior_a.confident:
+            _blend_q = _scenario_prior_q.scenario_width_adj if _scenario_prior_q.confident else 1.0
+            _blend_a = _scenario_prior_a.scenario_width_adj if _scenario_prior_a.confident else 1.0
+            _learned_width_adj = _blend_q * 0.35 + _blend_a * 0.65
+            # Blend into existing multiplier: 20% learned signal, 80% original
+            _calibrated_swm = round(
+                _clamp(_raw_swm * 0.80 + _raw_swm * _learned_width_adj * 0.20, 1.0, 3.0), 2
+            )
+    except Exception:
+        pass
+
     return {
         "summary": summary,
         "review_cadence_years": 5,
@@ -2888,7 +2926,13 @@ def refine_live_assumptions(
         "margin_guardrail": margin_guardrail,
         "stable_margin_floor_guardrail": stable_margin_floor_guardrail,
         "regime_guardrail": regime_guardrail,
-        "scenario_width_multiplier": float(uncertainty.get("scenario_width_multiplier") or margin_normalisation["scenario_width_multiplier"]),
+        "scenario_width_multiplier": _calibrated_swm,
+        "scenario_calibration_prior": {
+            "quarterly": _scenario_prior_q.to_dict() if _scenario_prior_q else None,
+            "annual": _scenario_prior_a.to_dict() if _scenario_prior_a else None,
+            "raw_scenario_width_multiplier": round(_raw_swm, 2),
+            "calibrated_scenario_width_multiplier": _calibrated_swm,
+        },
         "confidence_model": confidence_model,
         "calibration_diagnostics": calibrated.calibration_diagnostics.to_dict() if getattr(calibrated, "calibration_diagnostics", None) else {},
         "explainability": explainability,

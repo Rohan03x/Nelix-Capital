@@ -537,6 +537,12 @@ def api_internal_learning_status():
     except Exception as exc:
         payload["performance"] = {"error": str(exc)}
 
+    try:
+        from auto_valuation.learning.scenario_calibrator import get_scenario_calibration_summary
+        payload["scenario_calibration"] = get_scenario_calibration_summary()
+    except Exception as exc:
+        payload["scenario_calibration"] = {"error": str(exc)}
+
     return jsonify({"ok": True, **payload})
 
 
