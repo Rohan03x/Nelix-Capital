@@ -2991,6 +2991,28 @@ def build_dashboard_data(
         dio  = round(inventory     / cogs * 365, 1)         if inventory > 0 and cogs > 0 else 60.0
         dpo  = round(accounts_pay  / cogs * 365, 1)         if accounts_pay > 0 and cogs > 0 else 40.0
 
+        # Pre-DCF market-implied G: using EV = market_cap + net_debt and a rough
+        # UFCF estimate from base-year income + balance sheet data.
+        # Gordon Growth rearranged: g = (EV*wacc - UFCF) / (EV + UFCF)
+        # This is a better signal than market_cap-only because it accounts for
+        # leverage, which is critical for capital-heavy declining businesses.
+        _pre_mig: float | None = None
+        try:
+            _ev_pre = market_cap + max(0.0, net_debt)   # avoid negative EV
+            _ufcf_est = (
+                revenue_base * ebit_margin_base_pct / 100.0 * (1.0 - tax_rate_pct / 100.0)
+                + da_pct / 100.0 * revenue_base
+                - capex_pct / 100.0 * revenue_base
+                - sbc_pct / 100.0 * revenue_base
+            )
+            _wacc_pre = wacc / 100.0
+            _denom_pre = _ev_pre + _ufcf_est
+            if _ev_pre > 0 and abs(_denom_pre) > 1e-6:
+                _pre_mig_raw = (_ev_pre * _wacc_pre - _ufcf_est) / _denom_pre
+                _pre_mig = max(-0.10, min(_pre_mig_raw, _wacc_pre - 0.005))
+        except Exception:
+            _pre_mig = None
+
         knowledge_model_payload: dict[str, Any] | None = None
         scenario_width_multiplier = 1.0
         try:
@@ -3033,6 +3055,11 @@ def build_dashboard_data(
                 dso=dso,
                 dio=dio,
                 dpo=dpo,
+                # Layer C/D/E — pre-DCF market-implied G from EV + UFCF estimate.
+                # Only passed as a signal when the estimate is NEGATIVE (i.e., company
+                # is trading at < 1/WACC FCF yield — genuinely distressed multiple).
+                # A positive quick estimate is unreliable for growth/transition companies.
+                market_implied_g=_pre_mig if _pre_mig is not None and _pre_mig < 0.0 else None,
                 # Layer F Tier 3 — pass raw NTM consensus and analyst count so
                 # the knowledge model can weight the consensus estimate correctly.
                 ntm_growth=_consensus_growth,

@@ -228,7 +228,9 @@ def _derive_actual_terminal_growth(
     """
     ptg = float(predicted_terminal_growth or 0.025)
     adj = _clamp(revenue_delta * 0.015, -0.010, 0.010)
-    return round(_clamp(ptg + adj, 0.005, 0.055), 4)
+    # Allow negative actual_terminal_growth so training data reflects
+    # structural decline (companies where market implies permanent shrinkage).
+    return round(_clamp(ptg + adj, -0.06, 0.055), 4)
 
 
 def _derive_actual_beta(predicted_beta: float, revenue_delta: float) -> float:
@@ -1372,13 +1374,19 @@ def _declining_regime_guardrail(
     severe_decline = company_growth_pct <= -2.0 or structural_break_score >= 0.75
     max_margin_target_pct = round(max(company_margin_target_pct, ebit_margin_base_pct), 1)
     max_growth_pct = round(min(max(revenue_growth_near, company_growth_pct), 0.8 if not severe_decline else 0.0), 1)
+    # For declining regimes, cap terminal growth at GDP-ish level to prevent
+    # optimistic positive-bias: severe decline → cap at 0.5%; mild → cap at 1.5%.
+    max_terminal_growth_pct = round(
+        0.5 if severe_decline else min(terminal_growth, 1.5),
+        1,
+    )
     return {
         "applied": True,
         "recent_revenue_cagr_pct": round(company_growth_pct, 1),
         "max_margin_target_pct": max_margin_target_pct,
         "max_growth_pct": max_growth_pct,
         "min_wacc_pct": round(wacc, 1),
-        "max_terminal_growth_pct": round(terminal_growth, 1),
+        "max_terminal_growth_pct": max_terminal_growth_pct,
         "min_beta": round(beta, 2),
         "note": "Declining/structural-break safeguard applied: positive learned memory is capped until revenue momentum improves.",
     }
@@ -2410,14 +2418,29 @@ def refine_live_assumptions(
         ),
         1,
     )
+    # Layer E — direct market_implied_g blending into terminal growth.
+    # Only applied when the market signal is NEGATIVE (quick estimate implies < 0% TG),
+    # meaning the company is trading at distressed FCF multiples (< 1/WACC of UFCF).
+    # A positive quick estimate is unreliable noise for transition-phase companies
+    # where the model projects near-term UFCF improvement — it should be ignored.
+    # For genuinely distressed (market_implied_g < 0): apply a soft pull downward.
+    _mig_tg_pp = 0.0
+    if market_implied_g is not None and market_implied_g < 0.0:
+        _mig_delta_pp = (market_implied_g * 100.0) - terminal_growth  # always negative here
+        _mig_weight = min(0.30, 0.10 + abs(_mig_delta_pp) / 30.0)
+        _mig_tg_pp = max(-3.0, _mig_delta_pp * _mig_weight)
+
     refined_terminal_growth = round(
         _clamp(
             terminal_growth * max(0.65, 1.0 - risk_weights["learned_cohort"])
             + (calibrated.terminal_growth_adj * 100) * risk_weights["learned_cohort"]
             + global_terminal_growth_pp
             + relationship_terminal_growth_pp
-            + market_terminal_growth_pp,
-            0.5,
+            + market_terminal_growth_pp
+            + _mig_tg_pp,
+            # Floor lowered to -4% to allow structural decline terminal values.
+            # (DCF validity requires g < WACC — enforced separately via Gordon-Growth.)
+            -4.0,
             4.0,
         ),
         1,

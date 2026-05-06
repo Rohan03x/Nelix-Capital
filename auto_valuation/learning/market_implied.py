@@ -254,7 +254,7 @@ def build_market_residual_overlay(
     wacc_delta_pp = _weighted_mean(weighted_wacc_deltas) if weighted_wacc_deltas else 0.0
     terminal_growth_delta_pp = _weighted_mean(weighted_terminal_growth_deltas) if weighted_terminal_growth_deltas else 0.0
     wacc_adj_pp = _clamp(wacc_delta_pp * risk_assumption_weight, -0.8, 0.8)
-    terminal_growth_adj_pp = _clamp(terminal_growth_delta_pp * risk_assumption_weight, -0.4, 0.4)
+    terminal_growth_adj_pp = _clamp(terminal_growth_delta_pp * risk_assumption_weight, -1.5, 1.5)
     dominant_scope = max(scopes.items(), key=lambda item: item[1])[0] if scopes else "global"
     residuals_for_band = sorted(value for value, _weight in weighted_residuals)
     p10_index = int(max(0, min(len(residuals_for_band) - 1, len(residuals_for_band) * 0.10)))

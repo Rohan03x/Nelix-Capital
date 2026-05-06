@@ -57,7 +57,7 @@ BLUME_ADJUSTMENT:      bool  = True    # B_adj = 0.67×B_raw + 0.33×1.0
 # ── Terminal value defaults (Parts 3.3, 52) ────────────────────────────────────
 TERMINAL_GROWTH_DEFAULT:  float = 0.025   # 2.5% default long-run growth
 TERMINAL_GROWTH_GDP_CAP:  float = 0.040   # hard cap (≈ nominal US GDP growth)
-TERMINAL_GROWTH_FLOOR:    float = 0.005   # floors at 0.5% (not negative)
+TERMINAL_GROWTH_FLOOR:    float = -0.05  # allows negative TG for structural decliners
 TV_PCT_EV_WARN_THRESHOLD: float = 0.80    # warn if PV(TV) > 80% of total EV
 EXIT_MULTIPLE_DEFAULT:    float = 10.0    # EV/EBITDA exit multiple (Gordon Growth is primary)
 
