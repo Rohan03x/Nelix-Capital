@@ -1076,6 +1076,46 @@ def _ledger_evidence_summary(ticker: str) -> dict[str, Any]:
         return {"enabled": False, "matured_records": 0, "updated_records": 0, "reason": str(exc)}
 
 
+def _historical_replay_evidence_summary(ticker: str) -> dict[str, Any]:
+    ticker_upper = str(ticker or "").upper()
+    if not ticker_upper:
+        return {"enabled": False, "records": 0, "reason": "missing-ticker"}
+
+    def _obs_field(observation: Any, name: str, default: Any = None) -> Any:
+        if isinstance(observation, dict):
+            return observation.get(name, default)
+        return getattr(observation, name, default)
+
+    try:
+        from auto_valuation.learning.historical_replay import get_all_observations
+
+        observations = [
+            observation
+            for observation in get_all_observations()
+            if str(_obs_field(observation, "ticker", "") or "").upper() == ticker_upper
+        ]
+        revenue_errors: list[float] = []
+        margin_errors: list[float] = []
+        for observation in observations:
+            predicted_revenue = _maybe_float(_obs_field(observation, "predicted_revenue_growth"))
+            actual_revenue = _maybe_float(_obs_field(observation, "actual_revenue_growth"))
+            if predicted_revenue is not None and actual_revenue is not None:
+                revenue_errors.append((actual_revenue - predicted_revenue) * 100.0)
+            predicted_margin = _maybe_float(_obs_field(observation, "predicted_ebit_margin"))
+            actual_margin = _maybe_float(_obs_field(observation, "actual_ebit_margin"))
+            if predicted_margin is not None and actual_margin is not None:
+                margin_errors.append((actual_margin - predicted_margin) * 100.0)
+        return {
+            "enabled": True,
+            "records": len(observations),
+            "mean_abs_revenue_error_pct": _mean_abs(revenue_errors),
+            "mean_abs_margin_error_pp": _mean_abs(margin_errors),
+            "source": "historical-replay",
+        }
+    except Exception as exc:
+        return {"enabled": False, "records": 0, "reason": str(exc)}
+
+
 def _latest_maintenance_summary() -> dict[str, Any]:
     try:
         from auto_valuation.learning.ledger import LedgerReader
@@ -1195,6 +1235,8 @@ def _learning_accuracy_summary(
     margin_errors_pp: list[float] = []
     valuation_errors: list[float] = []
     direct_samples = 0
+    historical_summary = _historical_replay_evidence_summary(ticker)
+    historical_samples = int(historical_summary.get("records") or 0)
 
     try:
         from auto_valuation.learning.ledger import LedgerReader
@@ -1259,20 +1301,27 @@ def _learning_accuracy_summary(
     except Exception:
         priority = {}
 
-    direct_error_parts = [
-        value for value in (
-            _mean_abs(revenue_errors),
-            _mean_abs(valuation_errors),
-        )
+    revenue_error = _mean_abs(revenue_errors)
+    margin_error = _mean_abs(margin_errors_pp)
+    historical_revenue_error = _maybe_float(historical_summary.get("mean_abs_revenue_error_pct"))
+    historical_margin_error = _maybe_float(historical_summary.get("mean_abs_margin_error_pp"))
+    valuation_error = _mean_abs(valuation_errors)
+    assumption_error_parts = [
+        value for value in (revenue_error, historical_revenue_error)
         if value is not None
     ]
-    margin_error = _mean_abs(margin_errors_pp)
     if margin_error is not None:
-        direct_error_parts.append(margin_error * 3.0)
-    direct_mean_error = round(sum(direct_error_parts) / len(direct_error_parts), 2) if direct_error_parts else None
+        assumption_error_parts.append(margin_error * 3.0)
+    if historical_margin_error is not None:
+        assumption_error_parts.append(historical_margin_error * 3.0)
+    assumption_error = round(sum(assumption_error_parts) / len(assumption_error_parts), 2) if assumption_error_parts else None
+    direct_error_parts = [value for value in (assumption_error, valuation_error) if value is not None]
+    direct_mean_error = round((assumption_error * 0.85 + valuation_error * 0.15), 2) if assumption_error is not None and valuation_error is not None else (round(sum(direct_error_parts) / len(direct_error_parts), 2) if direct_error_parts else None)
     priority_error = _maybe_float(priority.get("mean_abs_error_pct"))
     effective_error = direct_mean_error if direct_mean_error is not None else (priority_error if priority_error is not None and priority_error > 0 else p50_error)
     accuracy_score = int(round(max(0.0, min(100.0, 100.0 - min(50.0, effective_error or 0.0) * 2.0))))
+    assumption_score = int(round(max(0.0, min(100.0, 100.0 - min(50.0, assumption_error or effective_error or 0.0) * 2.0))))
+    valuation_score = int(round(max(0.0, min(100.0, 100.0 - min(50.0, valuation_error or effective_error or 0.0) * 2.0))))
     confidence_score = int(
         valuation_confidence.get("score_100")
         or round(float(valuation_confidence.get("score") or knowledge_model.get("valuation_confidence") or 0.0) * 100)
@@ -1287,9 +1336,13 @@ def _learning_accuracy_summary(
     cohort_samples = int(priority.get("cohort_samples") or cohort_memory.get("records") or knowledge_model.get("calibration_cohort_size") or 0)
     priority_direct = int(priority.get("direct_samples") or 0)
     direct_samples = max(direct_samples, priority_direct)
-    if direct_samples > 0:
+    if direct_samples > 0 or historical_samples > 0:
         scope = "ticker"
-        source_note = f"{direct_samples} ticker-specific matured forecast sample(s) anchor the back-test."
+        source_note = (
+            f"{direct_samples} ledger back-test(s) plus {historical_samples} replay observation(s) anchor the ticker view."
+            if historical_samples > 0
+            else f"{direct_samples} ticker-specific matured forecast sample(s) anchor the back-test."
+        )
     elif cohort_samples > 0:
         scope = "cohort"
         source_note = f"No ticker back-test is mature yet, so {cohort_samples} matched cohort sample(s) carry the accuracy estimate."
@@ -1304,17 +1357,23 @@ def _learning_accuracy_summary(
         "enabled": True,
         "scope": scope,
         "score": accuracy_score,
+        "assumption_score": assumption_score,
+        "valuation_score": valuation_score,
         "confidence_score": confidence_score,
         "expected_error_pct": {"p50": round(p50_error, 2), "p90": round(p90_error, 2)},
         "direct_samples": direct_samples,
+        "historical_replay_samples": historical_samples,
         "cohort_samples": cohort_samples,
         "global_records": global_records,
         "company_weight_pct": int(company_memory.get("weight_pct") or 0),
         "cohort_weight_pct": int(cohort_memory.get("weight_pct") or 0),
         "mean_abs_error_pct": round(effective_error, 2) if effective_error is not None else None,
-        "mean_abs_revenue_error_pct": _mean_abs(revenue_errors),
+        "mean_abs_assumption_error_pct": assumption_error,
+        "mean_abs_revenue_error_pct": revenue_error,
         "mean_abs_margin_error_pp": margin_error,
-        "mean_abs_valuation_error_pct": _mean_abs(valuation_errors),
+        "mean_abs_historical_revenue_error_pct": historical_revenue_error,
+        "mean_abs_historical_margin_error_pp": historical_margin_error,
+        "mean_abs_valuation_error_pct": valuation_error,
         "priority": priority,
         "source_note": source_note,
         "label": "high" if accuracy_score >= 75 else ("moderate" if accuracy_score >= 55 else "guarded"),
@@ -2197,6 +2256,7 @@ def _augment_learning_explainability(
     maintenance = dict(knowledge_model.get("learning_maintenance") or {})
     persistence = dict(knowledge_model.get("learning_persistence") or {})
     ledger_evidence = _ledger_evidence_summary(ticker)
+    historical_evidence = _historical_replay_evidence_summary(ticker)
     readonly_maintenance = _latest_maintenance_summary()
     readonly_snapshot = _read_only_snapshot_summary(dashboard_data or {})
     global_universe = dict(knowledge_model.get("global_universe") or {})
@@ -2212,20 +2272,26 @@ def _augment_learning_explainability(
 
     backfill_matured = int(backfill.get("matured_records") or 0)
     ledger_matured = int(ledger_evidence.get("matured_records") or 0)
-    matured_records = max(backfill_matured, ledger_matured)
+    historical_records = int(historical_evidence.get("records") or 0)
+    ledger_matured_records = max(backfill_matured, ledger_matured)
+    matured_records = max(ledger_matured_records, historical_records)
     total_realized_records = int(ledger_evidence.get("total_realized_records") or 0)
     postmortem_records = int(ledger_evidence.get("postmortem_records") or 0)
     explainability["realized_evidence"] = {
         "matured_records": matured_records,
+        "ledger_matured_records": ledger_matured_records,
+        "historical_replay_records": historical_records,
         "updated_records": int(backfill.get("updated_records") or 0),
         "total_realized_records": total_realized_records,
         "complete_realized_records": int(ledger_evidence.get("complete_realized_records") or 0),
         "partial_realized_records": int(ledger_evidence.get("partial_realized_records") or 0),
         "postmortem_records": postmortem_records,
         "prediction_records": int(ledger_evidence.get("prediction_records") or 0),
+        "mean_abs_historical_revenue_error_pct": historical_evidence.get("mean_abs_revenue_error_pct"),
+        "mean_abs_historical_margin_error_pp": historical_evidence.get("mean_abs_margin_error_pp"),
         "source": "live-backfill" if backfill_matured > 0 else str(ledger_evidence.get("source") or "live-backfill"),
         "note": (
-            f"{matured_records} matured prediction(s), {total_realized_records} realized label(s), and {postmortem_records} postmortem(s) exist for this ticker."
+            f"{historical_records} replay observation(s), {ledger_matured_records} ledger back-test(s), {total_realized_records} realized label(s), and {postmortem_records} postmortem(s) exist for this ticker."
             if matured_records > 0
             else "No matured realized outcomes exist yet for this ticker."
         ),

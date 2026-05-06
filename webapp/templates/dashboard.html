@@ -1044,7 +1044,7 @@
     <div class="kpi-card {% if company_memory.get('review_due') %}amber{% else %}green{% endif %}">
       <div class="kpi-label">Company Memory</div>
       <div class="kpi-value {% if company_memory.get('review_due') %}amber{% else %}green{% endif %}">{{ company_memory.get('weight_pct', 0) }}%</div>
-      <div class="kpi-sub">{{ company_memory.get('history_window_years', km.get('history_window_years', 0)) }}y history (since IPO) · verified quarterly</div>
+      <div class="kpi-sub">{{ company_memory.get('records', 0) }} record(s) · {{ company_memory.get('history_window_years', km.get('history_window_years', 0)) }}y history (since IPO) · verified quarterly</div>
     </div>
 
     <div class="kpi-card {% if cohort_memory.get('records', 0) >= 5 %}green{% elif cohort_memory.get('records', 0) > 0 %}amber{% else %}amber{% endif %}">
@@ -1101,7 +1101,9 @@
         {% if realized_evidence.get('matured_records', 0) > 0 %}{{ realized_evidence.get('matured_records', 0) }} matured{% else %}Thin{% endif %}
       </div>
       <div class="kpi-sub">
-        {% if realized_evidence.get('total_realized_records', 0) > 0 %}
+        {% if realized_evidence.get('historical_replay_records', 0) > 0 %}
+          {{ realized_evidence.get('historical_replay_records', 0) }} replay obs · {{ realized_evidence.get('ledger_matured_records', 0) }} ledger · {{ realized_evidence.get('postmortem_records', 0) }} postmortem(s)
+        {% elif realized_evidence.get('total_realized_records', 0) > 0 %}
           {{ realized_evidence.get('total_realized_records', 0) }} label(s) · {{ realized_evidence.get('postmortem_records', 0) }} postmortem(s)
         {% else %}
           {{ realized_evidence.get('updated_records', 0) }} record(s) refreshed into the ledger
@@ -1140,7 +1142,7 @@
     <div class="card" style="padding:1rem;">
       <div class="section-title" style="font-size:.82rem;margin-top:0;">Model Accuracy</div>
       <div class="kpi-value {% if model_accuracy.get('score', 0) >= 75 %}green{% elif model_accuracy.get('score', 0) >= 55 %}amber{% else %}red{% endif %}" style="font-size:1.55rem;">{{ model_accuracy.get('score', valuation_conf.get('score_100', 0)) }}/100</div>
-      <div class="kpi-sub">{{ model_accuracy.get('scope', 'confidence-model')|replace('-', ' ')|title }} · p50 error {{ (model_accuracy.get('expected_error_pct') or expected_error_band).get('p50', 0) }}% · p90 {{ (model_accuracy.get('expected_error_pct') or expected_error_band).get('p90', 0) }}%</div>
+      <div class="kpi-sub">{{ model_accuracy.get('scope', 'confidence-model')|replace('-', ' ')|title }} · assumptions {{ model_accuracy.get('assumption_score', model_accuracy.get('score', 0)) }}/100 · valuation {{ model_accuracy.get('valuation_score', 0) }}/100</div>
       <div class="score-narrative" style="margin-top:.55rem;">{{ model_accuracy.get('source_note', confidence_decomposition.get('summary', '')) }}</div>
     </div>
 
@@ -1151,7 +1153,7 @@
         <div><div class="kpi-label">Cohort</div><div class="kpi-value" style="font-size:1.1rem;">{{ model_accuracy.get('cohort_samples', cohort_memory.get('records', 0)) }}</div></div>
         <div><div class="kpi-label">Global</div><div class="kpi-value" style="font-size:1.1rem;">{{ model_accuracy.get('global_records', global_brain_records) }}</div></div>
       </div>
-      <div class="score-narrative">Revenue miss {{ model_accuracy.get('mean_abs_revenue_error_pct', 'n/a') }}% · margin miss {{ model_accuracy.get('mean_abs_margin_error_pp', 'n/a') }}pp · valuation miss {{ model_accuracy.get('mean_abs_valuation_error_pct', 'n/a') }}%</div>
+      <div class="score-narrative">Replay {{ model_accuracy.get('historical_replay_samples', 0) }} · revenue miss {{ model_accuracy.get('mean_abs_revenue_error_pct', model_accuracy.get('mean_abs_historical_revenue_error_pct', 'n/a')) }}% · margin miss {{ model_accuracy.get('mean_abs_margin_error_pp', model_accuracy.get('mean_abs_historical_margin_error_pp', 'n/a')) }}pp · valuation miss {{ model_accuracy.get('mean_abs_valuation_error_pct', 'n/a') }}%</div>
     </div>
 
     <div class="card" style="padding:1rem;">

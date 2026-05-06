@@ -1557,7 +1557,20 @@ def _load_learning_cohort(limit: int | None = None, subject_ticker: str | None =
                 historical_limit = int(
                     LEARNING_CONFIG.get("historical_replay_limit", 4000) or 4000
                 )
-                if len(historical) > historical_limit:
+                if subject_ticker:
+                    subject_upper = str(subject_ticker).upper()
+                    subject_historical = [
+                        observation
+                        for observation in historical
+                        if str(_obs_value(observation, "ticker", "") or "").upper() == subject_upper
+                    ]
+                    other_historical = [
+                        observation
+                        for observation in historical
+                        if str(_obs_value(observation, "ticker", "") or "").upper() != subject_upper
+                    ]
+                    historical = subject_historical + other_historical[: max(historical_limit - len(subject_historical), 0)]
+                elif len(historical) > historical_limit:
                     historical = historical[:historical_limit]
                 observations = list(observations) + list(historical)
         except Exception:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import html
 import io
+from types import SimpleNamespace
 
 import pytest
 from openpyxl import load_workbook
@@ -762,6 +763,96 @@ def test_eodhd_scenarios_expand_with_learning_uncertainty(monkeypatch):
     assert wide["learned_expected_upside_pct"] is not None
     assert all("learning_basis" in scenario for scenario in wide["scenarios"].values())
     assert sum(scenario["probability"] for scenario in wide["scenarios"].values()) == pytest.approx(1.0, abs=0.01)
+
+
+def test_learning_cohort_pins_subject_historical_replay_before_global_cap(monkeypatch):
+    subject_record = SimpleNamespace(
+        record_id="subject-ledger",
+        ticker="LIGHT.AS",
+        sector="Industrials",
+        industry="Electrical Components",
+        data_vintage_years=9,
+        market_cap_regime="mid",
+        macro_regime="neutral",
+        predicted_revenue_mm=100.0,
+        actual_revenue_mm=110.0,
+        near_term_revenue_growth=0.03,
+        predicted_ebit_margin=0.10,
+        actual_ebit_margin=0.11,
+        predicted_wacc=0.08,
+        predicted_terminal_growth=0.025,
+        beta=1.0,
+        predicted_ufcf_mm=8.0,
+        actual_ufcf_mm=9.0,
+        capex_pct_revenue=0.03,
+        da_pct_revenue=0.02,
+        predicted_ev_mm=1000.0,
+        predicted_equity_value_mm=900.0,
+        predicted_price_per_share=20.0,
+        actual_price_at_prediction=18.0,
+        actual_price_at_horizon=22.0,
+        macro_backdrop={},
+        feature_vector=None,
+        structural_break_hints=[],
+        prediction_context={"source": "historical_replay_bootstrap"},
+    )
+    subject_historical = [
+        CalibrationObservation(
+            ticker="LIGHT.AS",
+            sector="Industrials",
+            industry="Electrical Components",
+            data_vintage_years=9,
+            market_cap_regime="mid",
+            macro_regime="neutral",
+            predicted_revenue_growth=0.0,
+            actual_revenue_growth=0.02 + idx / 100,
+            predicted_ebit_margin=0.10,
+            actual_ebit_margin=0.11,
+            predicted_wacc=0.08,
+            actual_wacc=0.08,
+            predicted_terminal_growth=0.025,
+            actual_terminal_growth=0.025,
+        )
+        for idx in range(3)
+    ]
+    other_historical = [
+        CalibrationObservation(
+            ticker=f"OTHER{idx}",
+            sector="Industrials",
+            industry="Electrical Components",
+            data_vintage_years=9,
+            market_cap_regime="mid",
+            macro_regime="neutral",
+            predicted_revenue_growth=0.0,
+            actual_revenue_growth=0.01,
+            predicted_ebit_margin=0.10,
+            actual_ebit_margin=0.10,
+            predicted_wacc=0.08,
+            actual_wacc=0.08,
+            predicted_terminal_growth=0.025,
+            actual_terminal_growth=0.025,
+        )
+        for idx in range(6)
+    ]
+
+    monkeypatch.setattr(knowledge_model_module, "_cached_ledger_records", lambda limit=None: [subject_record])
+    monkeypatch.setattr(knowledge_model_module, "_cached_stratified_sample", lambda records, max_records, target: list(records))
+    monkeypatch.setattr(knowledge_model_module.LedgerReader, "query", lambda *_args, **_kwargs: [subject_record])
+    monkeypatch.setattr(
+        knowledge_model_module,
+        "_get_historical_observations",
+        lambda: other_historical[:4] + subject_historical + other_historical[4:],
+    )
+    monkeypatch.setitem(knowledge_model_module.LEARNING_CONFIG, "historical_replay_limit", 2)
+
+    observations = knowledge_model_module._load_learning_cohort(limit=1, subject_ticker="LIGHT.AS")
+    subject_count = sum(
+        1
+        for observation in observations
+        if str(knowledge_model_module._obs_value(observation, "ticker", "")).upper() == "LIGHT.AS"
+    )
+
+    assert subject_count == 4
 
 
 def test_eodhd_read_only_build_skips_learning_writes(monkeypatch):
