@@ -9,6 +9,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Load .env before any auto_valuation imports so R2 credentials are available.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+except Exception:
+    pass
+
 from auto_valuation.config import LEARNING_CONFIG
 from auto_valuation.learning.background_runner import run_background_learning_cycle
 from auto_valuation.learning.performance_report import build_learning_performance_report

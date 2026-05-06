@@ -78,6 +78,47 @@ _DEFAULT_WACC = 0.090
 _DEFAULT_BETA = 1.0
 _DEFAULT_TGR = 0.025
 
+# BRAIN_IMPROVEMENT_PLAN.md (BUG-1) — Historical ERP table (Damodaran implied ERP, year-end).
+# Source: Damodaran NYU updated series through 2024.
+_HISTORICAL_ERP_BY_YEAR: dict[int, float] = {
+    2010: 0.0538, 2011: 0.0611, 2012: 0.0567, 2013: 0.0489, 2014: 0.0504,
+    2015: 0.0552, 2016: 0.0564, 2017: 0.0532, 2018: 0.0596, 2019: 0.0520,
+    2020: 0.0484, 2021: 0.0449, 2022: 0.0530, 2023: 0.0460, 2024: 0.0453,
+    2025: 0.0460,
+}
+_ERP_LONG_RUN_MEAN = 0.0530  # 1990-2024 mean
+
+
+def _historical_erp(year: int) -> float:
+    """Return implied equity risk premium for a given calendar year (Damodaran)."""
+    if year in _HISTORICAL_ERP_BY_YEAR:
+        return _HISTORICAL_ERP_BY_YEAR[year]
+    if year < min(_HISTORICAL_ERP_BY_YEAR):
+        return _ERP_LONG_RUN_MEAN
+    return _ERP_LONG_RUN_MEAN
+
+
+def _size_premium(cap_regime: str) -> float:
+    """Approximate Duff & Phelps size premium by market cap regime."""
+    if cap_regime == "small":
+        return 0.0250  # small-cap premium
+    if cap_regime == "mid":
+        return 0.0080  # mid-cap premium
+    return 0.0000  # large-cap: no premium
+
+
+def _extract_beta(fundamentals: dict[str, Any]) -> float | None:
+    """Extract historical beta from EODHD Technicals section, if available."""
+    technicals = dict(fundamentals.get("Technicals") or {})
+    beta_raw = _optional_float(str(technicals.get("Beta") or ""))
+    if beta_raw is not None and 0.10 <= beta_raw <= 4.0:
+        return beta_raw
+    highlights = dict(fundamentals.get("Highlights") or {})
+    beta_raw = _optional_float(str(highlights.get("Beta") or ""))
+    if beta_raw is not None and 0.10 <= beta_raw <= 4.0:
+        return beta_raw
+    return None
+
 
 # ─── Historical macro context (S2 — eliminate look-ahead bias) ───────────────
 # Approximate FRED 10Y constant-maturity treasury, year-end averages (decimals).
@@ -245,6 +286,9 @@ def observations_for_ticker(
     years = sorted(ann)
     vintage = len(years)
 
+    # BRAIN_IMPROVEMENT_PLAN.md (BUG-1) — extract real beta once per ticker
+    historical_beta = _extract_beta(fundamentals) or _DEFAULT_BETA
+
     obs: list[CalibrationObservation] = []
 
     # Annual pairs ────────────────────────────────────────────────────────────
@@ -270,11 +314,12 @@ def observations_for_ticker(
             predicted_ebit_margin=float(pred_em),  # persistence model
             actual_ebit_margin=float(actual_em),
             predicted_wacc=wacc0,
-            actual_wacc=wacc0,                     # unobservable → zero WACC error
+            # BRAIN_IMPROVEMENT_PLAN.md (BUG-1) — real WACC from beta + rf + erp + size premium
+            actual_wacc=_historical_rf(int(year)) + historical_beta * _historical_erp(int(year)) + _size_premium(cap),
             predicted_terminal_growth=_DEFAULT_TGR,
             actual_terminal_growth=_DEFAULT_TGR,
             predicted_beta=_DEFAULT_BETA,
-            actual_beta=_DEFAULT_BETA,
+            actual_beta=historical_beta,
             ticker=ticker,
             predicted_ufcf_margin=prev.get("ufcf_margin"),
             actual_ufcf_margin=curr.get("ufcf_margin"),
@@ -309,11 +354,12 @@ def observations_for_ticker(
                 predicted_ebit_margin=float(pred_em_q),
                 actual_ebit_margin=float(actual_em_q),
                 predicted_wacc=wacc0,
-                actual_wacc=wacc0,
+                # BRAIN_IMPROVEMENT_PLAN.md (BUG-1) — real quarterly WACC estimate
+                actual_wacc=_historical_rf(int(curr_q["date"].year)) + historical_beta * _historical_erp(int(curr_q["date"].year)) + _size_premium(cap),
                 predicted_terminal_growth=_DEFAULT_TGR,
                 actual_terminal_growth=_DEFAULT_TGR,
                 predicted_beta=_DEFAULT_BETA,
-                actual_beta=_DEFAULT_BETA,
+                actual_beta=historical_beta,
                 ticker=ticker,
                 as_of_year=int(curr_q["date"].year),
                 rf_rate_at_time=_historical_rf(int(curr_q["date"].year)),

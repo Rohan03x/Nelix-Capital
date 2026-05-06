@@ -359,6 +359,17 @@ def run_live_evidence_bootstrap(
             )
             counts["annual_postmortems_created"] += len(created_postmortems)
 
+        # BRAIN_IMPROVEMENT_PLAN.md (BUG-2) — persist implied WACC/TG as CalibrationObservations.
+        # For every matured record that now has actual_ev_mm, compute the market-implied WACC/TG
+        # and store it as a learning signal so the calibration layer can use it next time.
+        if labeled_horizon_years:
+            _persist_implied_wacc_observations(
+                ticker,
+                matured_records,
+                fundamentals=fundamentals,
+                ledger_reader=reader,
+            )
+
         counts["quinquennial_reports_created"] += _materialize_quinquennial_reports(
             ticker,
             ledger_reader=reader,
@@ -480,6 +491,112 @@ def _resolve_bootstrap_tickers(
     if effective_max_tickers is not None and effective_max_tickers > 0:
         return ordered[:effective_max_tickers]
     return ordered
+
+
+    return ordered
+
+
+def _persist_implied_wacc_observations(
+    ticker: str,
+    matured_records: list[Any],
+    *,
+    fundamentals: dict[str, Any],
+    ledger_reader: Any,
+) -> None:
+    """BRAIN_IMPROVEMENT_PLAN.md (BUG-2) — persist market-implied WACC/TG as CalibrationObservations.
+
+    For each matured record with actual_ev_mm available, compute the market-implied WACC
+    and terminal growth rate, then store them as CalibrationObservations so the layered
+    calibrator learns from the market's implied discount rate — not just realized financials.
+    """
+    try:
+        from auto_valuation.learning.market_implied import compute_market_implied_snapshot
+        from auto_valuation.learning._layered_calibrator import CalibrationObservation, CalibrationStore
+    except Exception:
+        return
+
+    general = dict((fundamentals or {}).get("General") or {})
+    sector = str(general.get("Sector") or "")
+    industry = str(general.get("Industry") or "")
+    highlights = dict((fundamentals or {}).get("Highlights") or {})
+
+    store = CalibrationStore()
+
+    for record in matured_records:
+        # Re-fetch the record with realized outcomes attached so actual_ev_mm is populated
+        realized_outcomes = ledger_reader.query_realized_outcomes(record_id=record.record_id, limit=10)
+        if not realized_outcomes:
+            continue
+
+        # Merge realized outcome data onto the record for the snapshot
+        best_outcome = None
+        for outcome in realized_outcomes:
+            actual_ev = getattr(outcome, "actual_ev_mm", None)
+            if actual_ev and actual_ev > 0:
+                best_outcome = outcome
+                break
+        if best_outcome is None:
+            continue
+
+        # Build a lightweight merged record for compute_market_implied_snapshot
+        class _MergedRecord:
+            pass
+
+        merged = _MergedRecord()
+        for attr in (
+            "record_id", "ticker", "predicted_ev_mm", "predicted_price_per_share",
+            "predicted_wacc", "predicted_terminal_growth", "predicted_revenue_mm",
+            "predicted_ufcf_mm", "actual_price_at_prediction", "sector", "industry",
+            "market_cap_regime", "data_vintage_years", "macro_regime", "run_date",
+        ):
+            setattr(merged, attr, getattr(record, attr, None))
+
+        setattr(merged, "actual_ev_mm", getattr(best_outcome, "actual_ev_mm", None))
+        setattr(merged, "actual_price_at_horizon", getattr(best_outcome, "actual_price_at_horizon", None))
+        setattr(merged, "actual_revenue_mm", getattr(best_outcome, "actual_revenue_mm", None))
+
+        snap = compute_market_implied_snapshot(merged)
+        if snap is None or snap.implied_wacc_pct is None:
+            continue
+
+        run_date = getattr(record, "run_date", None)
+        as_of_year = run_date.year if isinstance(run_date, date) else None
+        rf_at_time: float | None = None
+        if as_of_year is not None:
+            try:
+                from auto_valuation.learning.historical_replay import _historical_rf
+                rf_at_time = _historical_rf(as_of_year)
+            except Exception:
+                pass
+
+        try:
+            obs = CalibrationObservation(
+                sector=sector,
+                industry=industry,
+                data_vintage_years=min(int(getattr(record, "data_vintage_years", 0) or 0), 20),
+                market_cap_regime=str(getattr(record, "market_cap_regime", "") or "mid"),
+                macro_regime=str(getattr(record, "macro_regime", "") or "neutral"),
+                predicted_revenue_growth=0.0,
+                actual_revenue_growth=0.0,
+                predicted_ebit_margin=0.0,
+                actual_ebit_margin=0.0,
+                predicted_wacc=float(getattr(record, "predicted_wacc", 0.10) or 0.10),
+                actual_wacc=snap.implied_wacc_pct / 100.0,
+                predicted_terminal_growth=float(getattr(record, "predicted_terminal_growth", 0.025) or 0.025),
+                actual_terminal_growth=(
+                    snap.implied_terminal_growth_pct / 100.0
+                    if snap.implied_terminal_growth_pct is not None
+                    else float(getattr(record, "predicted_terminal_growth", 0.025) or 0.025)
+                ),
+                ticker=ticker,
+                quality_score=float(snap.quality_score or 0.5),
+                as_of_year=as_of_year,
+                rf_rate_at_time=rf_at_time,
+                growth_regime="market_implied",
+            )
+            store.save_observation(obs, source="market_implied")
+        except Exception:
+            pass
 
 
 def _load_supported_bootstrap_tickers() -> list[str]:

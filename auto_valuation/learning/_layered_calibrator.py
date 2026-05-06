@@ -50,6 +50,11 @@ class CalibrationObservation:
     predicted_reinvestment_rate: float | None = None
     actual_reinvestment_rate: float | None = None
     structural_break_flag: bool = False
+    # BRAIN_IMPROVEMENT_PLAN.md (H4) — graded structural break score (0.0=clean, 1.0=severe break)
+    structural_break_score: float = 0.0
+    # BRAIN_IMPROVEMENT_PLAN.md (M2) — volatility dimensions for risk-era weighting
+    revenue_volatility: float = 0.0
+    margin_volatility: float = 0.0
     feature_vector: dict[str, float] | tuple[float, ...] | list[float] | None = None
     quality_score: float = 1.0
     # ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (S2/S3/M3) — point-in-time + growth dim
@@ -392,6 +397,36 @@ class CalibrationStore:
                 )
                 """
             )
+            # BRAIN_IMPROVEMENT_PLAN.md (M5) — store individual observations for replay/audit
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS calibration_observations (
+                    obs_id TEXT PRIMARY KEY,
+                    ticker TEXT NOT NULL,
+                    sector TEXT NOT NULL,
+                    industry TEXT,
+                    market_cap_regime TEXT NOT NULL,
+                    macro_regime TEXT NOT NULL,
+                    as_of_year INTEGER,
+                    predicted_revenue_growth REAL,
+                    actual_revenue_growth REAL,
+                    predicted_ebit_margin REAL,
+                    actual_ebit_margin REAL,
+                    predicted_wacc REAL,
+                    actual_wacc REAL,
+                    predicted_terminal_growth REAL,
+                    actual_terminal_growth REAL,
+                    rf_rate_at_time REAL,
+                    growth_regime TEXT,
+                    structural_break_score REAL DEFAULT 0.0,
+                    revenue_volatility REAL DEFAULT 0.0,
+                    margin_volatility REAL DEFAULT 0.0,
+                    quality_score REAL DEFAULT 1.0,
+                    source TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
             conn.commit()
 
     def save_prior(self, prior: CalibrationPrior) -> None:
@@ -422,6 +457,41 @@ class CalibrationStore:
                     prior.correction_std,
                     prior.cohort_size,
                     prior.last_updated.isoformat(),
+                ),
+            )
+            conn.commit()
+
+
+    def save_observation(self, obs: "CalibrationObservation", *, source: str = "unknown") -> None:
+        """Persist a CalibrationObservation row for audit and future replay."""
+        from datetime import datetime, timezone
+        obs_id = str(uuid.uuid4())
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self._connect_db() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO calibration_observations (
+                    obs_id, ticker, sector, industry, market_cap_regime, macro_regime,
+                    as_of_year, predicted_revenue_growth, actual_revenue_growth,
+                    predicted_ebit_margin, actual_ebit_margin,
+                    predicted_wacc, actual_wacc,
+                    predicted_terminal_growth, actual_terminal_growth,
+                    rf_rate_at_time, growth_regime,
+                    structural_break_score, revenue_volatility, margin_volatility,
+                    quality_score, source, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    obs_id, obs.ticker, obs.sector, obs.industry,
+                    obs.market_cap_regime, obs.macro_regime,
+                    obs.as_of_year,
+                    obs.predicted_revenue_growth, obs.actual_revenue_growth,
+                    obs.predicted_ebit_margin, obs.actual_ebit_margin,
+                    obs.predicted_wacc, obs.actual_wacc,
+                    obs.predicted_terminal_growth, obs.actual_terminal_growth,
+                    obs.rf_rate_at_time, obs.growth_regime,
+                    obs.structural_break_score, obs.revenue_volatility, obs.margin_volatility,
+                    obs.quality_score, source, created_at,
                 ),
             )
             conn.commit()
@@ -490,7 +560,7 @@ def _filter_analog_memory(
 ) -> list[Any]:
     if feature_vector is None:
         return []
-    min_similarity = float(_LEARNING_CONFIG.get("min_analog_similarity", 0.82))
+    min_similarity = float(_LEARNING_CONFIG.get("min_analog_similarity", 0.65))
     max_results = int(_LEARNING_CONFIG.get("max_analogs_returned", 8))
     scored: list[tuple[float, Any]] = []
     for observation in observations:
@@ -528,8 +598,13 @@ def _estimate_structural_break(
     if not observations:
         return StructuralBreakSummary()
 
-    flagged_count = sum(1 for observation in observations if bool(_get(observation, "structural_break_flag", False)))
-    flagged_ratio = flagged_count / len(observations)
+    # BRAIN_IMPROVEMENT_PLAN.md (H4) — use graded structural_break_score instead of binary flag
+    scores = [
+        float(_get(observation, "structural_break_score", 0.0) or 0.0)
+        or (1.0 if bool(_get(observation, "structural_break_flag", False)) else 0.0)
+        for observation in observations
+    ]
+    flagged_ratio = sum(scores) / len(scores) if scores else 0.0
     own_similarity = 0.0
     alt_similarity = 0.0
     alt_sector: str | None = None
@@ -557,7 +632,8 @@ def _estimate_structural_break(
     if similarity_signal >= flagged_ratio and alt_sector:
         rationale = f"Current feature profile resembles {alt_sector} analogs more than its legacy {sector} cohort."
     elif flagged_ratio > 0:
-        rationale = f"{flagged_count} matured observations in this learning set already flagged structural breaks."
+        flagged_count_equiv = round(sum(scores))
+        rationale = f"{flagged_count_equiv} equivalent observations in this learning set already flagged structural breaks."
     return StructuralBreakSummary(
         detected=detected,
         score=score,
@@ -610,7 +686,8 @@ def _layered_sources(
     global_memory = _exclude(observations, used_ids)
 
     return [
-        ("company_memory", company_memory, 1.45, "Same-symbol realised history from prior matured forecasts."),
+        # BRAIN_IMPROVEMENT_PLAN.md (H1) — company priority raised from 1.45 → 3.0
+        ("company_memory", company_memory, 3.0, "Same-symbol realised history from prior matured forecasts."),
         ("cohort_memory", exact, 1.20, "Same industry, maturity, cap regime, and macro regime as the current valuation."),
         ("sector_memory", sector_memory, 0.95, "Same sector and maturity bucket, used when the exact cohort is sparse or noisy."),
         ("analog_memory", analog_memory, 0.90, "Cross-symbol analogs with highly similar operating fingerprints."),
@@ -662,7 +739,11 @@ def _build_assumption_summary(
 ) -> AssumptionCalibrationSummary:
     layer_payloads: list[tuple[str, int, float, float, float, str]] = []
     for layer_name, cohort, priority, rationale in layer_sources:
-        errors = _error_series(cohort, spec.actual_key, spec.predicted_key, assumption_name=assumption_name)
+        # BRAIN_IMPROVEMENT_PLAN.md (M3) — WACC uses rate-era-adjusted errors
+        if assumption_name == "wacc":
+            errors = _wacc_rate_era_adjusted_errors(cohort, assumption_name)
+        else:
+            errors = _error_series(cohort, spec.actual_key, spec.predicted_key, assumption_name=assumption_name)
         if not errors:
             continue
         # S3 — exponential time-decay weighted residual (recent obs > older obs).
@@ -674,7 +755,21 @@ def _build_assumption_summary(
         )
         residual_std = max(robust_bounded_std(assumption_name, errors), spec.min_sigma)
         scale_penalty = 1.0 + (residual_std / max(spec.min_sigma, 1e-6))
-        raw_weight = priority * math.sqrt(len(errors)) / scale_penalty
+        # BRAIN_IMPROVEMENT_PLAN.md (BUG-3) — Kish effective sample size
+        # accounts for time-decay: 5-year-old obs don't count the same as recent ones
+        _cur_year = date.today().year
+        _obs_weights = [
+            _observation_weight(obs, _cur_year)
+            for obs in cohort
+            if _get(obs, spec.actual_key) is not None and _get(obs, spec.predicted_key) is not None
+        ]
+        if _obs_weights:
+            _sum_w = sum(_obs_weights)
+            _sum_w2 = sum(w * w for w in _obs_weights)
+            effective_n = (_sum_w * _sum_w) / (_sum_w2 or 1e-9)
+        else:
+            effective_n = float(len(errors))
+        raw_weight = priority * math.sqrt(effective_n) / scale_penalty
         if layer_name in {"company_memory", "cohort_memory", "sector_memory"} and structural_break.detected:
             raw_weight *= max(0.2, 1.0 - (0.60 * structural_break.score))
         elif layer_name in {"analog_memory", "macro_memory", "global_memory"} and structural_break.score > 0:
@@ -769,6 +864,37 @@ def _build_assumption_summary(
         layers=layers,
         rationale=" ".join(notes),
     )
+
+
+# BRAIN_IMPROVEMENT_PLAN.md (M3) — WACC residual normalization for rate era.
+# Long-run 10Y Treasury mean 1990-2024.
+_RF_LONG_RUN_BASELINE: float = 0.035
+
+
+def _wacc_rate_era_adjusted_errors(
+    observations: list[Any],
+    assumption_name: str,
+) -> list[float]:
+    """Compute WACC errors with rate-era adjustment: strips pure RF movement vs baseline.
+    E.g. a +50bp WACC residual when rates were +50bp above baseline = zero skill error.
+    Falls back to raw error when rf_rate_at_time is unavailable.
+    """
+    from auto_valuation.learning.residual_controls import clamp_assumption_residual
+    errors: list[float] = []
+    for obs in observations:
+        actual = _get(obs, "actual_wacc")
+        predicted = _get(obs, "predicted_wacc")
+        if actual is None or predicted is None:
+            continue
+        raw_error = float(actual) - float(predicted)
+        rf_at_time = _get(obs, "rf_rate_at_time")
+        if rf_at_time is not None:
+            rate_movement = float(rf_at_time) - _RF_LONG_RUN_BASELINE
+            raw_error -= rate_movement
+        bounded = clamp_assumption_residual(assumption_name, raw_error)
+        if bounded is not None:
+            errors.append(bounded)
+    return errors
 
 
 def _summary_source(

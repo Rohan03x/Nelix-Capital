@@ -45,6 +45,8 @@ class PostmortemRecord:
     surprise_flags: list[str] = field(default_factory=list)
     error_attribution: list[tuple[ErrorDriver | str, float]] = field(default_factory=list)
     structural_break_detected: bool = False
+    # BRAIN_IMPROVEMENT_PLAN.md (H4) — graded break score (0.0=clean, 1.0=severe)
+    structural_break_score: float = 0.0
     model_bias_signal: str = "neutral"
     postmortem_notes: str | None = None
     prediction_snapshot: dict[str, Any] = field(default_factory=dict)
@@ -277,7 +279,13 @@ def run_annual_postmortem(
 
         bias_errors.append(ev_error_pct)
         structural_break_hints = list(actuals.get("structural_break_hints") or [])
-        structural_break = bool(structural_break_hints) or abs(revenue_error_pct) > 25.0
+        # BRAIN_IMPROVEMENT_PLAN.md (H4) — graded structural break score instead of binary flag.
+        # Scales 0.0 (clean) to 1.0 (severe break); hint keywords each add 0.15.
+        structural_break_score = min(
+            1.0,
+            abs(revenue_error_pct) / 50.0 + len(structural_break_hints) * 0.15
+        )
+        structural_break = structural_break_score >= 0.50 or bool(structural_break_hints)
         surprise_flags = list(actuals.get("surprise_flags") or [])
         if structural_break and "structural break candidate" not in {flag.lower() for flag in surprise_flags}:
             surprise_flags.append("structural break candidate")
@@ -300,6 +308,7 @@ def run_annual_postmortem(
             primary_miss_driver=_primary_miss_driver(revenue_error_pct, margin_error_bps, ev_error_pct, price_return_error_pct),
             surprise_flags=surprise_flags,
             structural_break_detected=structural_break,
+            structural_break_score=structural_break_score,
             model_bias_signal="neutral",
             postmortem_notes=actuals.get("notes"),
             prediction_snapshot={

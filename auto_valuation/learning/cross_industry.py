@@ -159,6 +159,9 @@ class PatternDefinition:
     conditions: dict[str, tuple[float | None, float | None]]
     overlay: dict[str, float]
     archetypes: tuple[str, ...]
+    # BRAIN_IMPROVEMENT_PLAN.md (H3) — confidence gate + validation flag
+    confidence_threshold: float = 0.75  # pattern_score must reach this to apply
+    overlay_validated: bool = False     # if False, overlay is damped to 50%
 
 
 PATTERN_LIBRARY = [
@@ -814,9 +817,15 @@ def compute_overlay(analog_set: AnalogSet) -> dict[str, float]:
         "analog_confidence": analog_set.analog_confidence,
     }
     if analog_set.pattern_match_score > 0.7 and analog_set.pattern_match:
-        _, _, pattern_overlay = match_pattern_library(analog_set.subject_features or {})
-        for key, value in pattern_overlay.items():
-            result[key] = result.get(key, 0.0) + value
+        # BRAIN_IMPROVEMENT_PLAN.md (H3) — apply confidence_threshold and damp unvalidated overlays
+        matched_pattern = next(
+            (p for p in PATTERN_LIBRARY if p.name == analog_set.pattern_match), None
+        )
+        if matched_pattern is not None and analog_set.pattern_match_score >= matched_pattern.confidence_threshold:
+            _, _, pattern_overlay = match_pattern_library(analog_set.subject_features or {})
+            damp = 1.0 if matched_pattern.overlay_validated else 0.50
+            for key, value in pattern_overlay.items():
+                result[key] = result.get(key, 0.0) + value * damp
     if analog_set.pattern_match:
         result["pattern_match_score"] = analog_set.pattern_match_score
     return result
