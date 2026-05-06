@@ -32,6 +32,7 @@ from webapp.data.ticker_search import available_exchanges, resolve_search_input,
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+_VERCEL_LEARNING_FORCE_HYDRATED = False
 
 # Make enumerate available in Jinja2 templates
 app.jinja_env.globals.update(enumerate=enumerate)
@@ -222,12 +223,16 @@ def _safe_dashboard_data(
     mutate_learning: bool = True,
     historical_years: int | None | object = _HISTORICAL_YEARS_UNSET,
 ) -> dict:
+    global _VERCEL_LEARNING_FORCE_HYDRATED
     if historical_years is _HISTORICAL_YEARS_UNSET:
         historical_years = _current_historical_years_limit()
     # Always hydrate from remote on Vercel (serverless = fresh empty DBs each request).
     # On local dev, only hydrate when mutating to avoid redundant round-trips.
     if mutate_learning or os.environ.get("VERCEL"):
-        _sync_external_learning_state()
+        force_hydrate = bool(os.environ.get("VERCEL") and not _VERCEL_LEARNING_FORCE_HYDRATED)
+        sync_result = _sync_external_learning_state(force=force_hydrate)
+        if force_hydrate and sync_result.get("enabled") and not sync_result.get("errors"):
+            _VERCEL_LEARNING_FORCE_HYDRATED = True
     try:
         kwargs = {"mutate_learning": mutate_learning, "historical_years": historical_years}
         if overrides is not None:
