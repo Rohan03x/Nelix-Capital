@@ -2952,6 +2952,7 @@ def build_dashboard_data(
         # ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (F5) — full anchoring to consensus
         # Year 1 when ≥3 analysts cover the name.  Heavy-coverage names get
         # a 90/10 blend (analysts dominate), thin-coverage stays at 60/40.
+        _n_analysts_rev = 0
         try:
             _trend = (earn or {}).get("Trend") or {}
             _plus1 = next(
@@ -3032,6 +3033,10 @@ def build_dashboard_data(
                 dso=dso,
                 dio=dio,
                 dpo=dpo,
+                # Layer F Tier 3 — pass raw NTM consensus and analyst count so
+                # the knowledge model can weight the consensus estimate correctly.
+                ntm_growth=_consensus_growth,
+                analyst_count=_n_analysts_rev,
             )
 
             revenue_growth_near = float(knowledge_model_payload.get("revenue_growth_near", revenue_growth_near))

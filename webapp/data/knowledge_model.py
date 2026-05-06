@@ -2040,6 +2040,13 @@ def refine_live_assumptions(
     dio: float,
     dpo: float,
     observations: list[CalibrationObservation] | None = None,
+    # Layer C/D/E — trajectory constraints and market signal
+    market_implied_g: float | None = None,
+    # Layer F Tier 3 — analyst consensus depth signals
+    # ntm_growth: raw NTM consensus growth % (from analyst estimates) before blending
+    # analyst_count: number of analysts covering the name (0 = unknown)
+    ntm_growth: float | None = None,
+    analyst_count: int = 0,
 ) -> dict[str, Any]:
     def _dampen_positive(value: float, scale: float) -> float:
         if value <= 0:
@@ -2142,6 +2149,37 @@ def refine_live_assumptions(
     )
     base_reinvestment_rate = max(raw_assumptions.capex_pct_revenue - raw_assumptions.da_pct_revenue, 0.0)
 
+    # Layer C/D — compute trajectory-constrained terminal g range
+    from auto_valuation.assumptions.headwind_table import (
+        classify_revenue_regime,
+        get_industry_headwind_score,
+        terminal_g_prior_range as _tg_prior_range,
+    )
+    from auto_valuation.model.income_statement import historical_revenue_cagr
+    _income_stmts_proxy = [
+        {"revenue": rev, "ebit_margin": em}
+        for rev, em in zip(reversed(revenues), reversed(ebit_margins))
+    ]
+    _hist_cagr_3 = historical_revenue_cagr(_income_stmts_proxy, years=3) if len(revenues) >= 3 else None
+    _hist_cagr_5 = historical_revenue_cagr(_income_stmts_proxy, years=5) if len(revenues) >= 5 else None
+    _hist_cagr_10 = historical_revenue_cagr(_income_stmts_proxy, years=10) if len(revenues) >= 10 else None
+    # Layer E — quick pre-DCF market-implied g estimate from market cap + FCF
+    # Rearranging Gordon Growth: EV = UFCF*(1+g)/(wacc-g)
+    # → g = (EV*wacc - UFCF) / (EV + UFCF)
+    # Uses market_cap as a proxy for EV when net_debt unavailable here.
+    if market_implied_g is None and market_cap > 0 and abs(fcf) > 0:
+        _wacc_dec = (wacc / 100.0) if wacc > 1.0 else wacc
+        _ev_proxy = market_cap  # simplified: ignoring net debt for quick estimate
+        _denom = _ev_proxy + fcf
+        if abs(_denom) > 1e-6:
+            _quick_g = (_ev_proxy * _wacc_dec - fcf) / _denom
+            market_implied_g = max(-0.10, min(_quick_g, _wacc_dec - 0.005))
+    _revenue_regime = classify_revenue_regime(
+        _hist_cagr_3, _hist_cagr_5, _hist_cagr_10, revenue_growth_near / 100.0, market_implied_g
+    )
+    _rf_dec = (rf_rate / 100.0) if rf_rate > 1.0 else rf_rate
+    _tg_range = _tg_prior_range(_revenue_regime, rf_rate=_rf_dec, sector=knowledge_sector)
+
     calibrated = calibrate(
         raw_assumptions,
         knowledge_sector,
@@ -2154,6 +2192,9 @@ def refine_live_assumptions(
         base_terminal_growth=terminal_growth / 100,
         base_beta=beta,
         calibration_store=_LIVE_CALIBRATION_STORE,
+        terminal_g_range=_tg_range,
+        market_implied_terminal_g=market_implied_g,
+        market_cap_mm=market_cap,
     )
     max_analog_results = max(6, int(LEARNING_CONFIG.get("max_analogs_returned", 10)))
     graph_neighbor_limit = max(6, int(LEARNING_CONFIG.get("relationship_graph_max_neighbors", max_analog_results)))
@@ -2282,19 +2323,45 @@ def refine_live_assumptions(
         global_margin_pp = _dampen_positive(global_margin_pp, positive_scale)
         relationship_margin_pp = _dampen_positive(relationship_margin_pp, positive_scale)
 
-    refined_growth = round(
-        _clamp(
-            company_growth_pct * growth_weights["company_history"]
+    # Layer F Tier 3 — analyst consensus blending into refined_growth.
+    # When analyst coverage depth is known (analyst_count > 0), we incorporate
+    # the raw NTM consensus directly into the growth blend so the knowledge model
+    # can up-weight or down-weight it relative to the historical CAGR based on
+    # analyst count. Strong coverage (≥ 3) gets 25 pp NTM weight; thin coverage
+    # (1–2 analysts) gets a reduced 10 pp weight; no coverage = 0 (falls back
+    # to the purely historical blend below).
+    ntm_growth_pct = ntm_growth  # already in %, e.g. 8.0 means 8%
+    if ntm_growth_pct is not None and analyst_count > 0:
+        if analyst_count >= 3:
+            _ntm_w = 0.25
+        else:
+            _ntm_w = 0.10  # thin coverage — penalise NTM weight
+        # Reduce the company_history weight proportionally to make room for NTM.
+        _hist_w = max(growth_weights["company_history"] - _ntm_w, 0.10)
+        _ntm_company_growth = (
+            company_growth_pct * _hist_w
+            + ntm_growth_pct * _ntm_w
             + sector_growth_pct * growth_weights["sector_prior"]
             + (calibrated.revenue_growth_adj * 100) * growth_weights["learned_cohort"]
             + growth_pattern_pp
             + global_growth_pp
-            + relationship_growth_pp,
-            -15.0,
-            50.0,
-        ),
-        1,
-    )
+            + relationship_growth_pp
+        )
+        refined_growth = round(_clamp(_ntm_company_growth, -15.0, 50.0), 1)
+    else:
+        refined_growth = round(
+            _clamp(
+                company_growth_pct * growth_weights["company_history"]
+                + sector_growth_pct * growth_weights["sector_prior"]
+                + (calibrated.revenue_growth_adj * 100) * growth_weights["learned_cohort"]
+                + growth_pattern_pp
+                + global_growth_pp
+                + relationship_growth_pp,
+                -15.0,
+                50.0,
+            ),
+            1,
+        )
     refined_margin_target = round(
         _clamp(
             company_margin_target_pct * margin_weights["company_history"]
@@ -2587,6 +2654,9 @@ def refine_live_assumptions(
             "global_overlay_pp": global_terminal_growth_pp,
             "relationship_overlay_pp": relationship_terminal_growth_pp,
             "market_implied_overlay_pp": round(market_terminal_growth_pp, 2),
+            "market_implied_g_pct": round(market_implied_g * 100, 2) if market_implied_g is not None else None,
+            "revenue_regime": _revenue_regime,
+            "terminal_g_range": [round(_tg_range[0] * 100, 2), round(_tg_range[1] * 100, 2)],
             "source": risk_source + global_risk_source + relationship_risk_source + market_risk_source,
             "warn": _merge_guardrail_warn(risk_warn, regime_guardrail),
         },

@@ -15,6 +15,13 @@ from __future__ import annotations
 import statistics
 from typing import Any
 
+from auto_valuation.assumptions.headwind_table import (
+    classify_revenue_regime,
+    compute_structural_decline_flag,
+    get_industry_headwind_score,
+    terminal_g_prior_range,
+)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Growth anchor: blend sources  (Part 5, 38)
@@ -25,6 +32,9 @@ def blend_growth_estimate(
     ntm_consensus: float | None,
     sector_median_growth: float | None,
     weights: tuple[float, float, float] = (0.40, 0.40, 0.20),
+    *,
+    analyst_count: int = 0,
+    sector_analyst_accuracy: float | None = None,
 ) -> float:
     """
     Blend three growth anchors into a single near-term growth rate:
@@ -33,11 +43,24 @@ def blend_growth_estimate(
       - sector_median     (weight 0.20 default — or redistributed if not available)
 
     Missing sources have their weight redistributed pro-rata to the others.
-    Reference: Parts 5, 38.
+
+    analyst_count : number of analyst estimates (< 3 signals sparse coverage → reduce NTM weight)
+    sector_analyst_accuracy : sector-level analyst track record (< 0.5 → reduce NTM weight)
+
+    Reference: Parts 5, 38; ADAPTIVE_DCF_IMPROVEMENT_PLAN.md Layer F Tier 3.
     """
+    # Dynamic NTM weight adjustment based on analyst coverage depth and accuracy.
+    # Only penalise when we have explicit thin-coverage evidence (analyst_count > 0).
+    ntm_w = weights[1]
+    if ntm_consensus is not None:
+        if analyst_count > 0 and analyst_count < 3:
+            ntm_w = max(0.10, ntm_w - 0.15)
+        if sector_analyst_accuracy is not None and sector_analyst_accuracy < 0.50:
+            ntm_w = max(0.10, ntm_w - 0.10)
+
     sources = [
         (historical_cagr, weights[0]),
-        (ntm_consensus,   weights[1]),
+        (ntm_consensus,   ntm_w),
         (sector_median_growth, weights[2]),
     ]
     # Filter available sources
@@ -120,22 +143,55 @@ def build_growth_fade_schedule(
 # EBIT margin fade  (Part 10)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Per-sector mean-reversion speed (alpha) for EBIT margin convergence.
+# Higher alpha = faster mean-reversion toward sector median.
+# Source: ADAPTIVE_DCF_IMPROVEMENT_PLAN.md Layer G.
+_SECTOR_MARGIN_REVERSION_SPEED: dict[str, float] = {
+    "Information Technology":  0.22,
+    "Health Care":             0.20,
+    "Biotechnology":           0.25,
+    "Consumer Discretionary":  0.18,
+    "Consumer Staples":        0.15,
+    "Industrials":             0.12,
+    "Energy":                  0.13,
+    "Materials":               0.14,
+    "Financials":              0.16,
+    "Utilities":               0.10,
+    "Real Estate":             0.11,
+    "Communication Services":  0.20,
+    "default":                 0.18,
+}
+
+
 def build_margin_fade_schedule(
     base_margin: float,
     target_margin: float,
     forecast_years: int = 10,
     fade_years: int = 7,
+    *,
+    sector: str | None = None,
+    reversion_speed: float | None = None,
 ) -> list[float]:
     """
-    Linear fade from base_margin to target_margin over fade_years.
-    After fade_years, margin is held at target_margin.
+    Mean-reversion fade from base_margin toward target_margin.
 
-    Reference: Part 10.
+    Uses: margin_t = margin_{t-1} + alpha * (target_margin - margin_{t-1})
+    where alpha is a per-sector speed-of-adjustment parameter.
+
+    After fade_years the margin is held at target_margin.
+
+    Reference: Part 10; ADAPTIVE_DCF_IMPROVEMENT_PLAN.md Layer G.
     """
+    alpha = reversion_speed
+    if alpha is None:
+        alpha = _SECTOR_MARGIN_REVERSION_SPEED.get(
+            sector or "", _SECTOR_MARGIN_REVERSION_SPEED["default"]
+        )
     schedule: list[float] = []
+    m = base_margin
     for yr in range(1, forecast_years + 1):
         if yr <= fade_years:
-            m = base_margin + (target_margin - base_margin) * (yr / fade_years)
+            m = m + alpha * (target_margin - m)
         else:
             m = target_margin
         schedule.append(m)
@@ -201,6 +257,13 @@ def build_growth_assumptions(
     hold_years: int = 3,
     fade_years: int = 7,
     historical_cagr_years: int = 5,
+    *,
+    industry: str | None = None,
+    market_implied_g: float | None = None,
+    structural_break_score: float = 0.0,
+    rf_rate: float | None = None,
+    analyst_count: int = 0,
+    sector_analyst_accuracy: float | None = None,
 ) -> dict[str, Any]:
     """
     Produce a complete set of growth and margin assumptions.
@@ -208,15 +271,19 @@ def build_growth_assumptions(
     Returns a dict with:
       near_term_growth, terminal_growth, growth_schedule,
       base_ebit_margin, target_ebit_margin, margin_schedule,
+      revenue_regime, terminal_g_range, structural_decline_flag,
+      structural_decline_signals,
       sources (dict of individual anchors)
 
-    Reference: Parts 35, 38, 42.
+    Reference: Parts 35, 38, 42.  Layer C/D of DCF Accuracy Improvement Plan.
     """
-    # 1. Historical CAGR
+    # 1. Historical CAGRs (multi-window for trajectory detection)
     from auto_valuation.model.income_statement import (
         historical_revenue_cagr, historical_ebit_margin
     )
     hist_cagr  = historical_revenue_cagr(income_stmts, years=historical_cagr_years)
+    hist_cagr_3yr = historical_revenue_cagr(income_stmts, years=3) if len(income_stmts) >= 3 else hist_cagr
+    hist_cagr_10yr = historical_revenue_cagr(income_stmts, years=10) if len(income_stmts) >= 10 else None
     base_margin = historical_ebit_margin(income_stmts, use_normalized=True, years=3)
 
     # 2. NTM consensus
@@ -227,27 +294,57 @@ def build_growth_assumptions(
     sec_margin  = sector_median_ebit_margin(sector)
 
     # 4. Blend near-term growth
-    near_term = blend_growth_estimate(hist_cagr, ntm_growth, sec_growth)
+    near_term = blend_growth_estimate(
+        hist_cagr, ntm_growth, sec_growth,
+        analyst_count=analyst_count,
+        sector_analyst_accuracy=sector_analyst_accuracy,
+    )
 
-    # 5. Schedules
+    # 5. Layer C — Trajectory-constrained terminal g prior range
+    revenue_regime = classify_revenue_regime(
+        hist_cagr_3yr, hist_cagr, hist_cagr_10yr, ntm_growth, market_implied_g
+    )
+    tg_range = terminal_g_prior_range(revenue_regime, rf_rate=rf_rate, sector=sector)
+
+    # Clamp the provided terminal_growth to the trajectory-consistent range
+    terminal_growth_constrained = max(tg_range[0], min(terminal_growth, tg_range[1]))
+
+    # 6. Layer D — Structural decline detection
+    headwind_score = get_industry_headwind_score(industry)
+    is_structural_decline, decline_signals = compute_structural_decline_flag(
+        cagr_3yr=hist_cagr_3yr,
+        cagr_10yr=hist_cagr_10yr,
+        market_implied_g=market_implied_g,
+        structural_break_score=structural_break_score,
+        industry_headwind_score=headwind_score,
+    )
+
+    # 7. Schedules (use constrained terminal growth)
     growth_schedule = build_growth_fade_schedule(
-        near_term, terminal_growth, forecast_years, hold_years, fade_years
+        near_term, terminal_growth_constrained, forecast_years, hold_years, fade_years
     )
     margin_schedule = build_margin_fade_schedule(
-        base_margin, sec_margin, forecast_years, fade_years
+        base_margin, sec_margin, forecast_years, fade_years, sector=sector
     )
 
     return {
-        "near_term_growth":  near_term,
-        "terminal_growth":   terminal_growth,
-        "growth_schedule":   growth_schedule,
-        "base_ebit_margin":  base_margin,
-        "target_ebit_margin": sec_margin,
-        "margin_schedule":   margin_schedule,
+        "near_term_growth":         near_term,
+        "terminal_growth":          terminal_growth_constrained,
+        "terminal_g_range":         tg_range,
+        "revenue_regime":           revenue_regime,
+        "structural_decline_flag":  is_structural_decline,
+        "structural_decline_signals": decline_signals,
+        "growth_schedule":          growth_schedule,
+        "base_ebit_margin":         base_margin,
+        "target_ebit_margin":       sec_margin,
+        "margin_schedule":          margin_schedule,
         "sources": {
             "historical_cagr":       hist_cagr,
+            "historical_cagr_3yr":   hist_cagr_3yr,
+            "historical_cagr_10yr":  hist_cagr_10yr,
             "ntm_consensus_growth":  ntm_growth,
             "sector_median_growth":  sec_growth,
             "sector_median_margin":  sec_margin,
+            "headwind_score":        headwind_score,
         },
     }

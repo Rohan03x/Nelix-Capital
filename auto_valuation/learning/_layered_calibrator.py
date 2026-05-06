@@ -49,6 +49,15 @@ class CalibrationObservation:
     actual_ufcf_margin: float | None = None
     predicted_reinvestment_rate: float | None = None
     actual_reinvestment_rate: float | None = None
+    # Layer 6/7 — D&A, capex, tax rate, SBC accuracy tracking
+    predicted_da_pct: float | None = None
+    actual_da_pct: float | None = None
+    predicted_capex_pct: float | None = None
+    actual_capex_pct: float | None = None
+    predicted_tax_rate: float | None = None
+    actual_tax_rate: float | None = None
+    predicted_sbc_pct: float | None = None
+    actual_sbc_pct: float | None = None
     structural_break_flag: bool = False
     # BRAIN_IMPROVEMENT_PLAN.md (H4) — graded structural break score (0.0=clean, 1.0=severe break)
     structural_break_score: float = 0.0
@@ -423,10 +432,36 @@ class CalibrationStore:
                     margin_volatility REAL DEFAULT 0.0,
                     quality_score REAL DEFAULT 1.0,
                     source TEXT,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    predicted_da_pct REAL,
+                    actual_da_pct REAL,
+                    predicted_capex_pct REAL,
+                    actual_capex_pct REAL,
+                    predicted_tax_rate REAL,
+                    actual_tax_rate REAL,
+                    predicted_sbc_pct REAL,
+                    actual_sbc_pct REAL
                 )
                 """
             )
+            # Migrate existing DB: add new columns if they don't exist
+            _new_cols = [
+                ("predicted_da_pct", "REAL"),
+                ("actual_da_pct", "REAL"),
+                ("predicted_capex_pct", "REAL"),
+                ("actual_capex_pct", "REAL"),
+                ("predicted_tax_rate", "REAL"),
+                ("actual_tax_rate", "REAL"),
+                ("predicted_sbc_pct", "REAL"),
+                ("actual_sbc_pct", "REAL"),
+            ]
+            _existing = {row[1] for row in conn.execute("PRAGMA table_info(calibration_observations)").fetchall()}
+            for _col_name, _col_type in _new_cols:
+                if _col_name not in _existing:
+                    try:
+                        conn.execute(f"ALTER TABLE calibration_observations ADD COLUMN {_col_name} {_col_type}")
+                    except Exception:
+                        pass
             conn.commit()
 
     def save_prior(self, prior: CalibrationPrior) -> None:
@@ -478,8 +513,12 @@ class CalibrationStore:
                     predicted_terminal_growth, actual_terminal_growth,
                     rf_rate_at_time, growth_regime,
                     structural_break_score, revenue_volatility, margin_volatility,
-                    quality_score, source, created_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    quality_score, source, created_at,
+                    predicted_da_pct, actual_da_pct,
+                    predicted_capex_pct, actual_capex_pct,
+                    predicted_tax_rate, actual_tax_rate,
+                    predicted_sbc_pct, actual_sbc_pct
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     obs_id, obs.ticker, obs.sector, obs.industry,
@@ -492,6 +531,10 @@ class CalibrationStore:
                     obs.rf_rate_at_time, obs.growth_regime,
                     obs.structural_break_score, obs.revenue_volatility, obs.margin_volatility,
                     obs.quality_score, source, created_at,
+                    obs.predicted_da_pct, obs.actual_da_pct,
+                    obs.predicted_capex_pct, obs.actual_capex_pct,
+                    obs.predicted_tax_rate, obs.actual_tax_rate,
+                    obs.predicted_sbc_pct, obs.actual_sbc_pct,
                 ),
             )
             conn.commit()
@@ -740,8 +783,11 @@ def _build_assumption_summary(
     layer_payloads: list[tuple[str, int, float, float, float, str]] = []
     for layer_name, cohort, priority, rationale in layer_sources:
         # BRAIN_IMPROVEMENT_PLAN.md (M3) — WACC uses rate-era-adjusted errors
+        # ADAPTIVE_DCF_IMPROVEMENT_PLAN.md — terminal_growth uses rate-era-adjusted errors
         if assumption_name == "wacc":
             errors = _wacc_rate_era_adjusted_errors(cohort, assumption_name)
+        elif assumption_name == "terminal_growth":
+            errors = _terminal_g_rate_era_adjusted_errors(cohort, assumption_name)
         else:
             errors = _error_series(cohort, spec.actual_key, spec.predicted_key, assumption_name=assumption_name)
         if not errors:
@@ -897,6 +943,37 @@ def _wacc_rate_era_adjusted_errors(
     return errors
 
 
+# ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (Rate-era terminal g) — rate-era adjustment for terminal growth.
+# During low-rate eras (2012-2022), market-implied g was systematically elevated.
+# Strip k * (rf - baseline) from terminal g errors to avoid era-contaminated calibration.
+_K_RATE_TG: float = 0.30  # sensitivity of market-implied g to rate changes
+
+
+def _terminal_g_rate_era_adjusted_errors(
+    observations: list[Any],
+    assumption_name: str,
+) -> list[float]:
+    """Compute terminal growth errors with rate-era adjustment.
+    adjusted_error = (g_actual - g_predicted) - k * (rf - rf_baseline)
+    Falls back to raw error when rf_rate_at_time is unavailable.
+    """
+    from auto_valuation.learning.residual_controls import clamp_assumption_residual
+    errors: list[float] = []
+    for obs in observations:
+        actual = _get(obs, "actual_terminal_growth")
+        predicted = _get(obs, "predicted_terminal_growth")
+        if actual is None or predicted is None:
+            continue
+        raw_error = float(actual) - float(predicted)
+        rf_at_time = _get(obs, "rf_rate_at_time")
+        if rf_at_time is not None:
+            raw_error -= _K_RATE_TG * (float(rf_at_time) - _RF_LONG_RUN_BASELINE)
+        bounded = clamp_assumption_residual(assumption_name, raw_error)
+        if bounded is not None:
+            errors.append(bounded)
+    return errors
+
+
 def _summary_source(
     summary: AssumptionCalibrationSummary,
     *,
@@ -946,6 +1023,11 @@ def calibrate(
     calibration_store: CalibrationStore | None = None,
     ticker: str | None = None,
     feature_vector: dict[str, float] | tuple[float, ...] | list[float] | None = None,
+    # Layer C/D — trajectory-constrained terminal g range [low, high]
+    terminal_g_range: tuple[float, float] | None = None,
+    # Layer E — market-implied g from reverse DCF for 7th calibration layer
+    market_implied_terminal_g: float | None = None,
+    market_cap_mm: float | None = None,
 ) -> CalibratedAssumptions:
     observations_list = list(observations or [])
     min_observations = int(min_observations or _LEARNING_CONFIG.get("min_calibration_observations", 5))
@@ -1000,7 +1082,14 @@ def calibrate(
         ),
         "terminal_growth": _build_assumption_summary(
             "terminal_growth",
-            _AssumptionSpec("actual_terminal_growth", "predicted_terminal_growth", terminal_base, 0.003, 0.0, 0.06),
+            _AssumptionSpec(
+                "actual_terminal_growth",
+                "predicted_terminal_growth",
+                terminal_base,
+                0.003,
+                terminal_g_range[0] if terminal_g_range is not None else -0.06,
+                terminal_g_range[1] if terminal_g_range is not None else 0.06,
+            ),
             layer_sources,
             min_observations,
             structural_break,
@@ -1026,7 +1115,75 @@ def calibrate(
             min_observations,
             structural_break,
         ),
+        "da_pct": _build_assumption_summary(
+            "da_pct",
+            _AssumptionSpec("actual_da_pct", "predicted_da_pct", raw_assumptions.da_pct_revenue, 0.005, 0.0, 0.30),
+            layer_sources,
+            min_observations,
+            structural_break,
+        ),
+        "capex_pct": _build_assumption_summary(
+            "capex_pct",
+            _AssumptionSpec("actual_capex_pct", "predicted_capex_pct", raw_assumptions.capex_pct_revenue, 0.005, 0.0, 0.50),
+            layer_sources,
+            min_observations,
+            structural_break,
+        ),
+        "tax_rate": _build_assumption_summary(
+            "tax_rate",
+            _AssumptionSpec("actual_tax_rate", "predicted_tax_rate", raw_assumptions.effective_tax_rate, 0.005, 0.0, 0.50),
+            layer_sources,
+            min_observations,
+            structural_break,
+        ),
+        "sbc_pct": _build_assumption_summary(
+            "sbc_pct",
+            _AssumptionSpec("actual_sbc_pct", "predicted_sbc_pct", raw_assumptions.sbc_pct_revenue, 0.003, 0.0, 0.25),
+            layer_sources,
+            min_observations,
+            structural_break,
+        ),
     }
+
+    # Layer E — Market-implied g blending.
+    # Blend the calibrated terminal_growth with the market-implied value when
+    # a reverse-DCF result is available. Weight is a function of market cap
+    # (larger = more liquid = market price more informative) and structural break
+    # score (higher break = less weight on market price for company-specific reasons).
+    _tg_summary = summaries["terminal_growth"]
+    _calibrated_tg = _tg_summary.adjusted_value
+    if market_implied_terminal_g is not None:
+        _w_base = 0.65 if structural_break.score > 0.70 else 0.40
+        _cap_factor = 1.0
+        if market_cap_mm is not None and market_cap_mm > 0:
+            import math as _math
+            _cap_factor = min(1.0, _math.log10(max(market_cap_mm, 1.0)) / 4.0)
+        _w = _clamp(_w_base * (1.0 - 0.5 * structural_break.score) * _cap_factor, 0.05, 0.70)
+        _tg_low = terminal_g_range[0] if terminal_g_range is not None else -0.06
+        _tg_high = terminal_g_range[1] if terminal_g_range is not None else 0.06
+        _blended = _clamp(
+            (1.0 - _w) * _calibrated_tg + _w * float(market_implied_terminal_g),
+            _tg_low, _tg_high,
+        )
+        # Rebuild the terminal_growth summary with the blended adjusted_value
+        summaries["terminal_growth"] = AssumptionCalibrationSummary(
+            assumption_name=_tg_summary.assumption_name,
+            base_value=_tg_summary.base_value,
+            adjusted_value=_blended,
+            residual_adjustment=_blended - _tg_summary.base_value,
+            band=_band(_blended, _tg_summary.uncertainty, _tg_low, _tg_high),
+            uncertainty=_tg_summary.uncertainty,
+            confidence=_tg_summary.confidence,
+            evidence_count=_tg_summary.evidence_count,
+            conflict_score=_tg_summary.conflict_score,
+            weak_evidence=_tg_summary.weak_evidence,
+            dominant_layer=_tg_summary.dominant_layer,
+            layers=_tg_summary.layers,
+            rationale=(
+                _tg_summary.rationale
+                + f" Market-implied g ({market_implied_terminal_g:.1%}) blended with weight w={_w:.2f}."
+            ),
+        )
 
     for assumption_name, summary in summaries.items():
         _save_prior(

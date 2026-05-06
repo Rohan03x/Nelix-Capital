@@ -66,7 +66,28 @@ def _cohort_stats(rows: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
         "revenue_error": _metric_stats([p.get("revenue_error_pct") for p in payloads]),
         "ev_error": _metric_stats([p.get("ev_error_pct") for p in payloads]),
         "price_return_error": _metric_stats([p.get("price_return_error_pct") for p in payloads]),
+        "margin_error_bps": _metric_stats([p.get("margin_error_bps") for p in payloads], cap=2000.0),
+        "terminal_g_error_bps": _metric_stats([p.get("terminal_g_error_bps") for p in payloads], cap=1000.0),
+        "wacc_error_bps": _metric_stats([p.get("wacc_error_bps") for p in payloads], cap=500.0),
+        "da_error_pct": _metric_stats([p.get("da_error_pct") for p in payloads]),
+        "capex_error_pct": _metric_stats([p.get("capex_error_pct") for p in payloads]),
+        "sbc_error_pct": _metric_stats([p.get("sbc_error_pct") for p in payloads]),
     }
+
+
+def _per_sector_stats(rows: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+    """Build per-sector breakdown of error metrics."""
+    from collections import defaultdict
+    sector_rows: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+    for created_at, payload in rows:
+        snap = payload.get("prediction_snapshot") or {}
+        sector = snap.get("sector") or payload.get("sector") or "Unknown"
+        sector_rows[sector].append((created_at, payload))
+
+    result: dict[str, Any] = {}
+    for sector, sector_data in sorted(sector_rows.items()):
+        result[sector] = _cohort_stats(sector_data)
+    return result
 
 
 def _split_cohorts(rows: list[tuple[str, dict[str, Any]]], *, chunk_size: int) -> dict[str, Any]:
@@ -164,6 +185,7 @@ def build_learning_performance_report(
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "ledger": _ledger_counts(reader),
         "cohorts": _split_cohorts(postmortems, chunk_size=chunk_size),
+        "per_sector": _per_sector_stats(postmortems),
         "throughput": _throughput(postmortems),
         "calibration": _calibration_summary(calibration_store),
         "targets": {

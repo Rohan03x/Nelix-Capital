@@ -176,9 +176,11 @@ class TestBuildEbitMarginForecast:
         assert len(result) == 10
 
     def test_first_year_not_base_margin(self):
-        # Year 1 is base + 1/fade_years * (target - base)
+        # Year 1 follows mean-reversion: margin_1 = base + alpha * (target - base)
+        # Default alpha (_SECTOR_MARGIN_REVERSION_SPEED["default"]) = 0.18
         result = build_ebit_margin_forecast(0.10, 0.20, forecast_years=10, fade_years=10)
-        assert result[0] == pytest.approx(0.10 + (0.20 - 0.10) * (1 / 10), rel=1e-4)
+        alpha_default = 0.18
+        assert result[0] == pytest.approx(0.10 + alpha_default * (0.20 - 0.10), rel=1e-4)
 
     def test_last_year_equals_target_margin(self):
         result = build_ebit_margin_forecast(0.10, 0.20, forecast_years=10, fade_years=7)

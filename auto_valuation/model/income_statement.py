@@ -181,21 +181,24 @@ def build_ebit_margin_forecast(
     target_margin: float,
     forecast_years: int = 10,
     fade_years: int = 7,
+    *,
+    sector: str | None = None,
+    reversion_speed: float | None = None,
 ) -> list[float]:
     """
-    Fade EBIT margin from base_margin to target_margin over fade_years,
+    Mean-reversion fade from base_margin toward target_margin over fade_years,
     then hold at target_margin for remaining forecast_years.
 
-    Reference: Part 10.
+    Uses: margin_t = margin_{t-1} + alpha * (target_margin - margin_{t-1})
+    where alpha is a per-sector mean-reversion speed.
+
+    Reference: Part 10; ADAPTIVE_DCF_IMPROVEMENT_PLAN.md Layer G.
     """
-    margins: list[float] = []
-    for yr in range(1, forecast_years + 1):
-        if yr <= fade_years:
-            m = base_margin + (target_margin - base_margin) * (yr / fade_years)
-        else:
-            m = target_margin
-        margins.append(m)
-    return margins
+    from auto_valuation.assumptions.growth import build_margin_fade_schedule
+    return build_margin_fade_schedule(
+        base_margin, target_margin, forecast_years, fade_years,
+        sector=sector, reversion_speed=reversion_speed,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

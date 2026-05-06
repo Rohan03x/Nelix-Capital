@@ -182,7 +182,14 @@ def enforce_terminal_growth_consistency(
     terminal_reinvestment_rate: float,
     tolerance: float = 0.02,
 ) -> tuple[float, str | None]:
-    """Cap terminal growth when it exceeds ROIC × reinvestment capacity."""
+    """Cap terminal growth when it exceeds ROIC × reinvestment capacity.
+    For negative terminal growth, floor at -0.10 (hard limit)."""
+    # Hard floor: no company expected to shrink faster than -10%/yr in perpetuity
+    if terminal_growth < -0.10:
+        return -0.10, (
+            f"Terminal growth floored from {terminal_growth:.2%} to -10.00%; "
+            f"negative terminal growth values below -10% are economically unrealistic."
+        )
     if terminal_growth <= 0 or terminal_roic <= 0:
         return terminal_growth, None
     implied_growth = terminal_roic * terminal_reinvestment_rate

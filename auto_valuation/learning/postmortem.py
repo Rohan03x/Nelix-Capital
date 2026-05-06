@@ -54,6 +54,18 @@ class PostmortemRecord:
     macro_backdrop_at_horizon: dict[str, float] = field(default_factory=dict)
     actual_wacc: float | None = None
     actual_terminal_growth: float | None = None
+    # Layer 6 — sub-driver error tracking
+    da_error_pct: float | None = None
+    capex_error_pct: float | None = None
+    tax_rate_error_bps: float | None = None
+    sbc_error_pct: float | None = None
+    terminal_g_error_bps: float | None = None
+    wacc_error_bps: float | None = None
+    near_term_margin_error_bps: float | None = None
+    terminal_margin_error_bps: float | None = None
+    # Gap 6 — EV error decomposition via first-order DCF partial derivatives
+    # {driver: delta_ev_mm} — how many $M each driver contributed to the EV miss
+    ev_partial_attribution: dict[str, float] = field(default_factory=dict)
     realized_outcome_id: str | None = None
     realized_label_status: str = "pending"
     realized_unknown_targets: list[str] = field(default_factory=list)
@@ -184,6 +196,15 @@ def _postmortem_from_payload(payload: dict[str, Any]) -> PostmortemRecord:
         macro_backdrop_at_horizon=dict(payload.get("macro_backdrop_at_horizon") or {}),
         actual_wacc=payload.get("actual_wacc"),
         actual_terminal_growth=payload.get("actual_terminal_growth"),
+        da_error_pct=payload.get("da_error_pct"),
+        capex_error_pct=payload.get("capex_error_pct"),
+        tax_rate_error_bps=payload.get("tax_rate_error_bps"),
+        sbc_error_pct=payload.get("sbc_error_pct"),
+        terminal_g_error_bps=payload.get("terminal_g_error_bps"),
+        wacc_error_bps=payload.get("wacc_error_bps"),
+        near_term_margin_error_bps=payload.get("near_term_margin_error_bps"),
+        terminal_margin_error_bps=payload.get("terminal_margin_error_bps"),
+        ev_partial_attribution=dict(payload.get("ev_partial_attribution") or {}),
         realized_outcome_id=payload.get("realized_outcome_id"),
         realized_label_status=str(payload.get("realized_label_status") or "pending"),
         realized_unknown_targets=list(payload.get("realized_unknown_targets") or []),
@@ -215,6 +236,123 @@ def _model_bias_signal(errors: list[float]) -> str:
     return "neutral"
 
 
+# ---------------------------------------------------------------------------
+# Reverse-DCF: solve for market-implied terminal growth given EV and UFCF
+# ---------------------------------------------------------------------------
+
+def _solve_implied_terminal_growth(
+    actual_ev_mm: float,
+    pv_explicit_ufcfs: float,
+    terminal_ufcf: float,
+    wacc: float,
+    discount_factor_at_terminal: float,
+    *,
+    g_low: float = -0.10,
+    g_high_cap: float | None = None,
+    max_iter: int = 100,
+    tol: float = 1e-6,
+) -> float | None:
+    """
+    Solve for g in: actual_ev = pv_explicit + terminal_ufcf*(1+g)/(wacc-g)*df_terminal
+    using bisection. Returns None if not solvable.
+    """
+    import math
+    if terminal_ufcf is None or abs(terminal_ufcf) < 1e-9 or discount_factor_at_terminal < 1e-9:
+        return None
+    if wacc <= 0.0:
+        return None
+    g_high = g_high_cap if g_high_cap is not None else wacc - 0.005
+    g_high = min(g_high, wacc - 0.001)
+    if g_low >= g_high:
+        return None
+
+    def _tv_pv(g: float) -> float:
+        denom = wacc - g
+        if abs(denom) < 1e-9:
+            return float("inf")
+        tv = terminal_ufcf * (1.0 + g) / denom
+        return pv_explicit_ufcfs + tv * discount_factor_at_terminal
+
+    try:
+        f_low = _tv_pv(g_low) - actual_ev_mm
+        f_high = _tv_pv(g_high) - actual_ev_mm
+    except Exception:
+        return None
+
+    if f_low * f_high > 0:
+        # Try shrinking g_high
+        for _g in [g_high - 0.01, g_high - 0.02, g_high - 0.03]:
+            if _g <= g_low:
+                break
+            try:
+                _f = _tv_pv(_g) - actual_ev_mm
+                if f_low * _f <= 0:
+                    g_high = _g
+                    f_high = _f
+                    break
+            except Exception:
+                continue
+        else:
+            return None
+
+    for _ in range(max_iter):
+        g_mid = (g_low + g_high) / 2.0
+        try:
+            f_mid = _tv_pv(g_mid) - actual_ev_mm
+        except Exception:
+            return None
+        if abs(f_mid) < tol or (g_high - g_low) / 2.0 < tol:
+            return g_mid
+        if f_low * f_mid <= 0:
+            g_high = g_mid
+        else:
+            g_low = g_mid
+            f_low = f_mid
+    return (g_low + g_high) / 2.0
+
+
+def _compute_implied_wacc_and_tg(
+    prediction: Any,
+    actuals: dict[str, Any],
+) -> tuple[float | None, float | None]:
+    """
+    Given a prediction snapshot and realized actuals, compute:
+    - actual_wacc: best estimate of the cost of capital implied by actual outcomes
+      (use the DCF WACC from prediction; override if actuals provide it directly)
+    - actual_terminal_growth: reverse-solved from Gordon Growth Model using
+      actual EV, actual UFCF, and prediction's WACC
+    """
+    # 1. WACC: use prediction's wacc as proxy (it's the best available without
+    #    re-running a full WACC build from horizon-date fundamentals)
+    pred_wacc: float | None = getattr(prediction, "predicted_wacc", None)
+    actual_wacc_direct: float | None = actuals.get("actual_wacc")
+    resolved_wacc = actual_wacc_direct if actual_wacc_direct is not None else pred_wacc
+
+    # 2. Terminal growth from reverse DCF
+    actual_ev = actuals.get("actual_ev_mm")
+    actual_ufcf = actuals.get("actual_ufcf_mm")
+    if actual_ev is None or actual_ufcf is None or resolved_wacc is None:
+        return resolved_wacc, None
+    if actual_ev <= 0 or resolved_wacc <= 0:
+        return resolved_wacc, None
+
+    # Use terminal UFCF as current actual_ufcf (year N)
+    # The explicit PV is unavailable at postmortem time, so use actual_ev
+    # as the full PV target with pv_explicit=0 and terminal_ufcf = actual_ufcf.
+    # This solves: actual_ev = ufcf*(1+g)/(wacc-g) * 1.0 → simpler form.
+    # Rearranging: actual_ev * (wacc - g) = ufcf * (1 + g)
+    #              actual_ev * wacc - actual_ev * g = ufcf + ufcf * g
+    #              g * (actual_ev + ufcf) = actual_ev * wacc - ufcf
+    #              g = (actual_ev * wacc - actual_ufcf) / (actual_ev + actual_ufcf)
+    denom = actual_ev + actual_ufcf
+    if abs(denom) < 1e-9:
+        return resolved_wacc, None
+    g_implied = (actual_ev * resolved_wacc - actual_ufcf) / denom
+    # Clamp to [-0.10, wacc - 0.005] for sanity
+    g_implied = max(-0.10, min(g_implied, resolved_wacc - 0.005))
+    return resolved_wacc, g_implied
+
+
 def fetch_actual_financials_for_year(ticker: str, horizon_year: int) -> dict[str, Any]:
     return {
         "actual_revenue_mm": None,
@@ -227,6 +365,88 @@ def fetch_actual_financials_for_year(ticker: str, horizon_year: int) -> dict[str
         "structural_break_hints": [],
         "unknown_targets": list(REALIZED_VALUE_FIELDS),
         "notes": f"No default actuals provider configured for {ticker} FY{horizon_year}.",
+    }
+
+
+def _compute_ev_partial_attribution(
+    predicted_ev_mm: float | None,
+    actual_ev_mm: float | None,
+    predicted_wacc: float | None,
+    actual_wacc: float | None,
+    predicted_tg: float | None,
+    actual_tg: float | None,
+    predicted_ufcf_margin: float | None,
+    actual_ebit_margin: float | None,
+    predicted_ebit_margin: float | None,
+    predicted_revenue_mm: float | None,
+    actual_revenue_mm: float | None,
+) -> dict[str, float]:
+    """Compute first-order partial-derivative decomposition of the EV miss ($M).
+
+    For TV = last_ufcf * (1+g) / (WACC - g):
+      ∂TV/∂WACC = -TV / (WACC - g)
+      ∂TV/∂g    = TV * WACC / (WACC - g)^2  [but TV/(WACC-g) = last_ufcf*(1+g)/(WACC-g)^2]
+      ∂TV/∂ufcf = (1+g) / (WACC - g)
+
+    Returns {driver: delta_ev_mm}, positive = over-prediction, negative = under-prediction.
+    """
+    if predicted_ev_mm is None or actual_ev_mm is None:
+        return {}
+    total_ev_error = actual_ev_mm - predicted_ev_mm
+
+    wacc = predicted_wacc or 0.10
+    g = predicted_tg or 0.03
+    if wacc <= g or (wacc - g) < 1e-6:
+        return {"total_ev_miss_mm": round(total_ev_error, 2)}
+
+    # Proxy terminal UFCF from predicted EV using Gordon Growth reversal
+    # TV = last_ufcf * (1+g) / (WACC-g)  and  PV(TV) ≈ predicted_ev * tv_fraction
+    # Use tv_fraction ≈ 0.6 as typical DCF terminal value weight
+    tv_fraction = 0.60
+    pv_tv_estimate = (predicted_ev_mm or 0.0) * tv_fraction
+    denom = wacc - g
+    tv_estimate = pv_tv_estimate  # simplified: assume discount factor ≈ 1 for this linear approx
+    last_ufcf_estimate = tv_estimate * denom / (1.0 + g) if (1.0 + g) > 1e-9 else 0.0
+
+    # Partial derivatives
+    dtv_dwacc = -tv_estimate / denom if abs(denom) > 1e-9 else 0.0
+    dtv_dg = tv_estimate * wacc / (denom * denom) if abs(denom) > 1e-9 else 0.0
+    dtv_dufcf = (1.0 + g) / denom if abs(denom) > 1e-9 else 0.0
+
+    delta_wacc = (actual_wacc - wacc) if actual_wacc is not None else 0.0
+    delta_g = (actual_tg - g) if actual_tg is not None else 0.0
+    # UFCF margin error → proxy as ebit_margin error * (1 - tax) * revenue
+    tax_proxy = 0.22
+    rev_mm = actual_revenue_mm or predicted_revenue_mm or 0.0
+    if actual_ebit_margin is not None and predicted_ebit_margin is not None:
+        delta_ufcf_margin = (actual_ebit_margin - predicted_ebit_margin) * (1.0 - tax_proxy)
+    elif actual_revenue_mm is not None and predicted_revenue_mm is not None and predicted_revenue_mm > 0:
+        delta_revenue_pct = (actual_revenue_mm - predicted_revenue_mm) / predicted_revenue_mm
+        delta_ufcf_margin = delta_revenue_pct * (predicted_ufcf_margin or 0.0)
+    else:
+        delta_ufcf_margin = 0.0
+    delta_ufcf_mm = delta_ufcf_margin * rev_mm
+
+    wacc_contribution = dtv_dwacc * delta_wacc
+    tg_contribution = dtv_dg * delta_g
+    ufcf_contribution = dtv_dufcf * delta_ufcf_mm / rev_mm if rev_mm > 1e-3 else 0.0
+    # Revenue error: explicit PV ≈ (1-tv_fraction) of EV; treated as separate driver
+    if actual_revenue_mm is not None and predicted_revenue_mm is not None and predicted_revenue_mm > 0:
+        revenue_pct_error = (actual_revenue_mm - predicted_revenue_mm) / predicted_revenue_mm
+        revenue_contribution = (predicted_ev_mm or 0.0) * (1.0 - tv_fraction) * revenue_pct_error
+    else:
+        revenue_contribution = 0.0
+
+    explained = wacc_contribution + tg_contribution + ufcf_contribution + revenue_contribution
+    residual = total_ev_error - explained
+
+    return {
+        "wacc_delta_ev_mm": round(wacc_contribution, 2),
+        "terminal_g_delta_ev_mm": round(tg_contribution, 2),
+        "ufcf_margin_delta_ev_mm": round(ufcf_contribution, 2),
+        "revenue_delta_ev_mm": round(revenue_contribution, 2),
+        "residual_delta_ev_mm": round(residual, 2),
+        "total_ev_miss_mm": round(total_ev_error, 2),
     }
 
 
@@ -279,11 +499,70 @@ def run_annual_postmortem(
 
         bias_errors.append(ev_error_pct)
         structural_break_hints = list(actuals.get("structural_break_hints") or [])
-        # BRAIN_IMPROVEMENT_PLAN.md (H4) — graded structural break score instead of binary flag.
-        # Scales 0.0 (clean) to 1.0 (severe break); hint keywords each add 0.15.
+        # Compute implied WACC and terminal g via reverse-DCF / Gordon Growth
+        _implied_wacc, _implied_tg = _compute_implied_wacc_and_tg(prediction, actuals)
+
+        # Sub-driver error tracking (Layer 6)
+        _pred_da = prediction.prediction_snapshot.get("predicted_da_pct") if hasattr(prediction, "prediction_snapshot") else None
+        _actual_da = actuals.get("actual_da_pct")
+        _pred_capex = prediction.prediction_snapshot.get("predicted_capex_pct") if hasattr(prediction, "prediction_snapshot") else None
+        _actual_capex = actuals.get("actual_capex_pct")
+        _pred_tax = getattr(prediction, "predicted_tax_rate", None)
+        _actual_tax = actuals.get("actual_tax_rate")
+        _pred_sbc = prediction.prediction_snapshot.get("predicted_sbc_pct") if hasattr(prediction, "prediction_snapshot") else None
+        _actual_sbc = actuals.get("actual_sbc_pct")
+        _pred_tg = getattr(prediction, "predicted_terminal_growth", None) or prediction.prediction_snapshot.get("predicted_terminal_growth")
+        _pred_wacc = getattr(prediction, "predicted_wacc", None) or prediction.prediction_snapshot.get("predicted_wacc")
+
+        _da_error_pct = _safe_pct_error(_actual_da, _pred_da) if _actual_da is not None and _pred_da is not None else None
+        _capex_error_pct = _safe_pct_error(_actual_capex, _pred_capex) if _actual_capex is not None and _pred_capex is not None else None
+        _tax_error_bps = ((_actual_tax or 0.0) - (_pred_tax or 0.0)) * 10_000 if _actual_tax is not None and _pred_tax is not None else None
+        _sbc_error_pct = _safe_pct_error(_actual_sbc, _pred_sbc) if _actual_sbc is not None and _pred_sbc is not None else None
+        _tg_error_bps = ((_implied_tg or 0.0) - (_pred_tg or 0.0)) * 10_000 if _implied_tg is not None and _pred_tg is not None else None
+        _wacc_error_bps = ((_implied_wacc or 0.0) - (_pred_wacc or 0.0)) * 10_000 if _implied_wacc is not None and _pred_wacc is not None else None
+        _near_margin_error_bps = margin_error_bps  # identical to margin_error_bps for now
+
+        # Layer G — terminal margin error: predicted target EBIT margin vs actual horizon margin
+        _pred_target_margin = (
+            prediction.prediction_snapshot.get("target_ebit_margin")
+            or prediction.prediction_snapshot.get("predicted_target_ebit_margin")
+            if hasattr(prediction, "prediction_snapshot")
+            else None
+        )
+        _terminal_margin_error_bps = (
+            (_pred_target_margin - actual_margin) * 10_000
+            if _pred_target_margin is not None and actual_margin is not None
+            else None
+        )
+
+        # Gap 6 — EV error decomposition via first-order DCF partial derivatives
+        _ev_partial_attribution = _compute_ev_partial_attribution(
+            predicted_ev_mm=prediction.predicted_ev_mm,
+            actual_ev_mm=actuals.get("actual_ev_mm"),
+            predicted_wacc=_pred_wacc,
+            actual_wacc=_implied_wacc,
+            predicted_tg=_pred_tg,
+            actual_tg=_implied_tg,
+            predicted_ufcf_margin=prediction.prediction_snapshot.get("predicted_ufcf_margin")
+                if hasattr(prediction, "prediction_snapshot") else None,
+            actual_ebit_margin=actual_margin,
+            predicted_ebit_margin=prediction.predicted_ebit_margin,
+            predicted_revenue_mm=prediction.predicted_revenue_mm,
+            actual_revenue_mm=actuals.get("actual_revenue_mm"),
+        )
+
+        # Priority 8 — improved multi-variable structural break score.
+        # Combines revenue error, margin shock, ev error, hint count, and WACC/tg shifts.
+        _wacc_shock = abs(_wacc_error_bps or 0.0) / 500.0  # 500bps WACC move = score 1.0
+        _tg_shock = abs(_tg_error_bps or 0.0) / 500.0      # 500bps tg move = score 1.0
+        _margin_shock = abs(margin_error_bps) / 1000.0      # 1000bps margin move = score 1.0
         structural_break_score = min(
             1.0,
-            abs(revenue_error_pct) / 50.0 + len(structural_break_hints) * 0.15
+            abs(revenue_error_pct) / 50.0
+            + len(structural_break_hints) * 0.15
+            + _margin_shock * 0.30
+            + _wacc_shock * 0.15
+            + _tg_shock * 0.10
         )
         structural_break = structural_break_score >= 0.50 or bool(structural_break_hints)
         surprise_flags = list(actuals.get("surprise_flags") or [])
@@ -323,8 +602,17 @@ def run_annual_postmortem(
             },
             macro_backdrop_at_prediction=dict(prediction.macro_backdrop or {}),
             macro_backdrop_at_horizon=dict(actuals.get("macro_backdrop") or {}),
-            actual_wacc=actuals.get("actual_wacc"),
-            actual_terminal_growth=actuals.get("actual_terminal_growth"),
+            actual_wacc=_implied_wacc,
+            actual_terminal_growth=_implied_tg,
+            da_error_pct=_da_error_pct,
+            capex_error_pct=_capex_error_pct,
+            tax_rate_error_bps=_tax_error_bps,
+            sbc_error_pct=_sbc_error_pct,
+            terminal_g_error_bps=_tg_error_bps,
+            wacc_error_bps=_wacc_error_bps,
+            near_term_margin_error_bps=_near_margin_error_bps,
+            terminal_margin_error_bps=_terminal_margin_error_bps,
+            ev_partial_attribution=_ev_partial_attribution,
             realized_outcome_id=actuals.get("realized_outcome_id"),
             realized_label_status=str(actuals.get("realized_label_status") or "pending"),
             realized_unknown_targets=list(actuals.get("unknown_targets") or []),

@@ -501,6 +501,8 @@ def _build_background_bootstrap_tickers(max_tickers: int) -> list[str]:
 
 # Timestamp of the last successful full-universe replay so we can throttle it.
 _LAST_REPLAY_TS: float = 0.0
+# Timestamp of the last CAGR model training run (Layer F Tier 2).
+_LAST_CAGR_TRAIN_TS: float = 0.0
 
 
 def _should_run_replay(interval_hours: int) -> bool:
@@ -511,6 +513,43 @@ def _should_run_replay(interval_hours: int) -> bool:
         _LAST_REPLAY_TS = _time.monotonic()
         return True
     return False
+
+
+def _should_train_cagr_models(interval_hours: int) -> bool:
+    """Return True if the CAGR Ridge models haven't been trained within *interval_hours*."""
+    global _LAST_CAGR_TRAIN_TS  # noqa: PLW0603
+    import time as _time
+    if _time.monotonic() - _LAST_CAGR_TRAIN_TS >= interval_hours * 3600:
+        _LAST_CAGR_TRAIN_TS = _time.monotonic()
+        return True
+    return False
+
+
+def _train_cagr_models_from_ledger() -> dict[str, Any]:
+    """Load all postmortem records from the ledger and train per-regime Ridge models.
+
+    Returns a summary dict with sample_counts and status.
+    """
+    try:
+        from auto_valuation.learning.ledger import LedgerReader
+        from auto_valuation.learning.near_term_cagr_predictor import NearTermCagrPredictor
+
+        reader = LedgerReader()
+        raw_records = reader.query_postmortems()
+        if not raw_records:
+            return {"ran": False, "reason": "no-postmortem-records", "sample_counts": {}}
+
+        predictor = NearTermCagrPredictor()
+        sample_counts = predictor.train(raw_records, alpha=1.0)
+        total_samples = sum(sample_counts.values())
+        logger.info(
+            "CAGR Ridge model training complete: %d total samples across %d regimes",
+            total_samples, len([v for v in sample_counts.values() if v >= 5]),
+        )
+        return {"ran": True, "sample_counts": sample_counts, "total_samples": total_samples}
+    except Exception as exc:
+        logger.warning("CAGR Ridge model training failed: %s", exc)
+        return {"ran": False, "reason": str(exc), "sample_counts": {}}
 
 
 def run_background_learning_cycle(
@@ -598,6 +637,15 @@ def _run_background_learning_cycle(
     else:
         replay = {"enabled": False, "ran": False, "reason": "disabled"}
 
+    # Layer F Tier 2 — train per-regime Ridge CAGR models from accumulated
+    # postmortem records. Runs once every 24 h (configurable). Harmlessly skips
+    # when < 5 records are available per regime.
+    cagr_train_interval = int(LEARNING_CONFIG.get("cagr_model_train_interval_hours", 24))
+    if _should_train_cagr_models(cagr_train_interval):
+        cagr_train_result = _train_cagr_models_from_ledger()
+    else:
+        cagr_train_result = {"ran": False, "reason": "interval", "sample_counts": {}}
+
     bootstrap_payload = bootstrap.to_dict() if hasattr(bootstrap, "to_dict") else dict(bootstrap)
     maintenance_payload = maintenance.to_dict() if hasattr(maintenance, "to_dict") else dict(maintenance)
     bootstrap_payload.setdefault("requested_tickers", bootstrap_tickers)
@@ -637,6 +685,7 @@ def _run_background_learning_cycle(
         "bootstrap": bootstrap_payload,
         "maintenance": maintenance_payload,
         "replay": replay,
+        "cagr_train": cagr_train_result,
         "seed_refresh": seed_refresh,
         "state": state_payload,
     }

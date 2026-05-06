@@ -207,6 +207,19 @@ def _annual_snapshots(
             capex = _optional_float(cf.get("capitalExpenditures"))
             if op_cf is not None and capex is not None:
                 fcf = op_cf - abs(capex)
+            elif op_cf is not None or capex is not None:
+                missing_components = []
+                if op_cf is None:
+                    missing_components.append("operating_cf")
+                if capex is None:
+                    missing_components.append("capex")
+                logger.debug(
+                    "Partial UFCF for year %s: missing %s — using available components",
+                    year,
+                    missing_components,
+                )
+                # Compute with available components, substituting 0 for missing
+                fcf = (op_cf or 0.0) - abs(capex or 0.0)
         ufcf_m = (fcf / rev) if (fcf is not None and rev > 0) else None
         snaps[year] = {"revenue_mm": rev / 1e6, "ebit_margin": ebit_m, "ufcf_margin": ufcf_m}
     return snaps
