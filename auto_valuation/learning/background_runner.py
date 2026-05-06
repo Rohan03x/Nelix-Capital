@@ -526,21 +526,103 @@ def _should_train_cagr_models(interval_hours: int) -> bool:
 
 
 def _train_cagr_models_from_ledger() -> dict[str, Any]:
-    """Load all postmortem records from the ledger and train per-regime Ridge models.
+    """Train per-regime Ridge CAGR models from predictions + realized-outcomes data.
+
+    Derives YoY actual revenue growth from consecutive realized_outcomes rows
+    and the implied predicted growth from prediction_records.  Falls back to
+    calibration_observations if the predictions DB is unavailable.
 
     Returns a summary dict with sample_counts and status.
     """
     try:
-        from auto_valuation.learning.ledger import LedgerReader
+        import sqlite3
         from auto_valuation.learning.near_term_cagr_predictor import NearTermCagrPredictor
+        from auto_valuation.learning.storage_paths import learning_db_dir
 
-        reader = LedgerReader()
-        raw_records = reader.query_postmortems()
-        if not raw_records:
-            return {"ran": False, "reason": "no-postmortem-records", "sample_counts": {}}
+        db_dir = learning_db_dir()
+        pred_db = db_dir / "predictions.db"
+        calib_db = db_dir / "calibration.db"
+
+        training_records: list[dict] = []
+
+        # Primary source: realized_outcomes consecutive years + prediction_records
+        if pred_db.exists():
+            conn = sqlite3.connect(str(pred_db))
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("""
+                SELECT
+                    r1.ticker,
+                    r1.forecast_horizon_year as year,
+                    (r1.actual_revenue_mm / r0.actual_revenue_mm - 1) as actual_growth,
+                    p.predicted_revenue_mm,
+                    r0.actual_revenue_mm as base_rev
+                FROM realized_outcomes r1
+                JOIN realized_outcomes r0
+                    ON r1.ticker = r0.ticker
+                    AND r1.forecast_horizon_year = r0.forecast_horizon_year + 1
+                    AND r1.rowid > r0.rowid
+                LEFT JOIN prediction_records p
+                    ON p.ticker = r1.ticker
+                    AND p.forecast_horizon_year = r1.forecast_horizon_year
+                WHERE r1.actual_revenue_mm > 0
+                  AND r0.actual_revenue_mm > 0
+                GROUP BY r1.ticker, r1.forecast_horizon_year
+            """).fetchall()
+            conn.close()
+
+            for row in rows:
+                actual_g = float(row["actual_growth"])
+                # Clamp extreme outliers (>300% or <-80%) — data artefacts
+                if actual_g > 3.0 or actual_g < -0.80:
+                    continue
+                base_rev = float(row["base_rev"])
+                pred_mm = row["predicted_revenue_mm"]
+                # Implied predicted growth: if prediction exists, compute from base
+                if pred_mm and base_rev > 0:
+                    ntm_g = float(pred_mm) / base_rev - 1.0
+                    ntm_g = max(-0.80, min(ntm_g, 3.0))
+                else:
+                    ntm_g = actual_g  # use actual as proxy when prediction missing
+                training_records.append({
+                    "actual_revenue_growth": actual_g,
+                    "feature_vector": {
+                        "ntm_growth": ntm_g,
+                        "cagr_3yr": ntm_g,
+                        "cagr_5yr": ntm_g,
+                    },
+                })
+
+        # Fallback: calibration_observations (actual/predicted_revenue_growth)
+        if not training_records and calib_db.exists():
+            conn = sqlite3.connect(str(calib_db))
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT actual_revenue_growth, predicted_revenue_growth "
+                "FROM calibration_observations "
+                "WHERE actual_revenue_growth IS NOT NULL "
+                "  AND predicted_revenue_growth IS NOT NULL "
+                "  AND (actual_revenue_growth != 0 OR predicted_revenue_growth != 0)"
+            ).fetchall()
+            conn.close()
+            for row in rows:
+                actual_g = float(row["actual_revenue_growth"])
+                pred_g = float(row["predicted_revenue_growth"])
+                if actual_g > 3.0 or actual_g < -0.80:
+                    continue
+                training_records.append({
+                    "actual_revenue_growth": actual_g,
+                    "feature_vector": {
+                        "ntm_growth": pred_g,
+                        "cagr_3yr": pred_g,
+                        "cagr_5yr": pred_g,
+                    },
+                })
+
+        if not training_records:
+            return {"ran": False, "reason": "no-training-records", "sample_counts": {}}
 
         predictor = NearTermCagrPredictor()
-        sample_counts = predictor.train(raw_records, alpha=1.0)
+        sample_counts = predictor.train(training_records, alpha=1.0)
         total_samples = sum(sample_counts.values())
         logger.info(
             "CAGR Ridge model training complete: %d total samples across %d regimes",
