@@ -1779,20 +1779,23 @@ def _global_universe_summary(universe_store: Any | None) -> dict[str, Any]:
             "top_sectors": [],
             "background_target_symbols": seed_target,
             "background_seed_prefix_per_cycle": seed_prefix,
-            "background_seed_pool_size": _effective_seed_pool_size(live_summary_base),
+            "background_seed_pool_size": seed_pool_size,
             "background_runner": background_runner_state,
         }
 
     try:
-        live_summary_base = {
-            "enabled": True,
-            **universe_store.summary(
+        universe_summary_payload = dict(
+            universe_store.summary(
                 stale_after_hours=int(LEARNING_CONFIG.get("symbol_universe_bootstrap_interval_hours", 18)),
                 recent_days=int(LEARNING_CONFIG.get("symbol_universe_recent_days", 21)),
-            ),
+            )
+        )
+        live_summary_base = {
+            "enabled": True,
+            **universe_summary_payload,
             "background_target_symbols": seed_target,
             "background_seed_prefix_per_cycle": seed_prefix,
-            "background_seed_pool_size": seed_pool_size,
+            "background_seed_pool_size": _effective_seed_pool_size(universe_summary_payload),
         }
         live_summary = {
             **live_summary_base,
