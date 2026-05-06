@@ -1449,12 +1449,20 @@ def _thin_evidence_margin_guardrail(
     }
 
 
-def _load_learning_cohort(limit: int | None = None) -> list[Any]:
+def _load_learning_cohort(limit: int | None = None, subject_ticker: str | None = None) -> list[Any]:
     global _LAST_LEARNING_SAMPLE_DIAGNOSTICS
     target_limit = int(limit or _learning_pool_limit())
     try:
         all_records = _cached_ledger_records(limit=_learning_candidate_limit(target_limit))
         records = _cached_stratified_sample(all_records, max_records=target_limit, target="full_dcf")
+        if subject_ticker:
+            try:
+                subject_records = LedgerReader().query(ticker=str(subject_ticker).upper(), scenario="base")
+            except Exception:
+                subject_records = []
+            if subject_records:
+                seen_ids = {str(getattr(record, "record_id", "")) for record in records}
+                records = [record for record in subject_records if str(getattr(record, "record_id", "")) not in seen_ids] + list(records)
     except Exception:
         records = []
         _LAST_LEARNING_SAMPLE_DIAGNOSTICS = {"enabled": False, "reason": "ledger_query_failed"}
@@ -2006,7 +2014,15 @@ def refine_live_assumptions(
     revenue_volatility = _safe_pstdev(_growth_rates(revenues[-(history_window_years + 1):]))
     margin_volatility = _safe_pstdev([margin / 100 for margin in ebit_margins[-history_window_years:]])
     observations_provided = observations is not None
-    observations = list(observations) if observations is not None else _load_learning_cohort()
+    if observations is not None:
+        observations = list(observations)
+    else:
+        try:
+            observations = _load_learning_cohort(subject_ticker=ticker)
+        except TypeError as exc:
+            if "subject_ticker" not in str(exc):
+                raise
+            observations = _load_learning_cohort()
     learning_sample_diagnostics = (
         {"enabled": False, "reason": "caller_supplied_observations", "candidate_rows": len(observations)}
         if observations_provided

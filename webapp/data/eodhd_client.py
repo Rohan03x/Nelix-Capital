@@ -1045,6 +1045,85 @@ def _forecast_horizon_year(data: dict[str, Any]) -> int:
     return 0
 
 
+def _ledger_evidence_summary(ticker: str) -> dict[str, Any]:
+    try:
+        from auto_valuation.learning.ledger import LedgerReader
+
+        ticker_upper = str(ticker or "").upper()
+        reader = LedgerReader()
+        predictions = reader.query(ticker=ticker_upper, scenario="base")
+        realized = reader.query_realized_outcomes(ticker=ticker_upper)
+        postmortems: list[dict[str, Any]] = []
+        for record in predictions:
+            postmortems.extend(reader.query_postmortems(record_id=record.record_id))
+        matured_record_ids = {
+            str(item.record_id or "") for item in realized if str(item.record_id or "")
+        } | {
+            str(item.get("record_id") or "") for item in postmortems if str(item.get("record_id") or "")
+        }
+        return {
+            "enabled": True,
+            "matured_records": len(matured_record_ids),
+            "updated_records": 0,
+            "total_realized_records": len(realized),
+            "complete_realized_records": sum(1 for item in realized if item.label_status == "complete"),
+            "partial_realized_records": sum(1 for item in realized if item.label_status == "partial"),
+            "postmortem_records": len(postmortems),
+            "prediction_records": len(predictions),
+            "source": "ledger-readonly",
+        }
+    except Exception as exc:
+        return {"enabled": False, "matured_records": 0, "updated_records": 0, "reason": str(exc)}
+
+
+def _latest_maintenance_summary() -> dict[str, Any]:
+    try:
+        from auto_valuation.learning.ledger import LedgerReader
+
+        runs = LedgerReader().query_maintenance_runs(limit=1)
+        if not runs:
+            return {"enabled": True, "ran": False, "reason": "no-maintenance-history"}
+        latest = runs[0]
+        payload = dict(latest.payload or {})
+        return {
+            "enabled": True,
+            "ran": False,
+            "reason": "last-run",
+            "last_run_at": payload.get("last_run_at") or latest.completed_at,
+            "maintenance_run_id": latest.run_id,
+            "scanned_tickers": int(payload.get("scanned_tickers") or 0),
+            "matured_records": int(payload.get("matured_records") or 0),
+            "backfilled_records": int(payload.get("backfilled_records") or 0),
+            "annual_postmortems_created": int(payload.get("annual_postmortems_created") or 0),
+            "quinquennial_reports_created": int(payload.get("quinquennial_reports_created") or 0),
+            "tickers_processed": list(payload.get("tickers_processed") or [])[:8],
+        }
+    except Exception as exc:
+        return {"enabled": False, "ran": False, "reason": str(exc)}
+
+
+def _read_only_snapshot_summary(data: dict[str, Any]) -> dict[str, Any]:
+    horizon_year = _forecast_horizon_year(data)
+    ticker = str(data.get("ticker") or data.get("requested_ticker") or "").upper()
+    if not _live_learning_feedback_enabled():
+        return {"enabled": False, "persisted": False, "reason": "disabled", "horizon_year": horizon_year}
+    try:
+        from auto_valuation.learning.ledger import LedgerReader
+
+        expected_id = f"{ticker}-{datetime.now(timezone.utc).date()}-FY{horizon_year}-base"
+        records = LedgerReader().query(ticker=ticker, horizon_year=horizon_year, scenario="base") if ticker and horizon_year else []
+        persisted = any(record.record_id == expected_id for record in records)
+        return {
+            "enabled": True,
+            "persisted": persisted,
+            "reason": "already-persisted" if persisted else "read-only",
+            "horizon_year": horizon_year,
+            "existing_snapshots": len(records),
+        }
+    except Exception as exc:
+        return {"enabled": False, "persisted": False, "reason": str(exc), "horizon_year": horizon_year}
+
+
 def _persist_learning_snapshot(data: dict[str, Any], knowledge_model: dict[str, Any]) -> dict[str, Any]:
     horizon_year = _forecast_horizon_year(data)
     if not _live_learning_feedback_enabled():
@@ -1831,6 +1910,8 @@ def _augment_learning_explainability(
     *,
     sector: str = "",
     industry: str = "",
+    ticker: str = "",
+    dashboard_data: dict[str, Any] | None = None,
 ) -> None:
     explainability = dict(knowledge_model.get("explainability") or {})
     if not explainability:
@@ -1840,6 +1921,9 @@ def _augment_learning_explainability(
     bootstrap = dict(knowledge_model.get("learning_bootstrap") or {})
     maintenance = dict(knowledge_model.get("learning_maintenance") or {})
     persistence = dict(knowledge_model.get("learning_persistence") or {})
+    ledger_evidence = _ledger_evidence_summary(ticker)
+    readonly_maintenance = _latest_maintenance_summary()
+    readonly_snapshot = _read_only_snapshot_summary(dashboard_data or {})
     global_universe = dict(knowledge_model.get("global_universe") or {})
     relationship_graph = dict(explainability.get("relationship_graph") or knowledge_model.get("relationship_graph") or {})
     learned_peer_edges = list(knowledge_model.get("learned_peer_edges") or relationship_graph.get("learned_peer_edges") or [])
@@ -1851,12 +1935,23 @@ def _augment_learning_explainability(
     if global_universe:
         explainability["global_universe"] = global_universe
 
+    backfill_matured = int(backfill.get("matured_records") or 0)
+    ledger_matured = int(ledger_evidence.get("matured_records") or 0)
+    matured_records = max(backfill_matured, ledger_matured)
+    total_realized_records = int(ledger_evidence.get("total_realized_records") or 0)
+    postmortem_records = int(ledger_evidence.get("postmortem_records") or 0)
     explainability["realized_evidence"] = {
-        "matured_records": int(backfill.get("matured_records") or 0),
+        "matured_records": matured_records,
         "updated_records": int(backfill.get("updated_records") or 0),
+        "total_realized_records": total_realized_records,
+        "complete_realized_records": int(ledger_evidence.get("complete_realized_records") or 0),
+        "partial_realized_records": int(ledger_evidence.get("partial_realized_records") or 0),
+        "postmortem_records": postmortem_records,
+        "prediction_records": int(ledger_evidence.get("prediction_records") or 0),
+        "source": "live-backfill" if backfill_matured > 0 else str(ledger_evidence.get("source") or "live-backfill"),
         "note": (
-            f"{int(backfill.get('matured_records') or 0)} matured prediction(s) exist for this ticker."
-            if int(backfill.get("matured_records") or 0) > 0
+            f"{matured_records} matured prediction(s), {total_realized_records} realized label(s), and {postmortem_records} postmortem(s) exist for this ticker."
+            if matured_records > 0
             else "No matured realized outcomes exist yet for this ticker."
         ),
     }
@@ -1868,19 +1963,25 @@ def _augment_learning_explainability(
         "realized_outcomes_created": int(bootstrap.get("realized_outcomes_created") or 0),
         "last_bootstrapped_at": bootstrap.get("last_bootstrapped_at"),
     }
+    if not maintenance.get("ran") and maintenance.get("reason") == "mutate_learning disabled" and readonly_maintenance.get("last_run_at"):
+        maintenance = readonly_maintenance
     explainability["maintenance"] = {
         "ran": bool(maintenance.get("ran")),
         "reason": maintenance.get("reason"),
         "scanned_tickers": int(maintenance.get("scanned_tickers") or 0),
+        "matured_records": int(maintenance.get("matured_records") or 0),
+        "backfilled_records": int(maintenance.get("backfilled_records") or 0),
         "annual_postmortems_created": int(maintenance.get("annual_postmortems_created") or 0),
         "quinquennial_reports_created": int(maintenance.get("quinquennial_reports_created") or 0),
         "last_run_at": maintenance.get("last_run_at"),
     }
+    if not persistence.get("persisted") and persistence.get("reason") == "mutate_learning disabled":
+        persistence = readonly_snapshot
     explainability["current_snapshot"] = persistence
 
     data_gaps = list(explainability.get("data_gaps") or [])
     titles = {str(gap.get("title")) for gap in data_gaps}
-    if int(backfill.get("matured_records") or 0) == 0 and "No ticker-specific realized evidence" not in titles:
+    if matured_records == 0 and "No ticker-specific realized evidence" not in titles:
         data_gaps.append(
             {
                 "title": "No ticker-specific realized evidence",
@@ -3249,7 +3350,7 @@ def build_dashboard_data(
                 knowledge_model_payload["learning_backfill"] = disabled_note
                 knowledge_model_payload["learning_maintenance"] = disabled_note
                 knowledge_model_payload["learning_persistence"] = disabled_note
-            _augment_learning_explainability(knowledge_model_payload, sector=sector, industry=industry)
+            _augment_learning_explainability(knowledge_model_payload, sector=sector, industry=industry, ticker=ticker, dashboard_data=_result)
             confidence_model = dict(knowledge_model_payload.get("confidence_model") or {})
             dashboard_breakdown = dict(confidence_model.get("dashboard_breakdown") or {})
             if dashboard_breakdown:

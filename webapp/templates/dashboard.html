@@ -1013,6 +1013,8 @@
   {% set analog_memory = km_explain.get('analog_memory') or km.get('analogs') or {} %}
   {% set analog_matches = analog_evidence.get('top_matches') or [] %}
   {% set global_brain = km_explain.get('global_brain') or km.get('global_learning') or {} %}
+  {% set global_memory = km_explain.get('global_memory') or ((km.get('layered_learning') or {}).get('layer_mix') or {}).get('global_memory') or {} %}
+  {% set global_brain_records = [global_brain.get('cohort_size', 0), global_memory.get('records', 0)]|max %}
   {% set global_universe = km_explain.get('global_universe') or km.get('global_universe') or {} %}
   {% set background_runner = global_universe.get('background_runner') or {} %}
   {% set learning_bootstrap = km_explain.get('learning_bootstrap') or km.get('learning_bootstrap') or {} %}
@@ -1050,11 +1052,11 @@
     <div class="kpi-card {% if global_brain.get('enabled') %}green{% else %}amber{% endif %}">
       <div class="kpi-label">Global Brain</div>
       <div class="kpi-value {% if global_brain.get('enabled') %}green{% else %}amber{% endif %}">
-        {% if global_brain.get('enabled') %}{{ global_brain.get('cohort_size', 0) }} recs{% else %}Inactive{% endif %}
+        {% if global_brain.get('enabled') %}{{ global_brain_records }} recs{% else %}Inactive{% endif %}
       </div>
       <div class="kpi-sub">
         {% if global_brain.get('enabled') %}
-          {{ global_brain.get('scope', 'global') }} cohort · {{ global_brain.get('sector_span', 0) }} sectors · conf {{ global_brain.get('confidence', 0) }}
+          {{ global_brain.get('scope', 'global') }} overlay {{ global_brain.get('cohort_size', 0) }} · {{ global_brain.get('sector_span', 0) }} sectors · conf {{ global_brain.get('confidence', 0) }}
         {% else %}
           Waiting for enough realised cross-symbol breadth
         {% endif %}
@@ -1094,17 +1096,25 @@
       <div class="kpi-value {% if realized_evidence.get('updated_records', 0) > 0 %}green{% elif realized_evidence.get('matured_records', 0) > 0 %}amber{% else %}amber{% endif %}">
         {% if realized_evidence.get('matured_records', 0) > 0 %}{{ realized_evidence.get('matured_records', 0) }} matured{% else %}Thin{% endif %}
       </div>
-      <div class="kpi-sub">{{ realized_evidence.get('updated_records', 0) }} record(s) refreshed into the ledger</div>
+      <div class="kpi-sub">
+        {% if realized_evidence.get('total_realized_records', 0) > 0 %}
+          {{ realized_evidence.get('total_realized_records', 0) }} label(s) · {{ realized_evidence.get('postmortem_records', 0) }} postmortem(s)
+        {% else %}
+          {{ realized_evidence.get('updated_records', 0) }} record(s) refreshed into the ledger
+        {% endif %}
+      </div>
     </div>
 
-    <div class="kpi-card {% if maintenance_state.get('ran') %}green{% elif maintenance_state.get('reason') == 'throttled' %}amber{% endif %}">
+    <div class="kpi-card {% if maintenance_state.get('ran') %}green{% elif maintenance_state.get('reason') in ['throttled', 'last-run'] %}amber{% endif %}">
       <div class="kpi-label">Scheduled Maintenance</div>
-      <div class="kpi-value {% if maintenance_state.get('ran') %}green{% elif maintenance_state.get('reason') == 'throttled' %}amber{% endif %}">
-        {% if maintenance_state.get('ran') %}{{ maintenance_state.get('annual_postmortems_created', 0) }} annuals{% elif maintenance_state.get('reason') == 'throttled' %}Throttled{% else %}Idle{% endif %}
+      <div class="kpi-value {% if maintenance_state.get('ran') %}green{% elif maintenance_state.get('reason') in ['throttled', 'last-run'] %}amber{% endif %}">
+        {% if maintenance_state.get('ran') %}{{ maintenance_state.get('annual_postmortems_created', 0) }} annuals{% elif maintenance_state.get('reason') == 'throttled' %}Throttled{% elif maintenance_state.get('reason') == 'last-run' %}Recent{% else %}Idle{% endif %}
       </div>
       <div class="kpi-sub">
         {% if maintenance_state.get('ran') %}
           {{ maintenance_state.get('quinquennial_reports_created', 0) }} 5y reports · {{ maintenance_state.get('scanned_tickers', 0) }} tickers scanned
+        {% elif maintenance_state.get('reason') == 'last-run' %}
+          Last run {{ maintenance_state.get('last_run_at') }} · {{ maintenance_state.get('matured_records', 0) }} matured · {{ maintenance_state.get('scanned_tickers', 0) }} tickers scanned
         {% elif maintenance_state.get('last_run_at') %}
           Last run {{ maintenance_state.get('last_run_at') }}
         {% else %}
@@ -1116,9 +1126,9 @@
     <div class="kpi-card {% if snapshot_state.get('persisted') %}green{% elif snapshot_state.get('enabled') %}amber{% endif %}">
       <div class="kpi-label">Current Snapshot</div>
       <div class="kpi-value {% if snapshot_state.get('persisted') %}green{% elif snapshot_state.get('enabled') %}amber{% endif %}">
-        {% if snapshot_state.get('persisted') %}Persisted{% elif snapshot_state.get('enabled') %}{{ snapshot_state.get('reason', 'pending')|replace('-', ' ')|title }}{% else %}View-only{% endif %}
+        {% if snapshot_state.get('persisted') %}Persisted{% elif snapshot_state.get('existing_snapshots', 0) > 0 %}Saved{% elif snapshot_state.get('enabled') %}{{ snapshot_state.get('reason', 'pending')|replace('-', ' ')|title }}{% else %}View-only{% endif %}
       </div>
-      <div class="kpi-sub">{% if snapshot_state.get('persisted') %}Horizon FY{{ snapshot_state.get('horizon_year') }}{% elif snapshot_state.get('enabled') %}{{ snapshot_state.get('reason', '') }}{% else %}Learning fires on first visit via loading page{% endif %}</div>
+      <div class="kpi-sub">{% if snapshot_state.get('persisted') %}Horizon FY{{ snapshot_state.get('horizon_year') }}{% elif snapshot_state.get('existing_snapshots', 0) > 0 %}{{ snapshot_state.get('existing_snapshots', 0) }} saved horizon snapshot(s){% elif snapshot_state.get('enabled') %}{{ snapshot_state.get('reason', '') }}{% else %}Learning fires on first visit via loading page{% endif %}</div>
     </div>
   </div>
 
