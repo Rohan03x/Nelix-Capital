@@ -891,10 +891,19 @@ def test_learning_cohort_uses_seeded_replay_summary_when_raw_cache_empty(monkeyp
     assert knowledge_model_module._observation_evidence_count(observations) == 51
 
 
-def test_learning_cohort_keeps_seeded_broad_cohort_with_ledger_rows(monkeypatch):
+@pytest.mark.parametrize(
+    ("subject_ticker", "broad_ticker"),
+    [
+        ("SUBJECT.ONE", "BROAD.ONE"),
+        ("SUBJECT.TWO", "BROAD.TWO"),
+        (None, "BROAD.THREE"),
+    ],
+)
+def test_learning_cohort_keeps_seeded_broad_cohort_with_any_ledger_rows(monkeypatch, subject_ticker, broad_ticker):
+    record_ticker = subject_ticker or "LEDGER.ONLY"
     subject_record = SimpleNamespace(
         record_id="subject-ledger",
-        ticker="NKE",
+        ticker=record_ticker,
         sector="Consumer Cyclical",
         industry="Footwear & Accessories",
         data_vintage_years=12,
@@ -923,7 +932,7 @@ def test_learning_cohort_keeps_seeded_broad_cohort_with_ledger_rows(monkeypatch)
         prediction_context={"source": "historical_replay_bootstrap"},
     )
     seeded_summary_observation = {
-        "ticker": "NKE",
+        "ticker": record_ticker,
         "sector": "Consumer Cyclical",
         "industry": "Footwear & Accessories",
         "data_vintage_years": 12,
@@ -941,7 +950,7 @@ def test_learning_cohort_keeps_seeded_broad_cohort_with_ledger_rows(monkeypatch)
         "observation_type": "deployment_historical_replay_summary",
     }
     duplicate_subject_seed = {
-        "ticker": "NKE",
+        "ticker": record_ticker,
         "sector": "Consumer Cyclical",
         "industry": "Footwear & Accessories",
         "data_vintage_years": 12,
@@ -949,7 +958,7 @@ def test_learning_cohort_keeps_seeded_broad_cohort_with_ledger_rows(monkeypatch)
         "macro_regime": "neutral",
     }
     broad_seed = {
-        "ticker": "LULU",
+        "ticker": broad_ticker,
         "sector": "Consumer Cyclical",
         "industry": "Apparel Retail",
         "data_vintage_years": 12,
@@ -972,14 +981,14 @@ def test_learning_cohort_keeps_seeded_broad_cohort_with_ledger_rows(monkeypatch)
     monkeypatch.setattr(
         knowledge_model_module,
         "seeded_replay_summary_observations",
-        lambda ticker=None: [seeded_summary_observation] if ticker == "NKE" else [],
+        lambda ticker=None: [seeded_summary_observation] if ticker == subject_ticker else [],
     )
 
-    observations = knowledge_model_module._load_learning_cohort(limit=20, subject_ticker="NKE")
+    observations = knowledge_model_module._load_learning_cohort(limit=20, subject_ticker=subject_ticker)
 
     tickers = [str(knowledge_model_module._obs_value(observation, "ticker", "")).upper() for observation in observations]
-    assert "LULU" in tickers
-    assert tickers.count("NKE") == 2
+    assert broad_ticker in tickers
+    assert tickers.count(record_ticker) == 2
 
 
 def test_historical_replay_evidence_summary_uses_seed_when_raw_cache_empty(monkeypatch):

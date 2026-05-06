@@ -1604,13 +1604,14 @@ def _load_learning_cohort(limit: int | None = None, subject_ticker: str | None =
                 added_historical_replay = bool(historical)
         except Exception:
             pass
-        if subject_ticker and not added_historical_replay:
-            try:
-                seeded_replay = seeded_replay_summary_observations(str(subject_ticker).upper())
-                if seeded_replay:
-                    observations = list(seeded_replay) + list(observations)
-            except Exception:
-                pass
+        if not added_historical_replay:
+            if subject_ticker:
+                try:
+                    seeded_replay = seeded_replay_summary_observations(str(subject_ticker).upper())
+                    if seeded_replay:
+                        observations = list(seeded_replay) + list(observations)
+                except Exception:
+                    pass
             try:
                 observations = list(observations) + _seeded_general_cohort()
             except Exception:
