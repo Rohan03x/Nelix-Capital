@@ -1468,6 +1468,18 @@ def _thin_evidence_margin_guardrail(
 def _load_learning_cohort(limit: int | None = None, subject_ticker: str | None = None) -> list[Any]:
     global _LAST_LEARNING_SAMPLE_DIAGNOSTICS
     target_limit = int(limit or _learning_pool_limit())
+    subject_upper = str(subject_ticker or "").upper()
+
+    def _seeded_general_cohort() -> list[dict[str, Any]]:
+        seeded_rows = seeded_cohort_observations(limit=target_limit)
+        if not subject_upper:
+            return seeded_rows
+        return [
+            observation
+            for observation in seeded_rows
+            if str(_obs_value(observation, "ticker", "") or "").upper() != subject_upper
+        ]
+
     try:
         all_records = _cached_ledger_records(limit=_learning_candidate_limit(target_limit))
         records = _cached_stratified_sample(all_records, max_records=target_limit, target="full_dcf")
@@ -1575,7 +1587,6 @@ def _load_learning_cohort(limit: int | None = None, subject_ticker: str | None =
                     LEARNING_CONFIG.get("historical_replay_limit", 4000) or 4000
                 )
                 if subject_ticker:
-                    subject_upper = str(subject_ticker).upper()
                     subject_historical = [
                         observation
                         for observation in historical
@@ -1600,8 +1611,12 @@ def _load_learning_cohort(limit: int | None = None, subject_ticker: str | None =
                     observations = list(seeded_replay) + list(observations)
             except Exception:
                 pass
+            try:
+                observations = list(observations) + _seeded_general_cohort()
+            except Exception:
+                pass
         return observations
-    seeded = seeded_cohort_observations(limit=int(limit or _learning_pool_limit()))
+    seeded = _seeded_general_cohort()
     if subject_ticker:
         try:
             seeded_replay = seeded_replay_summary_observations(str(subject_ticker).upper())

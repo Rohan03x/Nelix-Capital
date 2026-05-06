@@ -891,6 +891,97 @@ def test_learning_cohort_uses_seeded_replay_summary_when_raw_cache_empty(monkeyp
     assert knowledge_model_module._observation_evidence_count(observations) == 51
 
 
+def test_learning_cohort_keeps_seeded_broad_cohort_with_ledger_rows(monkeypatch):
+    subject_record = SimpleNamespace(
+        record_id="subject-ledger",
+        ticker="NKE",
+        sector="Consumer Cyclical",
+        industry="Footwear & Accessories",
+        data_vintage_years=12,
+        market_cap_regime="large",
+        macro_regime="neutral",
+        predicted_revenue_mm=100.0,
+        actual_revenue_mm=108.0,
+        near_term_revenue_growth=0.02,
+        predicted_ebit_margin=0.10,
+        actual_ebit_margin=0.11,
+        predicted_wacc=0.08,
+        predicted_terminal_growth=0.025,
+        beta=1.0,
+        predicted_ufcf_mm=8.0,
+        actual_ufcf_mm=9.0,
+        capex_pct_revenue=0.03,
+        da_pct_revenue=0.02,
+        predicted_ev_mm=1000.0,
+        predicted_equity_value_mm=900.0,
+        predicted_price_per_share=20.0,
+        actual_price_at_prediction=18.0,
+        actual_price_at_horizon=22.0,
+        macro_backdrop={},
+        feature_vector=None,
+        structural_break_hints=[],
+        prediction_context={"source": "historical_replay_bootstrap"},
+    )
+    seeded_summary_observation = {
+        "ticker": "NKE",
+        "sector": "Consumer Cyclical",
+        "industry": "Footwear & Accessories",
+        "data_vintage_years": 12,
+        "market_cap_regime": "large",
+        "macro_regime": "neutral",
+        "predicted_revenue_growth": 0.0,
+        "actual_revenue_growth": 0.03,
+        "predicted_ebit_margin": 0.0,
+        "actual_ebit_margin": 0.01,
+        "predicted_wacc": 0.08,
+        "actual_wacc": 0.08,
+        "predicted_terminal_growth": 0.025,
+        "actual_terminal_growth": 0.025,
+        "evidence_count": 51,
+        "observation_type": "deployment_historical_replay_summary",
+    }
+    duplicate_subject_seed = {
+        "ticker": "NKE",
+        "sector": "Consumer Cyclical",
+        "industry": "Footwear & Accessories",
+        "data_vintage_years": 12,
+        "market_cap_regime": "large",
+        "macro_regime": "neutral",
+    }
+    broad_seed = {
+        "ticker": "LULU",
+        "sector": "Consumer Cyclical",
+        "industry": "Apparel Retail",
+        "data_vintage_years": 12,
+        "market_cap_regime": "large",
+        "macro_regime": "neutral",
+        "predicted_revenue_growth": 0.0,
+        "actual_revenue_growth": 0.04,
+        "predicted_ebit_margin": 0.12,
+        "actual_ebit_margin": 0.13,
+        "predicted_wacc": 0.08,
+        "actual_wacc": 0.08,
+        "predicted_terminal_growth": 0.025,
+        "actual_terminal_growth": 0.025,
+    }
+    monkeypatch.setattr(knowledge_model_module, "_cached_ledger_records", lambda limit=None: [subject_record])
+    monkeypatch.setattr(knowledge_model_module, "_cached_stratified_sample", lambda records, max_records, target: list(records))
+    monkeypatch.setattr(knowledge_model_module.LedgerReader, "query", lambda *_args, **_kwargs: [subject_record])
+    monkeypatch.setattr(knowledge_model_module, "_get_historical_observations", lambda: [])
+    monkeypatch.setattr(knowledge_model_module, "seeded_cohort_observations", lambda limit=None: [duplicate_subject_seed, broad_seed])
+    monkeypatch.setattr(
+        knowledge_model_module,
+        "seeded_replay_summary_observations",
+        lambda ticker=None: [seeded_summary_observation] if ticker == "NKE" else [],
+    )
+
+    observations = knowledge_model_module._load_learning_cohort(limit=20, subject_ticker="NKE")
+
+    tickers = [str(knowledge_model_module._obs_value(observation, "ticker", "")).upper() for observation in observations]
+    assert "LULU" in tickers
+    assert tickers.count("NKE") == 2
+
+
 def test_historical_replay_evidence_summary_uses_seed_when_raw_cache_empty(monkeypatch):
     import auto_valuation.learning.deployment_seed as deployment_seed_module
     import auto_valuation.learning.historical_replay as historical_replay_module
