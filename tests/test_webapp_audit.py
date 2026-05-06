@@ -758,6 +758,10 @@ def test_eodhd_scenarios_expand_with_learning_uncertainty(monkeypatch):
     assert wide["scenarios"]["bull"]["rev_growth"] - wide["scenarios"]["base"]["rev_growth"] > narrow["scenarios"]["bull"]["rev_growth"] - narrow["scenarios"]["base"]["rev_growth"]
     assert wide["scenarios"]["bear"]["wacc"] - wide["scenarios"]["base"]["wacc"] > narrow["scenarios"]["bear"]["wacc"] - narrow["scenarios"]["base"]["wacc"]
     assert wide["scenarios"]["bull"]["margin_target"] - wide["scenarios"]["base"]["margin_target"] > narrow["scenarios"]["bull"]["margin_target"] - narrow["scenarios"]["base"]["margin_target"]
+    assert wide["recommendation_basis"]["method"] == "learned-scenario-weighted-expected-upside"
+    assert wide["learned_expected_upside_pct"] is not None
+    assert all("learning_basis" in scenario for scenario in wide["scenarios"].values())
+    assert sum(scenario["probability"] for scenario in wide["scenarios"].values()) == pytest.approx(1.0, abs=0.01)
 
 
 def test_eodhd_read_only_build_skips_learning_writes(monkeypatch):
@@ -855,6 +859,11 @@ def test_eodhd_read_only_build_skips_learning_writes(monkeypatch):
     assert data["knowledge_model"]["learning_maintenance"]["reason"] == "mutate_learning disabled"
     assert data["knowledge_model"]["learning_persistence"]["reason"] == "mutate_learning disabled"
     assert data["knowledge_model"]["global_universe"]["tracked_symbols"] == 12
+    assert data["knowledge_model"]["model_accuracy"]["enabled"] is True
+    assert data["knowledge_model"]["explainability"]["model_accuracy"]["enabled"] is True
+    assert data["model_view"]["enabled"] is True
+    assert data["model_view"]["probabilities"]["base"] > 0
+    assert data["model_view"]["recommendation"] == data["learned_recommendation"]
 
 
 def test_eodhd_high_margin_scenarios_stay_ordered(monkeypatch):

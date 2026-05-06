@@ -27,7 +27,7 @@ import tempfile
 from statistics import median
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -1124,6 +1124,254 @@ def _read_only_snapshot_summary(data: dict[str, Any]) -> dict[str, Any]:
         return {"enabled": False, "persisted": False, "reason": str(exc), "horizon_year": horizon_year}
 
 
+def _maybe_float(value: Any) -> float | None:
+    if value is None or value == "" or value == "None":
+        return None
+    try:
+        number = float(value)
+        if math.isnan(number) or math.isinf(number):
+            return None
+        return number
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalised_pct(value: Any) -> float | None:
+    number = _maybe_float(value)
+    if number is None:
+        return None
+    return number * 100.0 if abs(number) <= 1.5 else number
+
+
+def _pct_error(actual: Any, predicted: Any) -> float | None:
+    actual_number = _maybe_float(actual)
+    predicted_number = _maybe_float(predicted)
+    if actual_number is None or predicted_number is None or abs(predicted_number) <= 1e-9:
+        return None
+    return (actual_number - predicted_number) / abs(predicted_number) * 100.0
+
+
+def _mean_abs(values: Iterable[Any]) -> float | None:
+    cleaned = [abs(float(value)) for value in values if _maybe_float(value) is not None]
+    if not cleaned:
+        return None
+    return round(sum(cleaned) / len(cleaned), 2)
+
+
+def _learned_recommendation_from_upside(
+    upside_pct: float,
+    *,
+    expected_error_pct: float = 0.0,
+) -> tuple[str, str, float, float]:
+    buy_threshold = max(15.0, min(35.0, expected_error_pct or 0.0))
+    sell_threshold = -max(10.0, min(30.0, (expected_error_pct or 0.0) * 0.8))
+    if upside_pct >= buy_threshold:
+        return "Undervalued", "green", buy_threshold, sell_threshold
+    if upside_pct <= sell_threshold:
+        return "Overvalued", "red", buy_threshold, sell_threshold
+    return "Fairly Valued", "amber", buy_threshold, sell_threshold
+
+
+def _learning_accuracy_summary(
+    ticker: str,
+    *,
+    sector: str = "",
+    industry: str = "",
+    knowledge_model: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    knowledge_model = knowledge_model or {}
+    explainability = dict(knowledge_model.get("explainability") or {})
+    confidence_model = dict(knowledge_model.get("confidence_model") or {})
+    valuation_confidence = dict(confidence_model.get("valuation_confidence") or {})
+    expected_error = dict(
+        valuation_confidence.get("expected_error_pct")
+        or knowledge_model.get("expected_valuation_error_band")
+        or {}
+    )
+    p50_error = float(expected_error.get("p50") or knowledge_model.get("expected_valuation_error_pct") or 0.0)
+    p90_error = float(expected_error.get("p90") or p50_error or 0.0)
+
+    revenue_errors: list[float] = []
+    margin_errors_pp: list[float] = []
+    valuation_errors: list[float] = []
+    direct_samples = 0
+
+    try:
+        from auto_valuation.learning.ledger import LedgerReader
+
+        reader = LedgerReader()
+        pairs = reader.query_aligned_pairs(
+            ticker=str(ticker or "").upper(),
+            scenario="base",
+            include_partial=True,
+            include_postmortems=True,
+        )
+        direct_samples = len({pair.prediction.record_id for pair in pairs})
+        for pair in pairs:
+            for postmortem in pair.postmortems:
+                revenue_error = _maybe_float(postmortem.get("revenue_error_pct"))
+                if revenue_error is not None:
+                    revenue_errors.append(revenue_error)
+                margin_error_bps = _maybe_float(postmortem.get("margin_error_bps"))
+                if margin_error_bps is not None:
+                    margin_errors_pp.append(margin_error_bps / 100.0)
+                valuation_error = None
+                for error_key in ("ev_error_pct", "price_error_pct", "price_return_error_pct"):
+                    error_value = _maybe_float(postmortem.get(error_key))
+                    if error_value is not None:
+                        valuation_error = error_value
+                        break
+                if valuation_error is not None:
+                    valuation_errors.append(valuation_error)
+
+            outcome = pair.realized_outcome
+            prediction = pair.prediction
+            if outcome is None:
+                continue
+            revenue_error = _pct_error(outcome.actual_revenue_mm, prediction.predicted_revenue_mm)
+            if revenue_error is not None:
+                revenue_errors.append(revenue_error)
+            predicted_margin = _normalised_pct(prediction.predicted_ebit_margin)
+            actual_margin = _normalised_pct(outcome.actual_ebit_margin)
+            if predicted_margin is not None and actual_margin is not None:
+                margin_errors_pp.append(actual_margin - predicted_margin)
+            valuation_error = _pct_error(outcome.actual_ev_mm, prediction.predicted_ev_mm)
+            if valuation_error is None:
+                valuation_error = _pct_error(outcome.actual_price_at_horizon, prediction.predicted_price_per_share)
+            if valuation_error is not None:
+                valuation_errors.append(valuation_error)
+    except Exception:
+        pass
+
+    priority: dict[str, Any] = {}
+    try:
+        from auto_valuation.learning.calibration_priority import (
+            build_calibration_priority_index,
+            calibration_priority_for_symbol,
+        )
+
+        priority = calibration_priority_for_symbol(
+            str(ticker or "").upper(),
+            sector=sector,
+            industry=industry,
+            index=build_calibration_priority_index(),
+        )
+    except Exception:
+        priority = {}
+
+    direct_error_parts = [
+        value for value in (
+            _mean_abs(revenue_errors),
+            _mean_abs(valuation_errors),
+        )
+        if value is not None
+    ]
+    margin_error = _mean_abs(margin_errors_pp)
+    if margin_error is not None:
+        direct_error_parts.append(margin_error * 3.0)
+    direct_mean_error = round(sum(direct_error_parts) / len(direct_error_parts), 2) if direct_error_parts else None
+    priority_error = _maybe_float(priority.get("mean_abs_error_pct"))
+    effective_error = direct_mean_error if direct_mean_error is not None else (priority_error if priority_error is not None and priority_error > 0 else p50_error)
+    accuracy_score = int(round(max(0.0, min(100.0, 100.0 - min(50.0, effective_error or 0.0) * 2.0))))
+    confidence_score = int(
+        valuation_confidence.get("score_100")
+        or round(float(valuation_confidence.get("score") or knowledge_model.get("valuation_confidence") or 0.0) * 100)
+        or accuracy_score
+    )
+
+    company_memory = dict(explainability.get("company_memory") or {})
+    cohort_memory = dict(explainability.get("cohort_memory") or {})
+    global_memory = dict(explainability.get("global_memory") or {})
+    global_brain = dict(explainability.get("global_brain") or knowledge_model.get("global_learning") or {})
+    global_records = max(int(global_memory.get("records") or 0), int(global_brain.get("cohort_size") or 0))
+    cohort_samples = int(priority.get("cohort_samples") or cohort_memory.get("records") or knowledge_model.get("calibration_cohort_size") or 0)
+    priority_direct = int(priority.get("direct_samples") or 0)
+    direct_samples = max(direct_samples, priority_direct)
+    if direct_samples > 0:
+        scope = "ticker"
+        source_note = f"{direct_samples} ticker-specific matured forecast sample(s) anchor the back-test."
+    elif cohort_samples > 0:
+        scope = "cohort"
+        source_note = f"No ticker back-test is mature yet, so {cohort_samples} matched cohort sample(s) carry the accuracy estimate."
+    elif global_records > 0:
+        scope = "global"
+        source_note = f"No direct/cohort back-test is mature yet, so {global_records} global memory record(s) carry the estimate."
+    else:
+        scope = "confidence-model"
+        source_note = "No realized back-test is mature yet; accuracy is inferred from the confidence model."
+
+    return {
+        "enabled": True,
+        "scope": scope,
+        "score": accuracy_score,
+        "confidence_score": confidence_score,
+        "expected_error_pct": {"p50": round(p50_error, 2), "p90": round(p90_error, 2)},
+        "direct_samples": direct_samples,
+        "cohort_samples": cohort_samples,
+        "global_records": global_records,
+        "company_weight_pct": int(company_memory.get("weight_pct") or 0),
+        "cohort_weight_pct": int(cohort_memory.get("weight_pct") or 0),
+        "mean_abs_error_pct": round(effective_error, 2) if effective_error is not None else None,
+        "mean_abs_revenue_error_pct": _mean_abs(revenue_errors),
+        "mean_abs_margin_error_pp": margin_error,
+        "mean_abs_valuation_error_pct": _mean_abs(valuation_errors),
+        "priority": priority,
+        "source_note": source_note,
+        "label": "high" if accuracy_score >= 75 else ("moderate" if accuracy_score >= 55 else "guarded"),
+    }
+
+
+def _learned_scenario_summary(
+    dashboard_data: dict[str, Any],
+    *,
+    knowledge_model: dict[str, Any] | None = None,
+    accuracy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    knowledge_model = knowledge_model or {}
+    accuracy = accuracy or {}
+    scenarios = dict(dashboard_data.get("scenarios") or {})
+    base = dict(scenarios.get("base") or {})
+    bull = dict(scenarios.get("bull") or {})
+    bear = dict(scenarios.get("bear") or {})
+    base_upside = float(base.get("upside_pct") if base.get("upside_pct") is not None else base.get("upside") or 0.0)
+    bull_upside = float(bull.get("upside_pct") if bull.get("upside_pct") is not None else bull.get("upside") or base_upside)
+    bear_upside = float(bear.get("upside_pct") if bear.get("upside_pct") is not None else bear.get("upside") or base_upside)
+    probabilities = {
+        "base": float(base.get("probability") or 0.50),
+        "bull": float(bull.get("probability") or 0.25),
+        "bear": float(bear.get("probability") or 0.25),
+    }
+    total_probability = sum(probabilities.values()) or 1.0
+    probabilities = {key: value / total_probability for key, value in probabilities.items()}
+    expected_upside = (
+        base_upside * probabilities["base"]
+        + bull_upside * probabilities["bull"]
+        + bear_upside * probabilities["bear"]
+    )
+    expected_error = float((accuracy.get("expected_error_pct") or {}).get("p50") or knowledge_model.get("expected_valuation_error_pct") or 0.0)
+    recommendation, rec_class, buy_threshold, sell_threshold = _learned_recommendation_from_upside(
+        expected_upside,
+        expected_error_pct=expected_error,
+    )
+    scenario_basis = dict(base.get("learning_basis") or bull.get("learning_basis") or bear.get("learning_basis") or {})
+    return {
+        "enabled": bool(scenarios),
+        "expected_upside_pct": round(expected_upside, 1),
+        "recommendation": recommendation,
+        "recommendation_class": rec_class,
+        "probabilities": {key: round(value * 100.0) for key, value in probabilities.items()},
+        "thresholds": {"buy_upside_pct": round(buy_threshold, 1), "sell_upside_pct": round(sell_threshold, 1)},
+        "scenario_width_multiplier": round(float(scenario_basis.get("width_multiplier") or knowledge_model.get("scenario_width_multiplier") or 1.0), 2),
+        "growth_bias_pp": scenario_basis.get("growth_bias_pp"),
+        "margin_bias_pp": scenario_basis.get("margin_bias_pp"),
+        "wacc_bias_pp": scenario_basis.get("wacc_bias_pp"),
+        "caution_flags": int(scenario_basis.get("caution_flags") or 0),
+        "summary": (
+            f"Scenario-weighted expected upside is {expected_upside:.1f}% after applying learned uncertainty and an expected error band near {expected_error:.1f}%."
+        ),
+    }
+
+
 def _persist_learning_snapshot(data: dict[str, Any], knowledge_model: dict[str, Any]) -> dict[str, Any]:
     horizon_year = _forecast_horizon_year(data)
     if not _live_learning_feedback_enabled():
@@ -2096,6 +2344,28 @@ def _augment_learning_explainability(
                 memory_hierarchy["layers"] = ordered_layers
             explainability["memory_hierarchy"] = memory_hierarchy
             knowledge_model["memory_hierarchy"] = memory_hierarchy
+
+    model_accuracy = _learning_accuracy_summary(
+        ticker,
+        sector=sector,
+        industry=industry,
+        knowledge_model={**knowledge_model, "explainability": explainability},
+    )
+    learned_scenario_engine = _learned_scenario_summary(
+        dashboard_data or {},
+        knowledge_model=knowledge_model,
+        accuracy=model_accuracy,
+    )
+    explainability["model_accuracy"] = model_accuracy
+    explainability["learned_scenario_engine"] = learned_scenario_engine
+    knowledge_model["model_accuracy"] = model_accuracy
+    knowledge_model["learned_scenario_engine"] = learned_scenario_engine
+    if dashboard_data is not None:
+        dashboard_data["model_accuracy"] = model_accuracy
+        dashboard_data["model_view"] = learned_scenario_engine
+        if learned_scenario_engine.get("enabled"):
+            dashboard_data["learned_expected_upside_pct"] = learned_scenario_engine.get("expected_upside_pct")
+            dashboard_data["learned_recommendation"] = learned_scenario_engine.get("recommendation")
     knowledge_model["explainability"] = explainability
 
 
@@ -2810,8 +3080,23 @@ def build_dashboard_data(
                     knowledge_model_payload["layered_learning"] = layered_payload
         tv_pct       = round(pv_tv / ev * 100, 1) if ev > 0 else 0
 
-        rec       = "Undervalued" if upside >= 15 else ("Fairly Valued" if upside >= -10 else "Overvalued")
-        rec_class = "green"       if upside >= 15 else ("amber"        if upside >= -10 else "red")
+        expected_error_band_for_rec = dict((knowledge_model_payload or {}).get("expected_valuation_error_band") or {})
+        expected_error_for_rec = float(
+            expected_error_band_for_rec.get("p50")
+            or (knowledge_model_payload or {}).get("expected_valuation_error_pct")
+            or 0.0
+        )
+        rec, rec_class, buy_threshold, sell_threshold = _learned_recommendation_from_upside(
+            upside,
+            expected_error_pct=expected_error_for_rec,
+        )
+        recommendation_basis = {
+            "method": "learned-error-adjusted-base-case",
+            "base_upside_pct": round(upside, 1),
+            "expected_error_pct": round(expected_error_for_rec, 1),
+            "buy_threshold_pct": round(buy_threshold, 1),
+            "sell_threshold_pct": round(sell_threshold, 1),
+        }
 
         # ── 52-week range ─────────────────────────────────────────────────
         year_high = _sf(tech.get("52WeekHigh")) or _sf(hi.get("52WeekHigh")) or price * 1.2
@@ -2853,25 +3138,146 @@ def build_dashboard_data(
             up_  = round((iv_ - price) / price * 100, 1) if price > 0 else 0
             return iv_, up_, round(ev_)
 
+        learning_explainability = dict((knowledge_model_payload or {}).get("explainability") or {})
+        forecast_layers_payload = list(learning_explainability.get("forecast_layers") or [])
+
+        def _forecast_layer(prefix: str) -> dict[str, Any]:
+            prefix_lower = prefix.lower()
+            for layer in forecast_layers_payload:
+                if str(layer.get("driver") or "").lower().startswith(prefix_lower):
+                    return dict(layer)
+            return {}
+
+        def _bounded(value: float, low: float, high: float) -> float:
+            return max(low, min(high, value))
+
+        revenue_layer = _forecast_layer("Revenue")
+        margin_layer = _forecast_layer("EBIT")
+        wacc_layer = _forecast_layer("WACC")
+        revenue_final = _maybe_float(revenue_layer.get("final_value"))
+        revenue_learned = _maybe_float(revenue_layer.get("learned_adjustment"))
+        growth_bias_pp = _bounded(
+            (revenue_learned - revenue_final) if revenue_learned is not None and revenue_final is not None else 0.0,
+            -5.0,
+            5.0,
+        )
+        margin_final = _maybe_float(margin_layer.get("final_value"))
+        margin_company = _maybe_float(margin_layer.get("company_anchor"))
+        margin_bias_pp = _bounded(
+            (margin_final - margin_company) if margin_final is not None and margin_company is not None else 0.0,
+            -4.0,
+            4.0,
+        )
+        wacc_final = _maybe_float(wacc_layer.get("final_value"))
+        wacc_company = _maybe_float(wacc_layer.get("company_anchor"))
+        wacc_bias_pp = _bounded(
+            (wacc_final - wacc_company) if wacc_final is not None and wacc_company is not None else 0.0,
+            -3.0,
+            3.0,
+        )
+        caution_flags = sum(1 for layer in forecast_layers_payload if layer.get("warn"))
+        learned_caution = _bounded(
+            caution_flags * 0.25 + max(0.0, -growth_bias_pp) * 0.15 + max(0.0, wacc_bias_pp) * 0.30,
+            0.0,
+            1.5,
+        )
+        learned_support = _bounded(
+            max(0.0, growth_bias_pp) * 0.15 + max(0.0, margin_bias_pp) * 0.12 + max(0.0, -wacc_bias_pp) * 0.20,
+            0.0,
+            1.0,
+        )
+        bull_wacc_reduction = _bounded(1.0 * scenario_width_multiplier + learned_support * 0.35 - learned_caution * 0.40, 0.4, 1.5)
+        bear_wacc_add = _bounded(1.5 * scenario_width_multiplier + learned_caution * 0.40 + max(0.0, wacc_bias_pp) * 0.50, 0.8, 5.0)
+
         # Cap WACC reduction at 1.5pp in bull case to prevent terminal-value explosion
-        bull_wacc = round(max(wacc - 1.5, max(4.0, wacc - (1.0 * scenario_width_multiplier))), 1)
-        bull_g = round(min(5.0, terminal_growth + min(1.2, 0.5 * scenario_width_multiplier)), 1)
+        bull_wacc = round(max(wacc - 1.5, max(4.0, wacc - bull_wacc_reduction)), 1)
+        bull_g = round(min(5.0, terminal_growth + min(1.2, 0.5 * scenario_width_multiplier + learned_support * 0.2)), 1)
         # Enforce minimum WACC-g spread of 2.0pp; without this, a small spread causes TV to go infinite
         bull_g = min(bull_g, round(bull_wacc - 2.0, 1))
-        bear_wacc = round(min(25.0, wacc + (1.5 * scenario_width_multiplier)), 1)
-        bear_g = round(max(-1.0, terminal_growth - min(1.6, 1.0 * scenario_width_multiplier)), 1)
+        bear_wacc = round(min(25.0, wacc + bear_wacc_add), 1)
+        bear_g = round(max(-1.0, terminal_growth - min(1.8, 1.0 * scenario_width_multiplier + learned_caution * 0.2)), 1)
         # Scenarios diverge around the analyst consensus anchor (not the blended
         # base-case growth) so bull and bear stay grounded in forward expectations.
         _cons_g_scenario = _extract_consensus_growth(earn, revenue_base)
         _scenario_anchor = _cons_g_scenario if _cons_g_scenario is not None else revenue_growth_near
-        bull_growth = round(min(60.0, _scenario_anchor + (2.0 * scenario_width_multiplier)), 1)
-        bear_growth = round(max(-15.0, _scenario_anchor - (3.0 * scenario_width_multiplier)), 1)
-        bull_margin = round(max(ebit_margin_target, min(80.0, ebit_margin_target + (2.0 * scenario_width_multiplier))), 1)
-        bear_margin = round(max(-10.0, ebit_margin_base_pct - max(1.0, scenario_width_multiplier)), 1)
+        bull_growth_step = _bounded(
+            2.0 * scenario_width_multiplier
+            + max(0.0, growth_bias_pp) * 0.50
+            - max(0.0, -growth_bias_pp) * 0.35
+            - learned_caution * 0.20,
+            0.5,
+            10.0,
+        )
+        bear_growth_step = _bounded(
+            3.0 * scenario_width_multiplier
+            + max(0.0, -growth_bias_pp) * 0.80
+            + max(0.0, wacc_bias_pp) * 0.50
+            + learned_caution * 0.40,
+            1.0,
+            14.0,
+        )
+        bull_margin_lift = _bounded(
+            2.0 * scenario_width_multiplier
+            + max(0.0, margin_bias_pp) * 0.60
+            - max(0.0, -margin_bias_pp) * 0.25,
+            0.5,
+            8.0,
+        )
+        bear_margin_drop = _bounded(
+            max(1.0, scenario_width_multiplier)
+            + max(0.0, -margin_bias_pp) * 0.70
+            + learned_caution * 0.30,
+            0.8,
+            8.0,
+        )
+        bull_growth = round(min(60.0, _scenario_anchor + bull_growth_step), 1)
+        bear_growth = round(max(-15.0, _scenario_anchor - bear_growth_step), 1)
+        bull_margin = round(max(ebit_margin_target, min(80.0, ebit_margin_target + bull_margin_lift)), 1)
+        bear_margin = round(max(-10.0, ebit_margin_base_pct - bear_margin_drop), 1)
         bull_iv, bull_up, bull_ev = _quick_iv(bull_wacc, bull_g, bull_growth, bull_margin)
         bear_iv, bear_up, bear_ev = _quick_iv(bear_wacc, bear_g, bear_growth, bear_margin)
-        bull_rec = "Undervalued" if bull_up >= 15 else "Fairly Valued"
-        bear_rec = "Overvalued"  if bear_up < -10 else "Fairly Valued"
+        bull_rec = _learned_recommendation_from_upside(bull_up, expected_error_pct=expected_error_for_rec)[0]
+        bear_rec = _learned_recommendation_from_upside(bear_up, expected_error_pct=expected_error_for_rec)[0]
+        bull_probability = _bounded(0.25 + learned_support * 0.06 - learned_caution * 0.04, 0.12, 0.38)
+        bear_probability = _bounded(0.25 + learned_caution * 0.06 - learned_support * 0.04, 0.12, 0.38)
+        base_probability = max(0.30, 1.0 - bull_probability - bear_probability)
+        probability_total = base_probability + bull_probability + bear_probability
+        base_probability /= probability_total
+        bull_probability /= probability_total
+        bear_probability /= probability_total
+        learned_expected_upside = round(
+            upside * base_probability + bull_up * bull_probability + bear_up * bear_probability,
+            1,
+        )
+        learned_rec, learned_rec_class, learned_buy_threshold, learned_sell_threshold = _learned_recommendation_from_upside(
+            learned_expected_upside,
+            expected_error_pct=expected_error_for_rec,
+        )
+        rec = learned_rec
+        rec_class = learned_rec_class
+        recommendation_basis.update(
+            {
+                "method": "learned-scenario-weighted-expected-upside",
+                "expected_upside_pct": learned_expected_upside,
+                "buy_threshold_pct": round(learned_buy_threshold, 1),
+                "sell_threshold_pct": round(learned_sell_threshold, 1),
+                "scenario_probabilities": {
+                    "base": round(base_probability * 100),
+                    "bull": round(bull_probability * 100),
+                    "bear": round(bear_probability * 100),
+                },
+            }
+        )
+        learning_scenario_basis = {
+            "source": "forecast_layers",
+            "width_multiplier": round(scenario_width_multiplier, 2),
+            "growth_bias_pp": round(growth_bias_pp, 1),
+            "margin_bias_pp": round(margin_bias_pp, 1),
+            "wacc_bias_pp": round(wacc_bias_pp, 1),
+            "caution_flags": int(caution_flags),
+            "learned_caution": round(learned_caution, 2),
+            "learned_support": round(learned_support, 2),
+        }
 
         # ── Financial scores ──────────────────────────────────────────────
         financial_scores   = None
@@ -3043,6 +3449,9 @@ def build_dashboard_data(
             "upside_pct":          round(upside, 1),
             "recommendation":      rec,
             "recommendation_class":rec_class,
+            "recommendation_basis": recommendation_basis,
+            "learned_expected_upside_pct": learned_expected_upside,
+            "learned_recommendation": rec,
             "confidence_score":    70,
             "data_freshness":      f"Live (EODHD — {n} years)",
 
@@ -3209,6 +3618,9 @@ def build_dashboard_data(
                     "intrinsic_value": round(iv, 2),
                     "upside_pct": round(upside, 1),
                     "recommendation": rec,
+                    "probability": round(base_probability, 3),
+                    "learning_basis": learning_scenario_basis,
+                    "narrative": "Learned expected case after company memory, cohort calibration, global memory, and confidence penalties are applied.",
                 },
                 "bull": {
                     "label": "Bull Case", "wacc": bull_wacc, "g": bull_g,
@@ -3222,7 +3634,9 @@ def build_dashboard_data(
                     "terminal_growth": bull_g,
                     "intrinsic_value": bull_iv,
                     "upside_pct": bull_up,
-                    "narrative": "Accelerated revenue growth, margin expansion ahead of plan.",
+                    "probability": round(bull_probability, 3),
+                    "learning_basis": learning_scenario_basis,
+                    "narrative": "Upside case gives learned support more room while respecting the current confidence and scenario-width penalty.",
                 },
                 "bear": {
                     "label": "Bear Case", "wacc": bear_wacc, "g": bear_g,
@@ -3236,7 +3650,9 @@ def build_dashboard_data(
                     "terminal_growth": bear_g,
                     "intrinsic_value": bear_iv,
                     "upside_pct": bear_up,
-                    "narrative": "Margin compression, slowing top-line growth, higher discount rate.",
+                    "probability": round(bear_probability, 3),
+                    "learning_basis": learning_scenario_basis,
+                    "narrative": "Downside case reflects learned caution, warning flags, layer disagreement, and higher discount-rate risk.",
                 },
             },
 

@@ -153,7 +153,7 @@
       <div class="scenario-label">{{ sc.label }}</div>
       <div class="scenario-iv {% if sc.upside >= 0 %}text-green{% else %}text-red{% endif %}">{{ money2(sc.iv) }}</div>
       <div class="scenario-upside {% if sc.upside >= 0 %}text-green{% else %}text-red{% endif %}">{% if sc.upside >= 0 %}+{% endif %}{{ "%.1f"|format(sc.upside) }}% vs market</div>
-      <div class="scenario-params">WACC {{ sc.wacc }}% · g {{ sc.g }}% · Margin {{ sc.margin_target }}%</div>
+      <div class="scenario-params">WACC {{ sc.wacc }}% · g {{ sc.g }}% · Margin {{ sc.margin_target }}%{% if sc.get('probability') is not none %} · P {{ "%.0f"|format(sc.get('probability') * 100) }}%{% endif %}</div>
       {% if sc.get('narrative') %}<div class="scenario-narrative">{{ sc.narrative }}</div>{% endif %}
     </div>
     {% endfor %}
@@ -1031,6 +1031,10 @@
   {% set valuation_conf = confidence_decomposition.get('valuation_confidence') or (km.get('confidence_model') or {}).get('valuation_confidence') or {} %}
   {% set expected_error_band = valuation_conf.get('expected_error_pct') or km.get('expected_valuation_error_band') or {} %}
   {% set forecast_layers = km_explain.get('forecast_layers') or [] %}
+  {% set model_accuracy = km_explain.get('model_accuracy') or km.get('model_accuracy') or data.get('model_accuracy') or {} %}
+  {% set learned_scenario_engine = km_explain.get('learned_scenario_engine') or km.get('learned_scenario_engine') or data.get('model_view') or {} %}
+  {% set scenario_probabilities = learned_scenario_engine.get('probabilities') or {} %}
+  {% set model_thresholds = learned_scenario_engine.get('thresholds') or {} %}
   {% set data_gaps = km_explain.get('data_gaps') or [] %}
   <div class="section-desc" style="margin-bottom:.35rem;">{{ data.knowledge_model.summary }}</div>
   <div class="section-title" style="font-size:.9rem;margin-top:0;">Everything Knows Model</div>
@@ -1129,6 +1133,38 @@
         {% if snapshot_state.get('persisted') %}Persisted{% elif snapshot_state.get('existing_snapshots', 0) > 0 %}Saved{% elif snapshot_state.get('enabled') %}{{ snapshot_state.get('reason', 'pending')|replace('-', ' ')|title }}{% else %}View-only{% endif %}
       </div>
       <div class="kpi-sub">{% if snapshot_state.get('persisted') %}Horizon FY{{ snapshot_state.get('horizon_year') }}{% elif snapshot_state.get('existing_snapshots', 0) > 0 %}{{ snapshot_state.get('existing_snapshots', 0) }} saved horizon snapshot(s){% elif snapshot_state.get('enabled') %}{{ snapshot_state.get('reason', '') }}{% else %}Learning fires on first visit via loading page{% endif %}</div>
+    </div>
+  </div>
+
+  <div class="insights-grid" style="grid-template-columns:repeat(auto-fit,minmax(240px,1fr));margin-bottom:1rem;">
+    <div class="card" style="padding:1rem;">
+      <div class="section-title" style="font-size:.82rem;margin-top:0;">Model Accuracy</div>
+      <div class="kpi-value {% if model_accuracy.get('score', 0) >= 75 %}green{% elif model_accuracy.get('score', 0) >= 55 %}amber{% else %}red{% endif %}" style="font-size:1.55rem;">{{ model_accuracy.get('score', valuation_conf.get('score_100', 0)) }}/100</div>
+      <div class="kpi-sub">{{ model_accuracy.get('scope', 'confidence-model')|replace('-', ' ')|title }} · p50 error {{ (model_accuracy.get('expected_error_pct') or expected_error_band).get('p50', 0) }}% · p90 {{ (model_accuracy.get('expected_error_pct') or expected_error_band).get('p90', 0) }}%</div>
+      <div class="score-narrative" style="margin-top:.55rem;">{{ model_accuracy.get('source_note', confidence_decomposition.get('summary', '')) }}</div>
+    </div>
+
+    <div class="card" style="padding:1rem;">
+      <div class="section-title" style="font-size:.82rem;margin-top:0;">What It Learned</div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:.5rem;margin:.35rem 0 .65rem 0;">
+        <div><div class="kpi-label">Company</div><div class="kpi-value" style="font-size:1.1rem;">{{ model_accuracy.get('company_weight_pct', company_memory.get('weight_pct', 0)) }}%</div></div>
+        <div><div class="kpi-label">Cohort</div><div class="kpi-value" style="font-size:1.1rem;">{{ model_accuracy.get('cohort_samples', cohort_memory.get('records', 0)) }}</div></div>
+        <div><div class="kpi-label">Global</div><div class="kpi-value" style="font-size:1.1rem;">{{ model_accuracy.get('global_records', global_brain_records) }}</div></div>
+      </div>
+      <div class="score-narrative">Revenue miss {{ model_accuracy.get('mean_abs_revenue_error_pct', 'n/a') }}% · margin miss {{ model_accuracy.get('mean_abs_margin_error_pp', 'n/a') }}pp · valuation miss {{ model_accuracy.get('mean_abs_valuation_error_pct', 'n/a') }}%</div>
+    </div>
+
+    <div class="card" style="padding:1rem;">
+      <div class="section-title" style="font-size:.82rem;margin-top:0;">Learned Scenario Engine</div>
+      <div class="kpi-value {% if learned_scenario_engine.get('recommendation_class') == 'green' %}green{% elif learned_scenario_engine.get('recommendation_class') == 'red' %}red{% else %}amber{% endif %}" style="font-size:1.35rem;">{{ learned_scenario_engine.get('recommendation', data.recommendation) }}</div>
+      <div class="kpi-sub">Expected upside {% if learned_scenario_engine.get('expected_upside_pct', 0) >= 0 %}+{% endif %}{{ learned_scenario_engine.get('expected_upside_pct', data.upside_pct) }}% · width {{ learned_scenario_engine.get('scenario_width_multiplier', km.get('scenario_width_multiplier', 1)) }}x</div>
+      <div class="score-narrative" style="margin-top:.55rem;">Base {{ scenario_probabilities.get('base', 0) }}% · Bull {{ scenario_probabilities.get('bull', 0) }}% · Bear {{ scenario_probabilities.get('bear', 0) }}% · growth bias {{ learned_scenario_engine.get('growth_bias_pp', 0) }}pp · margin bias {{ learned_scenario_engine.get('margin_bias_pp', 0) }}pp</div>
+    </div>
+
+    <div class="card" style="padding:1rem;">
+      <div class="section-title" style="font-size:.82rem;margin-top:0;">Model View</div>
+      <div class="score-narrative" style="margin-bottom:.65rem;">{{ learned_scenario_engine.get('summary', confidence_decomposition.get('summary', '')) }}</div>
+      <div class="kpi-sub">Buy above +{{ model_thresholds.get('buy_upside_pct', (data.recommendation_basis or {}).get('buy_threshold_pct', 15)) }}% · Sell below {{ model_thresholds.get('sell_upside_pct', (data.recommendation_basis or {}).get('sell_threshold_pct', -10)) }}% · caution flags {{ learned_scenario_engine.get('caution_flags', 0) }}</div>
     </div>
   </div>
 
