@@ -1989,7 +1989,7 @@ def _augment_learning_explainability(
                 "severity": "amber",
             }
         )
-    if not maintenance.get("ran") and maintenance.get("reason") not in ("throttled", None) and "Maintenance is behind" not in titles:
+    if not maintenance.get("ran") and maintenance.get("reason") not in ("throttled", "last-run", None) and "Maintenance is behind" not in titles:
         data_gaps.append(
             {
                 "title": "Maintenance is behind",

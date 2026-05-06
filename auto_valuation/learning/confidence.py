@@ -195,6 +195,10 @@ def _maintenance_freshness(payload: dict[str, Any]) -> tuple[float, str]:
         return 0.82, "Scheduled maintenance refreshed eligible postmortems and ledger evidence."
     if maintenance.get("reason") == "throttled":
         return 0.68, "Maintenance was run recently and is intentionally throttled between scans."
+    if maintenance.get("reason") == "last-run":
+        matured = int(maintenance.get("matured_records") or 0)
+        scanned = int(maintenance.get("scanned_tickers") or 0)
+        return 0.76, f"Latest scheduled maintenance is available from the ledger with {matured} matured record(s) across {scanned} scanned ticker(s)."
     if int(realized_evidence.get("matured_records") or 0) > 0:
         return 0.58, "Some matured realized evidence exists, but the latest session has not refreshed it yet."
     if current_snapshot or maintenance or realized_evidence:
