@@ -31,6 +31,7 @@ from auto_valuation.learning.cross_industry import (
 )
 from auto_valuation.learning.deployment_seed import analog_observations as seeded_analog_observations
 from auto_valuation.learning.deployment_seed import cohort_observations as seeded_cohort_observations
+from auto_valuation.learning.deployment_seed import historical_replay_summary_observations as seeded_replay_summary_observations
 from auto_valuation.learning.historical_replay import get_all_observations as _get_historical_observations
 from auto_valuation.learning.ledger import LedgerReader
 from auto_valuation.learning.market_implied import build_market_residual_overlay
@@ -385,6 +386,16 @@ def _residual_values(observations: list[Any], actual_key: str, predicted_key: st
     return residuals
 
 
+def _observation_evidence_count(observations: list[Any]) -> int:
+    total = 0
+    for observation in observations:
+        try:
+            total += max(1, int(_obs_value(observation, "evidence_count", 1) or 1))
+        except (TypeError, ValueError):
+            total += 1
+    return total
+
+
 def _structural_break_flag(observation: Any) -> bool:
     if bool(_obs_value(observation, "structural_break_flag", False)):
         return True
@@ -422,7 +433,7 @@ def _blend_observation_metric(
         residuals = _residual_values(observations, actual_key, predicted_key)
         if not residuals:
             continue
-        contributions.append((float(layer_weights.get(layer_name) or 0.0), _trimmed_mean(residuals), len(residuals)))
+        contributions.append((float(layer_weights.get(layer_name) or 0.0), _trimmed_mean(residuals), _observation_evidence_count(observations)))
     total_weight = sum(weight for weight, _, _ in contributions)
     if total_weight <= 0:
         return 0.0, 0, 0.0
@@ -483,6 +494,11 @@ def _build_layered_learning_snapshot(
         and str(_obs_value(observation, "macro_regime", "") or "") == macro_regime
     ]
     global_observations = list(observations)
+    company_evidence_count = _observation_evidence_count(company_observations)
+    cohort_evidence_count = _observation_evidence_count(cohort_observations)
+    sector_evidence_count = _observation_evidence_count(sector_observations)
+    macro_evidence_count = _observation_evidence_count(macro_observations)
+    global_evidence_count = _observation_evidence_count(global_observations)
 
     same_sector_similarities = [_observation_similarity(observation, feature_vector) for observation in sector_observations]
     cross_sector_similarities = [
@@ -526,7 +542,7 @@ def _build_layered_learning_snapshot(
         0.28,
     )
     macro_signal = _clamp(
-        0.03 + min(len(macro_observations) / 8.0, 1.0) * 0.10 + float(global_learning.get("confidence") or 0.0) * 0.06,
+        0.03 + min(macro_evidence_count / 8.0, 1.0) * 0.10 + float(global_learning.get("confidence") or 0.0) * 0.06,
         0.0,
         0.20,
     )
@@ -579,7 +595,7 @@ def _build_layered_learning_snapshot(
         ]
     )
     conflict_score = max(revenue_conflict, margin_conflict)
-    weak_evidence = len(company_observations) == 0 and len(cohort_observations) < 5
+    weak_evidence = company_evidence_count == 0 and cohort_evidence_count < 5
     effective_confidence = _clamp(
         float(calibrated.calibration_confidence or 0.0)
         * (0.72 if weak_evidence else 1.0)
@@ -635,19 +651,19 @@ def _build_layered_learning_snapshot(
         "layer_mix": {
             "company_memory": _layer_snapshot(
                 "company_memory",
-                len(company_observations),
+                company_evidence_count,
                 "Same-ticker realised history feeds the company-memory layer when prior forecasts have matured.",
                 enabled=bool(company_observations),
             ),
             "sector_memory": _layer_snapshot(
                 "sector_memory",
-                len(sector_observations),
+                sector_evidence_count,
                 "Sector priors remain the stabilising layer when company-specific evidence is thin or noisy.",
                 enabled=bool(sector_observations),
             ),
             "cohort_memory": _layer_snapshot(
                 "cohort_memory",
-                len(cohort_observations),
+                cohort_evidence_count,
                 "Matched realised cohorts contribute residual corrections rather than replacing the base model wholesale.",
                 enabled=bool(cohort_observations),
             ),
@@ -663,14 +679,14 @@ def _build_layered_learning_snapshot(
             },
             "macro_memory": _layer_snapshot(
                 "macro_memory",
-                len(macro_observations),
+                macro_evidence_count,
                 f"Macro memory reuses realised records from the same {macro_regime} regime and {market_cap_regime} cap bucket.",
                 enabled=bool(macro_observations),
             ),
             "global_memory": {
                 **_layer_snapshot(
                     "global_memory",
-                    len(global_observations),
+                    global_evidence_count,
                     global_learning.get("note") or "Global cross-symbol memory stays as a low-conviction stabiliser until enough evidence accrues.",
                     enabled=bool(global_learning.get("enabled")),
                 ),
@@ -1551,6 +1567,7 @@ def _load_learning_cohort(limit: int | None = None, subject_ticker: str | None =
     if observations:
         # Augment ledger records with historical quarterly/annual replay observations.
         # Cap to avoid iterating 300k+ observations in refine_live_assumptions.
+        added_historical_replay = False
         try:
             historical = _get_historical_observations()
             if historical:
@@ -1573,10 +1590,26 @@ def _load_learning_cohort(limit: int | None = None, subject_ticker: str | None =
                 elif len(historical) > historical_limit:
                     historical = historical[:historical_limit]
                 observations = list(observations) + list(historical)
+                added_historical_replay = bool(historical)
         except Exception:
             pass
+        if subject_ticker and not added_historical_replay:
+            try:
+                seeded_replay = seeded_replay_summary_observations(str(subject_ticker).upper())
+                if seeded_replay:
+                    observations = list(seeded_replay) + list(observations)
+            except Exception:
+                pass
         return observations
-    return seeded_cohort_observations(limit=int(limit or _learning_pool_limit()))
+    seeded = seeded_cohort_observations(limit=int(limit or _learning_pool_limit()))
+    if subject_ticker:
+        try:
+            seeded_replay = seeded_replay_summary_observations(str(subject_ticker).upper())
+            if seeded_replay:
+                return list(seeded_replay) + list(seeded)
+        except Exception:
+            pass
+    return seeded
 
 
 def _load_analog_candidates(limit: int | None = None):

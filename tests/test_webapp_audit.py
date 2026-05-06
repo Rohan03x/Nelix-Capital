@@ -855,6 +855,69 @@ def test_learning_cohort_pins_subject_historical_replay_before_global_cap(monkey
     assert subject_count == 4
 
 
+def test_learning_cohort_uses_seeded_replay_summary_when_raw_cache_empty(monkeypatch):
+    seeded_summary_observation = {
+        "ticker": "LIGHT.AS",
+        "sector": "Industrials",
+        "industry": "Electrical Components",
+        "data_vintage_years": 13,
+        "market_cap_regime": "mid",
+        "macro_regime": "neutral",
+        "predicted_revenue_growth": 0.0,
+        "actual_revenue_growth": -0.024,
+        "predicted_ebit_margin": 0.0,
+        "actual_ebit_margin": 0.001,
+        "predicted_wacc": 0.084,
+        "actual_wacc": 0.084,
+        "predicted_terminal_growth": 0.025,
+        "actual_terminal_growth": 0.025,
+        "evidence_count": 51,
+        "observation_type": "deployment_historical_replay_summary",
+    }
+    monkeypatch.setattr(knowledge_model_module, "_cached_ledger_records", lambda limit=None: [])
+    monkeypatch.setattr(knowledge_model_module, "_cached_stratified_sample", lambda records, max_records, target: [])
+    monkeypatch.setattr(knowledge_model_module.LedgerReader, "query", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(knowledge_model_module, "_get_historical_observations", lambda: [])
+    monkeypatch.setattr(knowledge_model_module, "seeded_cohort_observations", lambda limit=None: [])
+    monkeypatch.setattr(
+        knowledge_model_module,
+        "seeded_replay_summary_observations",
+        lambda ticker=None: [seeded_summary_observation] if ticker == "LIGHT.AS" else [],
+    )
+
+    observations = knowledge_model_module._load_learning_cohort(limit=1, subject_ticker="LIGHT.AS")
+
+    assert observations == [seeded_summary_observation]
+    assert knowledge_model_module._observation_evidence_count(observations) == 51
+
+
+def test_historical_replay_evidence_summary_uses_seed_when_raw_cache_empty(monkeypatch):
+    import auto_valuation.learning.deployment_seed as deployment_seed_module
+    import auto_valuation.learning.historical_replay as historical_replay_module
+
+    monkeypatch.setattr(historical_replay_module, "get_all_observations", lambda: [])
+    monkeypatch.setattr(
+        deployment_seed_module,
+        "historical_replay_summary",
+        lambda ticker=None: {
+            "records": 51,
+            "annual_records": 10,
+            "quarterly_records": 41,
+            "first_year": 2016,
+            "last_year": 2026,
+            "mean_abs_revenue_error_pct": 26.21,
+            "mean_abs_margin_error_pp": 2.38,
+        } if ticker == "LIGHT.AS" else {},
+    )
+
+    summary = eodhd_client._historical_replay_evidence_summary("LIGHT.AS")
+
+    assert summary["records"] == 51
+    assert summary["annual_records"] == 10
+    assert summary["quarterly_records"] == 41
+    assert summary["source"] == "deployment-replay-summary"
+
+
 def test_eodhd_read_only_build_skips_learning_writes(monkeypatch):
     monkeypatch.setattr(eodhd_client, "_fetch_price", lambda _code: {"close": 100.0})
     monkeypatch.setattr(eodhd_client, "_fetch_fundamentals", lambda _code: _mock_fundamentals())

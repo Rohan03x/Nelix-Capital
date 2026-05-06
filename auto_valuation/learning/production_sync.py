@@ -15,6 +15,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from ._layered_calibrator import CALIBRATION_DB_PATH, CalibrationStore
 from .background_runner import BACKGROUND_RUNNER_STATE_PATH
 from .discovery import DISCOVERY_DB_PATH, DiscoveryStore
+from .historical_replay import _OBS_DISK_CACHE_PATH
 from .ledger import DEFAULT_DB_PATH, DEFAULT_EXPORT_DIR, LedgerReader
 from .maintenance import MAINTENANCE_STATE_PATH
 from .postmortem import POSTMORTEM_DB_PATH, QuinquennialStore
@@ -684,6 +685,11 @@ def _component_specs() -> dict[str, dict[str, Any]]:
             "path": MAINTENANCE_STATE_PATH,
             "r2_key": "brain/db/maintenance_state.json",
         },
+        "historical_observations": {
+            "kind": "file",
+            "path": _OBS_DISK_CACHE_PATH,
+            "r2_key": "brain/db/obs_cache.pkl",
+        },
     }
 
 
@@ -714,6 +720,8 @@ def hydrate_external_learning_state(*, force: bool = False) -> dict[str, Any]:
                         snapshot,
                         spec["ensure"],
                     )
+                elif spec["kind"] == "file":
+                    continue
                 else:
                     restored[namespace] = _restore_json_file(Path(spec["path"]), snapshot)
             except Exception as exc:
@@ -744,6 +752,8 @@ def persist_external_learning_state(*, force: bool = False) -> dict[str, Any]:
                     spec["ensure"]()
                     snapshot = _snapshot_sqlite_db(Path(spec["path"]), tuple(spec["tables"]))
                     persisted[namespace] = _save_sqlite_snapshot(namespace, snapshot)
+                elif spec["kind"] == "file":
+                    persisted[namespace] = False
                 else:
                     snapshot = _snapshot_json_file(Path(spec["path"]))
                     persisted[namespace] = save_remote_snapshot(namespace, snapshot)

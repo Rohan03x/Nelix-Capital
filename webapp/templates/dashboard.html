@@ -1102,7 +1102,7 @@
       </div>
       <div class="kpi-sub">
         {% if realized_evidence.get('historical_replay_records', 0) > 0 %}
-          {{ realized_evidence.get('historical_replay_records', 0) }} replay obs · {{ realized_evidence.get('ledger_matured_records', 0) }} ledger · {{ realized_evidence.get('postmortem_records', 0) }} postmortem(s)
+          {{ realized_evidence.get('historical_replay_records', 0) }} replay obs{% if realized_evidence.get('historical_replay_annual_records', 0) or realized_evidence.get('historical_replay_quarterly_records', 0) %} ({{ realized_evidence.get('historical_replay_annual_records', 0) }} annual, {{ realized_evidence.get('historical_replay_quarterly_records', 0) }} quarterly){% endif %} · {{ realized_evidence.get('ledger_matured_records', 0) }} ledger · {{ realized_evidence.get('postmortem_records', 0) }} postmortem(s)
         {% elif realized_evidence.get('total_realized_records', 0) > 0 %}
           {{ realized_evidence.get('total_realized_records', 0) }} label(s) · {{ realized_evidence.get('postmortem_records', 0) }} postmortem(s)
         {% else %}

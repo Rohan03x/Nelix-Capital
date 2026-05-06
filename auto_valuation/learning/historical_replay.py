@@ -45,6 +45,7 @@ from auto_valuation.learning.residual_controls import (
     robust_bounded_mean,
     robust_bounded_std,
 )
+from auto_valuation.learning.storage_paths import learning_db_dir
 from auto_valuation.learning.maintenance import (
     _annual_periods_by_year,
     _optional_float,
@@ -538,7 +539,7 @@ _OBS_CACHE_TTL: float = 3600.0  # rebuild at most once per hour
 # ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (M5) — disk-backed observation cache.
 # Pickling avoids re-scanning ~3.7k JSON files on every cold start.
 _OBS_DISK_CACHE_PATH: Path = (
-    Path(__file__).resolve().parent / "db" / "obs_cache.pkl"
+    learning_db_dir() / "obs_cache.pkl"
 )
 _OBS_DISK_TTL_SEC: float = 24 * 3600.0  # one day
 

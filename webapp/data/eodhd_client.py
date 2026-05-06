@@ -1105,11 +1105,39 @@ def _historical_replay_evidence_summary(ticker: str) -> dict[str, Any]:
             actual_margin = _maybe_float(_obs_field(observation, "actual_ebit_margin"))
             if predicted_margin is not None and actual_margin is not None:
                 margin_errors.append((actual_margin - predicted_margin) * 100.0)
+        if observations:
+            return {
+                "enabled": True,
+                "records": len(observations),
+                "mean_abs_revenue_error_pct": _mean_abs(revenue_errors),
+                "mean_abs_margin_error_pp": _mean_abs(margin_errors),
+                "source": "historical-replay",
+            }
+    except Exception:
+        pass
+
+    try:
+        from auto_valuation.learning.deployment_seed import historical_replay_summary
+
+        summary = historical_replay_summary(ticker_upper)
+        records = int(summary.get("records") or 0)
+        if records > 0:
+            return {
+                "enabled": True,
+                "records": records,
+                "annual_records": int(summary.get("annual_records") or 0),
+                "quarterly_records": int(summary.get("quarterly_records") or 0),
+                "first_year": summary.get("first_year"),
+                "last_year": summary.get("last_year"),
+                "mean_abs_revenue_error_pct": _maybe_float(summary.get("mean_abs_revenue_error_pct")),
+                "mean_abs_margin_error_pp": _maybe_float(summary.get("mean_abs_margin_error_pp")),
+                "source": "deployment-replay-summary",
+            }
         return {
             "enabled": True,
-            "records": len(observations),
-            "mean_abs_revenue_error_pct": _mean_abs(revenue_errors),
-            "mean_abs_margin_error_pp": _mean_abs(margin_errors),
+            "records": 0,
+            "mean_abs_revenue_error_pct": None,
+            "mean_abs_margin_error_pp": None,
             "source": "historical-replay",
         }
     except Exception as exc:
@@ -2277,10 +2305,21 @@ def _augment_learning_explainability(
     matured_records = max(ledger_matured_records, historical_records)
     total_realized_records = int(ledger_evidence.get("total_realized_records") or 0)
     postmortem_records = int(ledger_evidence.get("postmortem_records") or 0)
+    historical_annual_records = int(historical_evidence.get("annual_records") or 0)
+    historical_quarterly_records = int(historical_evidence.get("quarterly_records") or 0)
+    historical_mix = (
+        f"{historical_records} replay observation(s) ({historical_annual_records} annual, {historical_quarterly_records} quarterly)"
+        if historical_annual_records or historical_quarterly_records
+        else f"{historical_records} replay observation(s)"
+    )
     explainability["realized_evidence"] = {
         "matured_records": matured_records,
         "ledger_matured_records": ledger_matured_records,
         "historical_replay_records": historical_records,
+        "historical_replay_annual_records": historical_annual_records,
+        "historical_replay_quarterly_records": historical_quarterly_records,
+        "historical_replay_first_year": historical_evidence.get("first_year"),
+        "historical_replay_last_year": historical_evidence.get("last_year"),
         "updated_records": int(backfill.get("updated_records") or 0),
         "total_realized_records": total_realized_records,
         "complete_realized_records": int(ledger_evidence.get("complete_realized_records") or 0),
@@ -2291,7 +2330,7 @@ def _augment_learning_explainability(
         "mean_abs_historical_margin_error_pp": historical_evidence.get("mean_abs_margin_error_pp"),
         "source": "live-backfill" if backfill_matured > 0 else str(ledger_evidence.get("source") or "live-backfill"),
         "note": (
-            f"{historical_records} replay observation(s), {ledger_matured_records} ledger back-test(s), {total_realized_records} realized label(s), and {postmortem_records} postmortem(s) exist for this ticker."
+            f"{historical_mix}, {ledger_matured_records} ledger back-test(s), {total_realized_records} realized label(s), and {postmortem_records} postmortem(s) exist for this ticker."
             if matured_records > 0
             else "No matured realized outcomes exist yet for this ticker."
         ),
