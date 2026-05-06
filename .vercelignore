@@ -25,7 +25,7 @@ pyproject.toml
 uv.lock
 logs/
 output/
-learning/
+/learning/
 tests/
 api/
 api/**
