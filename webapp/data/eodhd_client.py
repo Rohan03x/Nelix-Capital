@@ -1733,25 +1733,32 @@ def _global_universe_summary(universe_store: Any | None) -> dict[str, Any]:
     except Exception:
         seed_pool_size = 0
 
+    def _effective_seed_pool_size(summary: dict[str, Any]) -> int:
+        live_tracked = int(summary.get("tracked_symbols") or 0)
+        bootstrapped = int(summary.get("bootstrapped_symbols") or 0)
+        bounded_tracked = min(live_tracked, seed_pool_limit) if seed_pool_limit > 0 and live_tracked > 0 else live_tracked
+        return max(seed_pool_size, bootstrapped, bounded_tracked)
+
     def _reconcile_background_runner_state(state: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
         runner_state = dict(state or {})
         live_tracked = int(summary.get("tracked_symbols") or 0)
         state_tracked = int(runner_state.get("tracked_symbols") or 0)
-        if live_tracked > 0 and (state_tracked <= 0 or state_tracked < max(12, live_tracked // 10)):
+        if live_tracked >= 100 and (state_tracked <= 0 or state_tracked < max(12, live_tracked // 10)):
             runner_state["tracked_symbols"] = live_tracked
-            runner_state["seed_pool_size"] = max(int(runner_state.get("seed_pool_size") or 0), seed_pool_size)
+            runner_state["seed_pool_size"] = max(int(runner_state.get("seed_pool_size") or 0), _effective_seed_pool_size(summary))
             runner_state["state_reconciled"] = True
             runner_state["reconciled_reason"] = "runner-state-lower-than-live-universe"
-            if state_tracked and state_tracked < 12:
-                runner_state["requested_tickers"] = []
-                runner_state["bootstrap"] = {**dict(runner_state.get("bootstrap") or {}), "requested_tickers": []}
+            runner_state["requested_tickers"] = []
+            runner_state["requested_exchanges"] = []
+            runner_state["fetched_exchanges"] = []
+            runner_state["bootstrap"] = {**dict(runner_state.get("bootstrap") or {}), "requested_tickers": []}
         return runner_state
 
     snapshot_payload = {
         **(snapshot_summary or {}),
         "background_target_symbols": seed_target,
         "background_seed_prefix_per_cycle": seed_prefix,
-        "background_seed_pool_size": seed_pool_size,
+        "background_seed_pool_size": _effective_seed_pool_size(snapshot_summary or {}),
         "background_runner": _reconcile_background_runner_state(background_runner_state, snapshot_summary or {}),
     }
 
@@ -1772,7 +1779,7 @@ def _global_universe_summary(universe_store: Any | None) -> dict[str, Any]:
             "top_sectors": [],
             "background_target_symbols": seed_target,
             "background_seed_prefix_per_cycle": seed_prefix,
-            "background_seed_pool_size": seed_pool_size,
+            "background_seed_pool_size": _effective_seed_pool_size(live_summary_base),
             "background_runner": background_runner_state,
         }
 
