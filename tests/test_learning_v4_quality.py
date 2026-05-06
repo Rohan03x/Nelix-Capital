@@ -136,6 +136,10 @@ def test_market_implied_snapshot_and_overlay_use_quality_gated_ev_labels():
     assert overlay["enabled"] is True
     assert overlay["cohort_size"] == 6
     assert overlay["applied_adjustment_decimal"] > 0
+    assert overlay["implied_wacc_label_count"] == 6
+    assert overlay["implied_terminal_growth_label_count"] == 6
+    assert overlay["wacc_adj_pp"] > 0
+    assert overlay["terminal_growth_adj_pp"] < 0
 
 
 def test_market_overlay_rejects_extreme_ev_labels():

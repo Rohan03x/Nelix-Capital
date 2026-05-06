@@ -191,9 +191,13 @@ def build_market_residual_overlay(
             "confidence": 0.0,
             "applied_adjustment_decimal": 0.0,
             "applied_adjustment_pct": 0.0,
+            "wacc_adj_pp": 0.0,
+            "terminal_growth_adj_pp": 0.0,
         }
 
     weighted_residuals: list[tuple[float, float]] = []
+    weighted_wacc_deltas: list[tuple[float, float]] = []
+    weighted_terminal_growth_deltas: list[tuple[float, float]] = []
     scopes: dict[str, int] = {}
     quality_scores: list[float] = []
     snapshots: list[MarketImpliedSnapshot] = []
@@ -216,6 +220,10 @@ def build_market_residual_overlay(
             continue
         weight = max(0.0, match_score) * max(0.05, snapshot.quality_score)
         weighted_residuals.append((residual, weight))
+        if snapshot.implied_wacc_delta_pct is not None:
+            weighted_wacc_deltas.append((float(snapshot.implied_wacc_delta_pct), weight))
+        if snapshot.implied_terminal_growth_delta_pct is not None:
+            weighted_terminal_growth_deltas.append((float(snapshot.implied_terminal_growth_delta_pct), weight))
         scopes[scope] = scopes.get(scope, 0) + 1
         quality_scores.append(snapshot.quality_score)
         snapshots.append(snapshot)
@@ -229,6 +237,8 @@ def build_market_residual_overlay(
             "confidence": round(min(cohort_size / max(min_records, 1), 1.0) * 0.2, 2),
             "applied_adjustment_decimal": 0.0,
             "applied_adjustment_pct": 0.0,
+            "wacc_adj_pp": 0.0,
+            "terminal_growth_adj_pp": 0.0,
             "scope_counts": scopes,
         }
 
@@ -240,6 +250,11 @@ def build_market_residual_overlay(
     if confidence < 0.22:
         residual_weight = 0.0
     applied_adjustment = clamp_market_applied_adjustment(raw_residual * residual_weight)
+    risk_assumption_weight = _clamp(0.10 + confidence * 0.25, 0.0, 0.35) if confidence >= 0.22 else 0.0
+    wacc_delta_pp = _weighted_mean(weighted_wacc_deltas) if weighted_wacc_deltas else 0.0
+    terminal_growth_delta_pp = _weighted_mean(weighted_terminal_growth_deltas) if weighted_terminal_growth_deltas else 0.0
+    wacc_adj_pp = _clamp(wacc_delta_pp * risk_assumption_weight, -0.8, 0.8)
+    terminal_growth_adj_pp = _clamp(terminal_growth_delta_pp * risk_assumption_weight, -0.4, 0.4)
     dominant_scope = max(scopes.items(), key=lambda item: item[1])[0] if scopes else "global"
     residuals_for_band = sorted(value for value, _weight in weighted_residuals)
     p10_index = int(max(0, min(len(residuals_for_band) - 1, len(residuals_for_band) * 0.10)))
@@ -259,6 +274,13 @@ def build_market_residual_overlay(
         "raw_residual_pct": round(raw_residual * 100.0, 1),
         "residual_model_weight": round(residual_weight, 3),
         "dcf_weight": round(1.0 - residual_weight, 3),
+        "risk_assumption_weight": round(risk_assumption_weight, 3),
+        "implied_wacc_delta_pp": round(wacc_delta_pp, 2),
+        "implied_terminal_growth_delta_pp": round(terminal_growth_delta_pp, 2),
+        "wacc_adj_pp": round(wacc_adj_pp, 2),
+        "terminal_growth_adj_pp": round(terminal_growth_adj_pp, 2),
+        "implied_wacc_label_count": len(weighted_wacc_deltas),
+        "implied_terminal_growth_label_count": len(weighted_terminal_growth_deltas),
         "applied_adjustment_decimal": round(applied_adjustment, 5),
         "applied_adjustment_pct": round(applied_adjustment * 100.0, 1),
         "optimism_bias_signal": raw_residual < -0.20,

@@ -2245,6 +2245,9 @@ def refine_live_assumptions(
     global_margin_pp = float(global_learning.get("ebit_margin_adj_pp") or 0.0)
     global_wacc_pp = float(global_learning.get("wacc_adj_pp") or 0.0)
     global_terminal_growth_pp = float(global_learning.get("terminal_growth_adj_pp") or 0.0)
+    market_wacc_pp = float(market_residual_overlay.get("wacc_adj_pp") or 0.0)
+    market_terminal_growth_pp = float(market_residual_overlay.get("terminal_growth_adj_pp") or 0.0)
+    market_risk_source = "; market-implied risk overlay" if abs(market_wacc_pp) >= 0.05 or abs(market_terminal_growth_pp) >= 0.05 else ""
     global_beta_adj = float(global_learning.get("beta_adj") or 0.0)
     relationship_growth_pp = round(float(relationship_overlay.get("revenue_growth_adj_pp") or 0.0) * 0.35, 2)
     relationship_margin_pp = round(float(relationship_overlay.get("ebit_margin_adj_pp") or 0.0) * 0.35, 2)
@@ -2317,7 +2320,8 @@ def refine_live_assumptions(
             + sector_wacc * risk_weights["sector_prior"]
             + (calibrated.wacc_adj * 100) * risk_weights["learned_cohort"]
             + global_wacc_pp
-            + relationship_wacc_pp,
+            + relationship_wacc_pp
+            + market_wacc_pp,
             5.0,
             20.0,
         ),
@@ -2328,7 +2332,8 @@ def refine_live_assumptions(
             terminal_growth * max(0.65, 1.0 - risk_weights["learned_cohort"])
             + (calibrated.terminal_growth_adj * 100) * risk_weights["learned_cohort"]
             + global_terminal_growth_pp
-            + relationship_terminal_growth_pp,
+            + relationship_terminal_growth_pp
+            + market_terminal_growth_pp,
             0.5,
             4.0,
         ),
@@ -2565,7 +2570,8 @@ def refine_live_assumptions(
             "pattern_overlay_pp": 0.0,
             "global_overlay_pp": global_terminal_growth_pp,
             "relationship_overlay_pp": relationship_terminal_growth_pp,
-            "source": risk_source + global_risk_source + relationship_risk_source,
+            "market_implied_overlay_pp": round(market_terminal_growth_pp, 2),
+            "source": risk_source + global_risk_source + relationship_risk_source + market_risk_source,
             "warn": _merge_guardrail_warn(risk_warn, regime_guardrail),
         },
         "ebit_margin_target": {
@@ -2598,7 +2604,8 @@ def refine_live_assumptions(
             "pattern_overlay_pp": 0.0,
             "global_overlay_pp": global_wacc_pp,
             "relationship_overlay_pp": relationship_wacc_pp,
-            "source": risk_source + global_risk_source + relationship_risk_source,
+            "market_implied_overlay_pp": round(market_wacc_pp, 2),
+            "source": risk_source + global_risk_source + relationship_risk_source + market_risk_source,
             "warn": _merge_guardrail_warn(risk_warn, regime_guardrail),
         },
         "tax_rate_pct": {
