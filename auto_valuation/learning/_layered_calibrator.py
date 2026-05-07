@@ -70,6 +70,9 @@ class CalibrationObservation:
     as_of_year: int | None = None
     rf_rate_at_time: float | None = None
     growth_regime: str = "unknown"
+    # BRAIN_IMPROVEMENT_PLAN.md (M1) — momentum and sector rotation signals
+    price_momentum_regime: str = "neutral"   # "strong_bull"|"bull"|"neutral"|"bear"|"strong_bear"
+    sector_rotation_phase: str = "neutral"   # "in_favor"|"neutral"|"out_of_favor"
 
 
 @dataclass(frozen=True)
@@ -440,7 +443,9 @@ class CalibrationStore:
                     predicted_tax_rate REAL,
                     actual_tax_rate REAL,
                     predicted_sbc_pct REAL,
-                    actual_sbc_pct REAL
+                    actual_sbc_pct REAL,
+                    price_momentum_regime TEXT DEFAULT 'neutral',
+                    sector_rotation_phase TEXT DEFAULT 'neutral'
                 )
                 """
             )
@@ -454,6 +459,8 @@ class CalibrationStore:
                 ("actual_tax_rate", "REAL"),
                 ("predicted_sbc_pct", "REAL"),
                 ("actual_sbc_pct", "REAL"),
+                ("price_momentum_regime", "TEXT DEFAULT 'neutral'"),
+                ("sector_rotation_phase", "TEXT DEFAULT 'neutral'"),
             ]
             _existing = {row[1] for row in conn.execute("PRAGMA table_info(calibration_observations)").fetchall()}
             for _col_name, _col_type in _new_cols:
@@ -517,8 +524,9 @@ class CalibrationStore:
                     predicted_da_pct, actual_da_pct,
                     predicted_capex_pct, actual_capex_pct,
                     predicted_tax_rate, actual_tax_rate,
-                    predicted_sbc_pct, actual_sbc_pct
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    predicted_sbc_pct, actual_sbc_pct,
+                    price_momentum_regime, sector_rotation_phase
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     obs_id, obs.ticker, obs.sector, obs.industry,
@@ -535,6 +543,7 @@ class CalibrationStore:
                     obs.predicted_capex_pct, obs.actual_capex_pct,
                     obs.predicted_tax_rate, obs.actual_tax_rate,
                     obs.predicted_sbc_pct, obs.actual_sbc_pct,
+                    obs.price_momentum_regime, obs.sector_rotation_phase,
                 ),
             )
             conn.commit()

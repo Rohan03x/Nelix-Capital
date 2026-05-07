@@ -1,12 +1,12 @@
 """
 learning/train_regime_classifier.py — Offline training script for LightGBM regime classifier.
 
-Trains on existing postmortem records in the ledger DB to learn which
+Trains on existing prediction_records in the ledger DB to learn which
 revenue-trajectory features predict the correct terminal growth regime.
 
 Usage:
     python -m auto_valuation.learning.train_regime_classifier
-    python -m auto_valuation.learning.train_regime_classifier --db path/to/ledger.db
+    python -m auto_valuation.learning.train_regime_classifier --db path/to/predictions.db
 
 The trained model bundle is saved to:
     auto_valuation/learning/data/regime_classifier.pkl
@@ -37,24 +37,65 @@ from auto_valuation.learning.regime_classifier import REGIME_LABELS, _build_feat
 from auto_valuation.learning.storage_paths import learning_db_dir
 
 
-def _load_postmortems(db_path: Path) -> list[dict[str, Any]]:
-    """Load all postmortem payloads from the ledger DB."""
+def _load_prediction_records(db_path: Path) -> list[dict[str, Any]]:
+    """Load prediction_records and join with calibration_observations for actual TG labels."""
     if not db_path.exists():
-        logger.warning("Ledger DB not found at %s", db_path)
+        logger.warning("Predictions DB not found at %s", db_path)
         return []
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT payload_json FROM postmortem_records ORDER BY created_at ASC"
+            """
+            SELECT record_id, ticker, sector, industry, near_term_revenue_growth,
+                   predicted_terminal_growth, predicted_wacc, beta, rf_rate,
+                   data_vintage_years, feature_vector_json, market_cap_regime,
+                   macro_regime, run_date
+            FROM prediction_records
+            WHERE near_term_revenue_growth IS NOT NULL
+              AND scenario = 'base'
+            ORDER BY created_at ASC
+            """
         ).fetchall()
-    payloads: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
     for row in rows:
+        records.append(dict(row))
+    logger.info("Loaded %d prediction records", len(records))
+
+    # Also load calibration_observations for actual TG lookup (by ticker + year)
+    cal_db_path = db_path.parent.parent / "db" / "calibration.db"
+    if not cal_db_path.exists():
+        # Try sibling db directory
+        cal_db_path = db_path.parent / "calibration.db"
+    actual_tg_by_ticker: dict[str, list[float]] = {}
+    if cal_db_path.exists():
         try:
-            payloads.append(json.loads(row["payload_json"]))
-        except Exception:
-            continue
-    logger.info("Loaded %d postmortem records", len(payloads))
-    return payloads
+            with sqlite3.connect(cal_db_path) as cconn:
+                cconn.row_factory = sqlite3.Row
+                cal_rows = cconn.execute(
+                    "SELECT ticker, actual_terminal_growth FROM calibration_observations "
+                    "WHERE actual_terminal_growth IS NOT NULL"
+                ).fetchall()
+            for row in cal_rows:
+                t = str(row["ticker"] or "").upper()
+                if t:
+                    actual_tg_by_ticker.setdefault(t, []).append(float(row["actual_terminal_growth"]))
+            logger.info("Loaded actual TG for %d tickers from calibration DB", len(actual_tg_by_ticker))
+        except Exception as exc:
+            logger.warning("Could not load calibration observations: %s", exc)
+
+    # Attach best actual_terminal_growth to records
+    for record in records:
+        ticker = str(record.get("ticker") or "").upper()
+        actuals = actual_tg_by_ticker.get(ticker)
+        if actuals:
+            # Use median of observed actual TG values for this ticker
+            sorted_actuals = sorted(actuals)
+            n = len(sorted_actuals)
+            record["actual_terminal_growth"] = sorted_actuals[n // 2]
+        else:
+            record["actual_terminal_growth"] = None
+
+    return records
 
 
 def _label_from_actual_terminal_g(actual_tg: float | None) -> str | None:
@@ -72,37 +113,49 @@ def _label_from_actual_terminal_g(actual_tg: float | None) -> str | None:
     return "strong_growth"
 
 
-def _extract_training_row(payload: dict[str, Any]) -> tuple[dict[str, float], str] | None:
+def _extract_training_row(record: dict[str, Any]) -> tuple[dict[str, float], str] | None:
+    """Extract (feature_vector, label) from a prediction_record.
+    Uses actual_terminal_growth (from calibration_observations) when available,
+    falling back to predicted_terminal_growth as a proxy label.
     """
-    Extract (feature_vector, label) from a postmortem payload.
-    Returns None if insufficient data.
-    """
-    snap = payload.get("prediction_snapshot") or {}
-    tg = payload.get("actual_terminal_growth") or snap.get("predicted_terminal_growth")
+    # Prefer actual TG from calibration observations; fall back to predicted
+    tg = record.get("actual_terminal_growth") or record.get("predicted_terminal_growth")
     label = _label_from_actual_terminal_g(tg)
     if label is None:
         return None
 
-    # Best-effort feature extraction from postmortem snapshot
-    # Fields may vary depending on what was stored
-    cagr_5 = snap.get("historical_cagr") or snap.get("hist_cagr_5yr")
-    cagr_3 = snap.get("historical_cagr_3yr") or cagr_5
-    cagr_10 = snap.get("historical_cagr_10yr")
-    ntm = snap.get("ntm_consensus_growth") or snap.get("near_term_growth")
-    mig = snap.get("market_implied_g") or payload.get("actual_terminal_growth")
-    break_score = float(payload.get("structural_break_score") or 0.0)
-    industry = payload.get("industry") or snap.get("industry")
-    headwind = get_industry_headwind_score(industry)
-    rev_vol = float(snap.get("revenue_volatility") or 0.0)
-    mar_vol = float(snap.get("margin_volatility") or 0.0)
-    wacc = snap.get("predicted_wacc")
+    # Extract features
+    cagr_5 = record.get("near_term_revenue_growth")   # near-term CAGR proxy
+    cagr_3 = cagr_5                                     # same field — best available
+    cagr_10: float | None = None
+    ntm: float | None = cagr_5                         # proxy
+    mig: float | None = record.get("predicted_terminal_growth")
+    break_score = 0.0
+
+    # Try to extract from feature_vector_json for richer features
+    fvj = record.get("feature_vector_json")
+    if fvj:
+        try:
+            fv_dict = json.loads(fvj) if isinstance(fvj, str) else fvj
+            cagr_3 = float(fv_dict.get("hist_cagr_3yr") or fv_dict.get("hist_cagr_5yr") or cagr_3 or 0.0)
+            cagr_5 = float(fv_dict.get("hist_cagr_5yr") or cagr_5 or 0.0)
+            cagr_10 = fv_dict.get("hist_cagr_10yr")
+            ntm = fv_dict.get("ntm_consensus_growth") or ntm
+            mig = fv_dict.get("market_implied_g") or mig
+            break_score = float(fv_dict.get("structural_break_score") or 0.0)
+        except Exception:
+            pass
 
     if cagr_5 is None and cagr_3 is None:
         return None
 
+    industry = str(record.get("industry") or "")
+    headwind = get_industry_headwind_score(industry)
+    wacc = record.get("predicted_wacc")
+
     fv = _build_feature_vector(
         cagr_3, cagr_5, cagr_10, ntm, mig,
-        break_score, headwind, rev_vol, mar_vol, wacc=wacc,
+        break_score, headwind, 0.0, 0.0, wacc=wacc,
     )
     return fv, label
 
@@ -120,14 +173,14 @@ def train(db_path: Path) -> None:
         logger.warning("LightGBM not installed. Falling back to sklearn RandomForest.")
         lgb = None
 
-    payloads = _load_postmortems(db_path)
-    if not payloads:
-        logger.error("No postmortem data found; cannot train classifier")
+    records = _load_prediction_records(db_path)
+    if not records:
+        logger.error("No prediction data found; cannot train classifier")
         return
 
     rows: list[tuple[dict[str, float], str]] = []
-    for payload in payloads:
-        result = _extract_training_row(payload)
+    for record in records:
+        result = _extract_training_row(record)
         if result is not None:
             rows.append(result)
 
@@ -138,7 +191,7 @@ def train(db_path: Path) -> None:
     logger.info("Training on %d labelled samples", len(rows))
 
     feature_names = sorted(rows[0][0].keys())
-    X = np.array([[r[0].get(f, 0.0) for f in feature_names] for r, _ in rows], dtype=float)
+    X = np.array([[r.get(f, 0.0) for f in feature_names] for r, _ in rows], dtype=float)
     y_labels = [label for _, label in rows]
     y_int = [REGIME_LABELS.index(label) if label in REGIME_LABELS else 2 for label in y_labels]
     y = np.array(y_int, dtype=int)
@@ -195,13 +248,14 @@ def train(db_path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train LightGBM regime classifier")
-    parser.add_argument("--db", type=Path, default=None, help="Path to ledger.db (default: auto-detect)")
+    parser = argparse.ArgumentParser(description="Train regime classifier")
+    parser.add_argument("--db", type=Path, default=None, help="Path to predictions.db (default: auto-detect)")
     args = parser.parse_args()
 
-    db_path = args.db or (learning_db_dir() / "ledger.db")
+    db_path = args.db or (learning_db_dir() / "predictions.db")
     train(db_path)
 
 
 if __name__ == "__main__":
     main()
+
