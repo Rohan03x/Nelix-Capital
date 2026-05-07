@@ -639,14 +639,11 @@ def _restore_r2_raw_component(namespace: str, spec: dict[str, Any], *, force: bo
 
 
 def _component_specs() -> dict[str, dict[str, Any]]:
+    # On serverless runtimes (Vercel) /tmp is limited to ~512 MB.
+    # Skip the two largest components (predictions.db ~235 MB, obs_cache.pkl ~95 MB)
+    # that are only needed for background training — Vercel uses the pre-trained PKL instead.
+    serverless = _serverless_runtime()
     return {
-        "ledger": {
-            "kind": "sqlite",
-            "path": DEFAULT_DB_PATH,
-            "r2_key": "brain/db/predictions.db",
-            "tables": ("prediction_records", "realized_outcomes", "postmortem_records", "maintenance_runs"),
-            "ensure": lambda: LedgerReader(db_path=DEFAULT_DB_PATH, export_dir=DEFAULT_EXPORT_DIR),
-        },
         "calibration": {
             "kind": "sqlite",
             "path": CALIBRATION_DB_PATH,
@@ -685,11 +682,20 @@ def _component_specs() -> dict[str, dict[str, Any]]:
             "path": MAINTENANCE_STATE_PATH,
             "r2_key": "brain/db/maintenance_state.json",
         },
-        "historical_observations": {
-            "kind": "file",
-            "path": _OBS_DISK_CACHE_PATH,
-            "r2_key": "brain/db/obs_cache.pkl",
-        },
+        **({} if serverless else {
+            "ledger": {
+                "kind": "sqlite",
+                "path": DEFAULT_DB_PATH,
+                "r2_key": "brain/db/predictions.db",
+                "tables": ("prediction_records", "realized_outcomes", "postmortem_records", "maintenance_runs"),
+                "ensure": lambda: LedgerReader(db_path=DEFAULT_DB_PATH, export_dir=DEFAULT_EXPORT_DIR),
+            },
+            "historical_observations": {
+                "kind": "file",
+                "path": _OBS_DISK_CACHE_PATH,
+                "r2_key": "brain/db/obs_cache.pkl",
+            },
+        }),
     }
 
 
