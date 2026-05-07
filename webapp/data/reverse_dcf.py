@@ -115,18 +115,31 @@ def compute_reverse_dcf(data: dict) -> dict:
             diluted_shares=diluted_shares,
         )
 
-    # Find implied g at current price
+    # Find implied g at current price.
+    # Ceiling is wacc - 0.1 so the Gordon-growth spread never collapses to zero.
+    # For hyper-growth stocks (e.g. TSLA) the implied g can sit very close to WACC;
+    # using wacc - 0.5 as the ceiling was too tight and caused the bisect to return None.
+    _G_HI = wacc_pct - 0.1
     implied_g = _bisect(
         lambda g: iv_fn(g) - price,
         lo=-5.0,
-        hi=wacc_pct - 0.5,
+        hi=_G_HI,
         target=0.0,
     )
 
     if implied_g is None:
-        # Price is below even the lowest-g IV → market is implying negative growth
-        implied_g = -5.0
-        auto_bounded = True
+        # Determine which boundary was hit so we can generate the right narrative.
+        _iv_at_lo = iv_fn(-5.0)
+        _iv_at_hi = iv_fn(_G_HI)
+        if _iv_at_hi < price:
+            # Even the maximum feasible growth rate undervalues vs the market price.
+            # The market is pricing extraordinary optionality beyond a standard perpetuity.
+            implied_g = _G_HI
+            auto_bounded = "high"  # market requires g approaching WACC
+        else:
+            # Minimum-g IV exceeds the price — stock deeply undervalued even at -5% growth.
+            implied_g = -5.0
+            auto_bounded = "low"
     else:
         auto_bounded = False
 
@@ -169,15 +182,15 @@ def compute_reverse_dcf(data: dict) -> dict:
     implied_g_bear = _bisect(
         lambda g: iv_fn_bear(g) - price,
         lo=-5.0,
-        hi=wacc_pct + 1 - 0.5,
+        hi=wacc_pct + 1 - 0.1,
         target=0.0,
     )
     implied_g_bear_rounded = round(implied_g_bear, 2) if implied_g_bear else implied_g_rounded
 
-    # Sensitivity curve: IV at each g from -2% to wacc-0.5%
+    # Sensitivity curve: IV at each g, anchored around implied_g
     curve = []
     g_step_start = max(-2.0, round(implied_g_rounded - 3, 1))
-    g_step_end   = min(wacc_pct - 0.5, g_step_start + 7)
+    g_step_end   = min(wacc_pct - 0.1, g_step_start + 7)
     steps = 20
     step = (g_step_end - g_step_start) / steps
     g_val = g_step_start
@@ -190,10 +203,19 @@ def compute_reverse_dcf(data: dict) -> dict:
     # Interpretation narrative
     if price <= 0:
         narrative = "Market price data unavailable."
+    elif auto_bounded == "high":
+        # Market requires terminal growth near or above WACC — standard perpetuity can't close the gap.
+        narrative = (
+            f"Even at terminal growth approaching our WACC of {wacc_pct:.1f}%, the DCF cannot justify "
+            f"the current price of ${price:.2f}. The market is pricing in extraordinary long-run optionality "
+            f"— revenue expansion, margin recovery, or new business lines — well beyond our conservative "
+            f"base-case assumption of {base_g:.1f}% terminal growth."
+        )
     elif implied_g < 0:
+        pessimism = "very pessimistic" if implied_g < -2 else "pessimistic"
         narrative = (
             f"The market is pricing in a terminal growth rate of {implied_g_rounded:.1f}% — "
-            f"implying long-term revenue contraction. This is {"very pessimistic" if implied_g < -2 else "pessimistic"} "
+            f"implying long-term revenue contraction. This is {pessimism} "
             f"relative to our base-case assumption of {base_g:.1f}%."
         )
     elif implied_g < base_g - 1.5:
@@ -206,16 +228,26 @@ def compute_reverse_dcf(data: dict) -> dict:
         )
     elif implied_g < base_g - 0.5:
         gap = base_g - implied_g_rounded
+        valuation = "undervalued" if implied_wacc_rounded > wacc_pct + 0.5 else "fairly priced"
         narrative = (
             f"The market prices in {implied_g_rounded:.1f}% terminal growth vs. our {base_g:.1f}% base case "
             f"— a moderate {gap:.1f}pp discount. At an implied WACC of {implied_wacc_rounded:.1f}%, "
-            f"the stock looks {"undervalued" if implied_wacc_rounded > wacc_pct + 0.5 else "fairly priced"} on our assumptions."
+            f"the stock looks {valuation} on our assumptions."
         )
     elif abs(implied_g - base_g) <= 0.5:
         narrative = (
             f"The market is broadly aligned with our base-case terminal growth assumption of {base_g:.1f}%. "
             f"Implied WACC of {implied_wacc_rounded:.1f}% vs. our {wacc_pct:.1f}% model WACC — "
             f"the stock appears fairly valued on current consensus."
+        )
+    elif implied_g >= wacc_pct - 1.5:
+        # Implied growth within ~1.5pp of WACC — market pricing near-WACC optionality
+        premium = implied_g_rounded - base_g
+        narrative = (
+            f"The market is pricing in terminal growth of {implied_g_rounded:.1f}% — "
+            f"{premium:.1f}pp above our {base_g:.1f}% base case and approaching our WACC of {wacc_pct:.1f}%. "
+            f"This implies exceptional long-run value creation expectations; the stock is priced for "
+            f"compounding growth well beyond consensus."
         )
     else:
         premium = implied_g_rounded - base_g
