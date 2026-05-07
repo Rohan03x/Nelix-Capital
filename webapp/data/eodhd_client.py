@@ -3447,41 +3447,31 @@ def build_dashboard_data(
                 base_probability /= _pt
 
         # ── Layer G: ScenarioProbabilityModel ML prediction ──────────────
-        # Multinomial LogisticRegression trained from labeled scenario_outcomes.
-        # Activates when ≥30 labeled rows exist; blends at up to 70% weight
-        # (growing with n_samples).  Below the threshold the heuristic/calibrator
-        # result is used unchanged.  Falls back silently on any error.
+        # Multinomial LogisticRegression trained from prediction_records (33k+ rows
+        # back to each ticker's IPO).  Activates immediately on first run.
+        # Blends at up to 70% weight (growing with n_samples).
         _ml_prob_weight = 0.0
         _ml_n_samples = 0
         try:
             from auto_valuation.learning.scenario_probability_model import (
-                extract_features_for_prediction,
+                extract_features_for_prediction_v2,
                 predict_scenario_probabilities,
                 get_model_info,
             )
-            _sp_revenue_regime = str(
-                (dict((knowledge_model_payload or {}).get("layered_learning") or {}).get("terminal_growth") or {}).get("revenue_regime") or "stable"
-            )
             _sp_macro_regime = _macro_regime_from_rf(float(rf_rate) / 100)
             _sp_mkt_cap_regime = str((knowledge_model_payload or {}).get("market_cap_regime") or "mid_cap")
-            _sp_feats = extract_features_for_prediction(
-                bull_wacc=bull_wacc,
-                bear_wacc=bear_wacc,
-                base_wacc=wacc,
-                bull_g=bull_g,
-                bear_g=bear_g,
-                bull_iv=bull_iv,
-                bear_iv=bear_iv,
-                base_iv=iv,
-                bull_rev_growth=bull_growth,
-                bear_rev_growth=bear_growth,
-                bull_margin=bull_margin,
-                bear_margin=bear_margin,
-                heuristic_bull=bull_probability,
-                heuristic_bear=bear_probability,
+            _sp_years = len((data.get("historical") or {}).get("years") or []) or 10
+            _sp_feats = extract_features_for_prediction_v2(
+                wacc=float(wacc) / 100.0,
+                rev_growth=float(revenue_growth_near) / 100.0,
+                ebit_margin=float(ebit_margin_target) / 100.0,
+                terminal_growth=float(terminal_growth) / 100.0,
+                base_iv=float(iv),
+                market_price=float(price),
+                years_since_ipo=_sp_years,
                 macro_regime=_sp_macro_regime,
-                revenue_regime=_sp_revenue_regime,
                 market_cap_regime=_sp_mkt_cap_regime,
+                data_vintage=_sp_years,
             )
             if _sp_feats is not None:
                 _ml_probs = predict_scenario_probabilities(_sp_feats)

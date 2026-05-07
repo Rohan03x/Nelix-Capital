@@ -598,13 +598,51 @@ def _train_scenario_probability_model() -> dict[str, Any]:
 
         labeled = [dict(row) for row in rows]
         n_labeled = len(labeled)
-        if n_labeled == 0:
-            return {"ran": True, "status": "no_labels_yet", "n_samples": 0}
 
         model = ScenarioProbabilityModel()
-        result = model.train(labeled)
-        result["ran"] = True
-        result["n_labeled_rows"] = n_labeled
+
+        if n_labeled >= 30:
+            # Preferred path — explicit quarterly/annual outcome labels
+            result = model.train(labeled)
+            result["ran"] = True
+            result["n_labeled_rows"] = n_labeled
+        else:
+            # Bootstrap path — use prediction_records (33k+ rows back to IPO)
+            # Label: actual_price_at_horizon / predicted_price_per_share
+            #   > 1.30 → bull,  < 0.70 → bear,  else → base
+            logger.info(
+                "ScenarioProbabilityModel: only %d scenario_outcomes labels; "
+                "bootstrapping from prediction_records",
+                n_labeled,
+            )
+            try:
+                pred_db = db_path.parent / "predictions.db"
+                if not pred_db.exists():
+                    return {"ran": False, "reason": "no predictions.db for bootstrap"}
+                import sqlite3 as _sql
+                pred_conn = _sql.connect(str(pred_db))
+                pred_conn.row_factory = _sql.Row
+                pred_rows = pred_conn.execute("""
+                    SELECT ticker, predicted_price_per_share, actual_price_at_horizon,
+                           actual_price_at_prediction, predicted_wacc,
+                           near_term_revenue_growth, target_ebit_margin,
+                           predicted_terminal_growth, years_since_ipo,
+                           data_vintage_years, macro_regime, market_cap_regime
+                    FROM prediction_records
+                    WHERE actual_price_at_horizon IS NOT NULL
+                      AND actual_price_at_horizon > 0
+                      AND predicted_price_per_share > 0
+                """).fetchall()
+                pred_conn.close()
+                pred_dicts = [dict(r) for r in pred_rows]
+                result = model.train_from_prediction_records(pred_dicts)
+                result["ran"] = True
+                result["n_labeled_rows"] = n_labeled
+                result["bootstrap_rows"] = len(pred_dicts)
+            except Exception as exc:
+                logger.warning("ScenarioProbabilityModel bootstrap failed: %s", exc)
+                return {"ran": False, "reason": str(exc)}
+
         # Invalidate the module singleton so the next prediction picks up the new model
         import auto_valuation.learning.scenario_probability_model as _spm
         _spm._model_singleton = None
