@@ -34,6 +34,8 @@ _REGIME_FEATURES: dict[str, list[str]] = {
         "gross_margin_trend",
         "industry_headwind_score",
         "market_implied_g",
+        "beta",
+        "capex_reinvestment",
     ],
     "mild_decline": [
         "cagr_3yr",
@@ -41,6 +43,8 @@ _REGIME_FEATURES: dict[str, list[str]] = {
         "ntm_growth",
         "margin_trend",
         "industry_headwind_score",
+        "beta",
+        "size_score",
     ],
     "stable": [
         "cagr_3yr",
@@ -48,6 +52,8 @@ _REGIME_FEATURES: dict[str, list[str]] = {
         "ntm_growth",
         "margin_trend",
         "structural_break_score",
+        "beta",
+        "size_score",
     ],
     "moderate_growth": [
         "cagr_3yr",
@@ -56,6 +62,8 @@ _REGIME_FEATURES: dict[str, list[str]] = {
         "margin_trend",
         "structural_break_score",
         "industry_headwind_score",
+        "capex_reinvestment",
+        "size_score",
     ],
     "strong_growth": [
         "cagr_3yr",
@@ -64,6 +72,8 @@ _REGIME_FEATURES: dict[str, list[str]] = {
         "margin_trend",
         "market_implied_g",
         "structural_break_score",
+        "capex_reinvestment",
+        "beta",
     ],
 }
 

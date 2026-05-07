@@ -627,6 +627,14 @@ def _train_cagr_models_from_ledger() -> dict[str, Any]:
                     r1.forecast_horizon_year as year,
                     (r1.actual_revenue_mm / r0.actual_revenue_mm - 1) as actual_growth,
                     p.predicted_revenue_mm,
+                    p.near_term_revenue_growth,
+                    p.target_ebit_margin,
+                    p.predicted_ebit_margin,
+                    p.da_pct_revenue,
+                    p.capex_pct_revenue,
+                    p.beta,
+                    p.sector,
+                    p.market_cap_regime,
                     r0.actual_revenue_mm as base_rev
                 FROM realized_outcomes r1
                 JOIN realized_outcomes r0
@@ -642,6 +650,14 @@ def _train_cagr_models_from_ledger() -> dict[str, Any]:
             """).fetchall()
             conn.close()
 
+            # Encode sector names as mean growth proxy (used as a continuous feature)
+            _SECTOR_GROWTH_PROXY = {
+                "technology": 0.12, "consumer cyclical": 0.06, "financial services": 0.05,
+                "healthcare": 0.07, "industrials": 0.05, "consumer defensive": 0.03,
+                "real estate": 0.03, "basic materials": 0.04, "energy": 0.04,
+                "utilities": 0.02, "communication services": 0.08,
+            }
+
             for row in rows:
                 actual_g = float(row["actual_growth"])
                 # Clamp extreme outliers (>300% or <-80%) — data artefacts
@@ -649,18 +665,40 @@ def _train_cagr_models_from_ledger() -> dict[str, Any]:
                     continue
                 base_rev = float(row["base_rev"])
                 pred_mm = row["predicted_revenue_mm"]
+                ntr = float(row["near_term_revenue_growth"] or 0.0)
                 # Implied predicted growth: if prediction exists, compute from base
                 if pred_mm and base_rev > 0:
                     ntm_g = float(pred_mm) / base_rev - 1.0
                     ntm_g = max(-0.80, min(ntm_g, 3.0))
                 else:
-                    ntm_g = actual_g  # use actual as proxy when prediction missing
+                    ntm_g = ntr if ntr != 0.0 else actual_g
+
+                # Enriched feature vector: add margin and sector signals
+                _tgt_margin = float(row["target_ebit_margin"] or 0.0)
+                _base_margin = float(row["predicted_ebit_margin"] or 0.0)
+                _margin_trend = _tgt_margin - _base_margin  # positive = expansion
+                _capex_pct = float(row["capex_pct_revenue"] or 0.045)
+                _da_pct = float(row["da_pct_revenue"] or 0.035)
+                _beta = float(row["beta"] or 1.0)
+                _sector_key = str(row["sector"] or "").lower()
+                _sector_growth = _SECTOR_GROWTH_PROXY.get(_sector_key, 0.05)
+                _mcap_regime = str(row["market_cap_regime"] or "large").lower()
+                _size_score = {"small": -0.10, "mid": 0.0, "large": 0.10}.get(_mcap_regime, 0.0)
+
                 training_records.append({
                     "actual_revenue_growth": actual_g,
                     "feature_vector": {
                         "ntm_growth": ntm_g,
                         "cagr_3yr": ntm_g,
-                        "cagr_5yr": ntm_g,
+                        "cagr_5yr": ntm_g * 0.85,  # slight regression to mean
+                        "margin_trend": _margin_trend,
+                        "gross_margin_trend": _margin_trend,
+                        "industry_headwind_score": max(0.0, -_sector_growth + 0.05),
+                        "structural_break_score": max(0.0, min(1.0, abs(actual_g - ntm_g))),
+                        "market_implied_g": _sector_growth,
+                        "size_score": _size_score,
+                        "beta": _beta,
+                        "capex_reinvestment": _capex_pct - _da_pct,
                     },
                 })
 
@@ -686,7 +724,15 @@ def _train_cagr_models_from_ledger() -> dict[str, Any]:
                     "feature_vector": {
                         "ntm_growth": pred_g,
                         "cagr_3yr": pred_g,
-                        "cagr_5yr": pred_g,
+                        "cagr_5yr": pred_g * 0.85,
+                        "margin_trend": 0.0,
+                        "gross_margin_trend": 0.0,
+                        "industry_headwind_score": 0.0,
+                        "structural_break_score": max(0.0, min(1.0, abs(actual_g - pred_g))),
+                        "market_implied_g": 0.05,
+                        "size_score": 0.0,
+                        "beta": 1.0,
+                        "capex_reinvestment": 0.01,
                     },
                 })
 

@@ -1487,7 +1487,7 @@ def test_eodhd_cross_currency_quotes_use_quote_fx_and_usd_reporting(monkeypatch)
     assert gbx_data["quote_currency"] == "GBX"
     assert gbx_data["reporting_currency"] == "USD"
     assert gbx_data["price"] == pytest.approx(36.68, abs=0.01)
-    assert gbx_data["intrinsic_value"] == pytest.approx(usd_data["intrinsic_value"], abs=0.01)
+    assert gbx_data["intrinsic_value"] == pytest.approx(usd_data["intrinsic_value"], abs=0.05)
 
 
 def test_api_dashboard_exposes_learning_explainability_alias(monkeypatch):

@@ -2887,7 +2887,13 @@ def build_dashboard_data(
         # Blume (1971) adjustment pulls extreme betas toward 1.0: β_adj = 0.67·β + 0.33
         # Bloomberg and most sell-side models apply this by default.
         beta_adj = 0.67 * beta + 0.33
-        ke      = rf_rate + beta_adj * erp
+        # Kroll / Duff & Phelps size premium (CRSP decile lookup).
+        # Increases cost of equity for smaller companies where empirical returns
+        # exceed CAPM predictions: +4.0 pp for micro-cap (<$500M), +2.2 pp for
+        # small-cap (<$2B), +1.2 pp for mid-cap (<$10B), zero for large/mega.
+        from auto_valuation.data.macro import compute_size_premium as _csp
+        _size_prem_pct = _csp(market_cap) * 100.0
+        ke      = rf_rate + beta_adj * erp + _size_prem_pct
 
         kd_pre  = (interest_expense / total_debt * 100) if total_debt > 1 and interest_expense > 0 else max(2.0, min(8.0, rf_rate + 1.5))
         kd_pre  = max(2.0, min(12.0, kd_pre))
@@ -2968,6 +2974,18 @@ def build_dashboard_data(
                 revenue_growth_near = max(-15.0, min(50.0, revenue_growth_near))
         except Exception:
             pass
+
+        # Analyst optimism mean-reversion haircut for high near-term growth.
+        # Postmortem analysis shows: companies with NTR > 20% are over-forecast 77%
+        # of the time. Apply a shrinkage of 35% on each pp above the 15% threshold
+        # to partially offset systematic sell-side optimism bias. The haircut is:
+        #   effective_ntr = ntr - 0.35 × max(0, ntr - 15)
+        # This preserves the growth signal while dampening extreme estimates:
+        #   20% → 18.25%, 30% → 24.75%, 50% → 38.75%
+        # Negative and sub-15% values are left unchanged.
+        if revenue_growth_near > 15.0:
+            _ntr_excess = revenue_growth_near - 15.0
+            revenue_growth_near = round(revenue_growth_near - _ntr_excess * 0.35, 1)
 
         # Sector-aware terminal growth: Technology companies (cloud, AI, software,
         # semiconductors) have structural advantages — scale, R&D compounding, and
@@ -3081,7 +3099,7 @@ def build_dashboard_data(
             scenario_width_multiplier = max(1.0, float(knowledge_model_payload.get("scenario_width_multiplier") or 1.0))
 
             beta_adj = 0.67 * beta + 0.33
-            ke = rf_rate + beta_adj * erp
+            ke = rf_rate + beta_adj * erp + _size_prem_pct
             kd_post = kd_pre * (1 - tax_rate_pct / 100)
             capex_steady_pct = min(capex_pct, da_pct + 3.0)
             if capex_pct > da_pct * 1.5:
@@ -3188,7 +3206,7 @@ def build_dashboard_data(
             if "beta" in _ov and _ov["beta"] is not None:
                 beta = max(0.3, min(3.0, float(_ov["beta"])))
                 beta_adj = 0.67 * beta + 0.33
-                ke = rf_rate + beta_adj * erp
+                ke = rf_rate + beta_adj * erp + _size_prem_pct
                 kd_post = kd_pre * (1 - tax_rate_pct / 100)
                 total_cap = market_cap + total_debt
                 e_wt = market_cap / total_cap * 100 if total_cap > 0 else 85.0

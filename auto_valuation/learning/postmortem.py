@@ -331,10 +331,29 @@ def _compute_implied_wacc_and_tg(
     # 2. Terminal growth from reverse DCF
     actual_ev = actuals.get("actual_ev_mm")
     actual_ufcf = actuals.get("actual_ufcf_mm")
-    if actual_ev is None or actual_ufcf is None or resolved_wacc is None:
+    if actual_ev is None or resolved_wacc is None:
         return resolved_wacc, None
     if actual_ev <= 0 or resolved_wacc <= 0:
         return resolved_wacc, None
+
+    # When actual_ufcf is not directly available, build a proxy from actual EBIT
+    # margin × actual revenue using the prediction's intensity factors.
+    # UFCF ≈ EBIT*(1-t) + D&A - Capex - SBC
+    if actual_ufcf is None:
+        _actual_ebit_margin = actuals.get("actual_ebit_margin")
+        _actual_revenue = actuals.get("actual_revenue_mm")
+        if _actual_ebit_margin is not None and _actual_revenue is not None and float(_actual_revenue) > 0:
+            _da_pct = float(getattr(prediction, "da_pct_revenue", None) or 0.035)
+            _capex_pct = float(getattr(prediction, "capex_pct_revenue", None) or 0.045)
+            _tax_proxy = 0.25
+            actual_ufcf = float(_actual_revenue) * (
+                float(_actual_ebit_margin) * (1.0 - _tax_proxy)
+                + _da_pct
+                - _capex_pct
+                - 0.010  # SBC proxy 1%
+            )
+        if actual_ufcf is None:
+            return resolved_wacc, None
 
     # Use terminal UFCF as current actual_ufcf (year N)
     # The explicit PV is unavailable at postmortem time, so use actual_ev
