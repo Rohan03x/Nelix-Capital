@@ -3423,6 +3423,28 @@ def build_dashboard_data(
         base_probability /= probability_total
         bull_probability /= probability_total
         bear_probability /= probability_total
+
+        # ── Blend calibrated scenario priors when sufficient historical data ──
+        # ScenarioCalibrator learns from labeled outcomes (base/bull/bear winner).
+        # Weight grows linearly from 5% at n=10 to 50% at n=100 and caps there.
+        # When no labeled data exists the heuristic values are used unchanged.
+        _cal_blend_weight = 0.0
+        _cal_n_obs = 0
+        if knowledge_model_payload:
+            _scal = knowledge_model_payload.get("scenario_calibration_prior") or {}
+            _sprior = _scal.get("annual") or _scal.get("quarterly") or {}
+            _cal_n_obs = int(_sprior.get("n_observations") or 0)
+            if _sprior.get("confident") and _cal_n_obs >= 10:
+                _cal_blend_weight = min(0.50, _cal_n_obs / 200.0)
+                _p_bull_cal = float(_sprior.get("p_bull") or bull_probability)
+                _p_bear_cal = float(_sprior.get("p_bear") or bear_probability)
+                bull_probability = _cal_blend_weight * _p_bull_cal + (1.0 - _cal_blend_weight) * bull_probability
+                bear_probability = _cal_blend_weight * _p_bear_cal + (1.0 - _cal_blend_weight) * bear_probability
+                base_probability = max(0.30, 1.0 - bull_probability - bear_probability)
+                _pt = bull_probability + bear_probability + base_probability
+                bull_probability /= _pt
+                bear_probability /= _pt
+                base_probability /= _pt
         learned_expected_upside = round(
             upside * base_probability + bull_up * bull_probability + bear_up * bear_probability,
             1,
@@ -3455,6 +3477,8 @@ def build_dashboard_data(
             "caution_flags": int(caution_flags),
             "learned_caution": round(learned_caution, 2),
             "learned_support": round(learned_support, 2),
+            "calibrated_probability_blend": round(_cal_blend_weight, 3),
+            "calibration_n_observations": _cal_n_obs,
         }
 
         # ── Financial scores ──────────────────────────────────────────────
@@ -3904,7 +3928,7 @@ def build_dashboard_data(
                 _result["peers"]       = _peers
                 _result["peer_median"] = _peer_median
             except Exception as _pe:
-                logger.debug("Peer fetch failed for %s: %s", ticker, _pe)
+                logger.warning("Peer fetch failed for %s: %s", ticker, _pe)
 
         universe_store = _safe_symbol_universe_store()
         discovery_store = _safe_discovery_store()

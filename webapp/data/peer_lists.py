@@ -1266,6 +1266,38 @@ def fetch_peer_metrics(
     eodhd_index = _build_eodhd_multiples_index()
     profiles = {str(profile.get("ticker") or ""): profile for profile in _load_cached_peer_profiles()}
 
+    # ── Pre-warm missing peers in parallel (critical for Vercel cold starts) ──
+    # On Vercel no eodhd_fund_*.json files are deployed, so _build_eodhd_multiples_index()
+    # returns an empty index.  Without this block each peer lookup triggers a sequential
+    # live EODHD API call (~12 × 3 s = 36 s), causing the request to time out.
+    # Parallel pre-fetch caps the overhead to max(single_fetch_time) ≈ 3–5 s.
+    _missing_from_index: list[str] = []
+    for _tk in peer_tickers:
+        _tk_upper = str(_tk or "").upper()
+        if not any(eodhd_index.get(v) for v in _ticker_variants(_tk_upper)):
+            _missing_from_index.append(_tk_upper)
+
+    if _missing_from_index:
+        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+
+        def _prefetch_peer(ticker_text: str) -> tuple[str, dict | None]:
+            raw = _fetch_eodhd_fundamentals_for_peer(ticker_text)
+            return ticker_text, _metrics_from_eodhd_fundamentals(raw, fallback_ticker=ticker_text) if raw else None
+
+        _max_workers = min(8, len(_missing_from_index))
+        with ThreadPoolExecutor(max_workers=_max_workers) as _pool:
+            for _result_tk, _metrics in _pool.map(_prefetch_peer, _missing_from_index):
+                if _metrics:
+                    _variants = _metrics.pop("_variants", set())
+                    for _v in _variants:
+                        if _v:
+                            eodhd_index.setdefault(str(_v).upper(), _metrics)
+        logger.debug(
+            "fetch_peer_metrics: parallel pre-fetch completed %d missing peers for %s",
+            len(_missing_from_index),
+            target_ticker,
+        )
+
     # yfinance fallback removed — see ADAPTIVE_DCF_IMPROVEMENT_PLAN.md (P3).
     # Tickers missing from the EODHD index are surfaced with N/A multiples.
 
