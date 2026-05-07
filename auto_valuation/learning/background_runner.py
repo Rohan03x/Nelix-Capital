@@ -694,7 +694,7 @@ def _train_cagr_models_from_ledger() -> dict[str, Any]:
             return {"ran": False, "reason": "no-training-records", "sample_counts": {}}
 
         predictor = NearTermCagrPredictor()
-        sample_counts = predictor.train(training_records, alpha=1.0)
+        sample_counts = predictor.train(training_records, alpha=0.05)
         total_samples = sum(sample_counts.values())
         logger.info(
             "CAGR Ridge model training complete: %d total samples across %d regimes",

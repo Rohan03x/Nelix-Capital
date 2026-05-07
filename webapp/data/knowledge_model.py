@@ -211,26 +211,35 @@ def _derive_actual_wacc(
     if actual_ufcf_margin is not None and predicted_ufcf_margin is not None:
         ufcf_delta = float(actual_ufcf_margin) - float(predicted_ufcf_margin)
     # UFCF outperformance → risk was lower → actual WACC < predicted WACC
-    ufcf_adj = _clamp(ufcf_delta * 0.40, -0.020, 0.020)
+    ufcf_adj = _clamp(ufcf_delta * 0.40, -0.030, 0.030)
     # Revenue outperformance → additional risk compression
-    rev_adj = _clamp(revenue_delta * 0.03, -0.015, 0.015)
+    rev_adj = _clamp(revenue_delta * 0.04, -0.020, 0.020)
     return round(_clamp(pw - ufcf_adj - rev_adj, 0.04, 0.30), 4)
 
 
 def _derive_actual_terminal_growth(
     predicted_terminal_growth: float | None,
     revenue_delta: float,
+    near_term_revenue_growth: float | None = None,
 ) -> float:
-    """Infer realized implied terminal growth from revenue performance vs. prediction.
+    """Infer realized implied terminal growth from revenue performance and near-term growth.
 
-    Companies that consistently beat revenue forecasts suggest slightly higher
-    long-run sustainable growth than originally predicted.
+    Uses near-term revenue growth as a company-specific TG anchor (mean-reverted toward
+    GDP) then adjusts for revenue outperformance vs prediction.  This breaks the near-zero
+    variance in training data where predicted_terminal_growth ≈ 0.025 for every company.
     """
-    ptg = float(predicted_terminal_growth or 0.025)
-    adj = _clamp(revenue_delta * 0.015, -0.010, 0.010)
-    # Allow negative actual_terminal_growth so training data reflects
-    # structural decline (companies where market implies permanent shrinkage).
-    return round(_clamp(ptg + adj, -0.06, 0.055), 4)
+    _gdp = 0.025
+    # Near-term growth anchors the sustainable TG estimate (35% weight, 65% GDP prior).
+    if near_term_revenue_growth is not None:
+        ntg = float(near_term_revenue_growth)
+        ntg_clipped = max(-0.20, min(0.30, ntg))
+        tg_anchor = 0.35 * ntg_clipped + 0.65 * _gdp
+    else:
+        # Fall back to adjusting off the stored predicted TG
+        tg_anchor = float(predicted_terminal_growth or _gdp)
+    # Revenue outperformance vs model's prediction shifts the anchor further.
+    delta_adj = _clamp(revenue_delta * 0.05, -0.025, 0.025)
+    return round(_clamp(tg_anchor + delta_adj, -0.06, 0.06), 4)
 
 
 def _derive_actual_beta(predicted_beta: float, revenue_delta: float) -> float:
@@ -1569,7 +1578,11 @@ def _load_learning_cohort(limit: int | None = None, subject_ticker: str | None =
                 "predicted_wacc": predicted_wacc or 0.10,
                 "actual_wacc": _derive_actual_wacc(predicted_wacc, actual_ufcf_margin, predicted_ufcf_margin, revenue_delta),
                 "predicted_terminal_growth": predicted_terminal_growth or 0.025,
-                "actual_terminal_growth": _derive_actual_terminal_growth(predicted_terminal_growth, revenue_delta),
+                "actual_terminal_growth": _derive_actual_terminal_growth(
+                    predicted_terminal_growth,
+                    revenue_delta,
+                    near_term_revenue_growth=_as_decimal(record.near_term_revenue_growth),
+                ),
                 "predicted_beta": predicted_beta,
                 "actual_beta": _derive_actual_beta(predicted_beta, revenue_delta),
                 "predicted_ufcf_margin": predicted_ufcf_margin,

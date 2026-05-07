@@ -78,6 +78,48 @@ _DEFAULT_WACC = 0.090
 _DEFAULT_BETA = 1.0
 _DEFAULT_TGR = 0.025
 
+# Sector-specific TG priors — mirrors what the live DCF model uses so that
+# predicted_terminal_growth in observations matches the model's actual output.
+# (Technology: 3.0%, others vary by structural growth profile.)
+_SECTOR_TGR: dict[str, float] = {
+    "Technology": 0.030,
+    "Communication Services": 0.028,
+    "Consumer Cyclical": 0.025,
+    "Consumer Defensive": 0.022,
+    "Consumer Staples": 0.022,
+    "Healthcare": 0.026,
+    "Health Care": 0.026,
+    "Industrials": 0.024,
+    "Energy": 0.022,
+    "Materials": 0.023,
+    "Financial Services": 0.025,
+    "Real Estate": 0.022,
+    "Utilities": 0.018,
+}
+
+
+def _sector_tgr(sector: str) -> float:
+    """Return the sector's long-run TG prior matching the live DCF model."""
+    return _SECTOR_TGR.get(sector, _DEFAULT_TGR)
+
+
+def _sustainable_tg_proxy(revenues: list[float], gdp_rate: float = _DEFAULT_TGR, n_years: int = 3) -> float:
+    """
+    Estimate a company's sustainable terminal growth rate from trailing revenue CAGR.
+
+    Uses n_years trailing CAGR blended with GDP prior (35%/65%) to mean-revert
+    high-growth/declining trajectories toward long-run nominal GDP.
+    """
+    usable = [r for r in revenues if r and r > 0]
+    if len(usable) < 2:
+        return gdp_rate
+    n = min(len(usable) - 1, n_years)
+    cagr = (usable[-1] / usable[-1 - n]) ** (1.0 / n) - 1
+    # Mean-revert: 35% weight on actual CAGR, 65% GDP prior
+    cagr_clipped = max(-0.20, min(0.30, cagr))
+    blended = 0.35 * cagr_clipped + 0.65 * gdp_rate
+    return max(-0.06, min(0.06, blended))
+
 # BRAIN_IMPROVEMENT_PLAN.md (BUG-1) — Historical ERP table (Damodaran implied ERP, year-end).
 # Source: Damodaran NYU updated series through 2024.
 _HISTORICAL_ERP_BY_YEAR: dict[int, float] = {
@@ -304,6 +346,12 @@ def observations_for_ticker(
 
     obs: list[CalibrationObservation] = []
 
+    # Pre-compute sorted revenue series for TG proxy calculations.
+    # Using revenues available up to each observation year (no look-ahead).
+    _sorted_years = sorted(years)
+    _rev_by_year = {y: ann[y]["revenue_mm"] for y in _sorted_years if (ann[y]["revenue_mm"] or 0) > 0}
+    _sector_tg_prior = _sector_tgr(sector)
+
     # Annual pairs ────────────────────────────────────────────────────────────
     for i, year in enumerate(years):
         if year < start_year or i == 0:
@@ -316,21 +364,36 @@ def observations_for_ticker(
         pred_em = prev["ebit_margin"]          # persistence model
         if actual_em is None or pred_em is None:
             continue
+
+        # Persistence revenue growth: prior year's realised growth as prediction.
+        # This gives the calibrator company-specific signal instead of always-zero.
+        if i >= 2 and years[i - 2] in _rev_by_year and years[i - 1] in _rev_by_year:
+            _rv_prev2 = _rev_by_year[years[i - 2]]
+            _rv_prev1 = _rev_by_year[years[i - 1]]
+            pred_rg = max(-0.50, min(1.00, (_rv_prev1 - _rv_prev2) / _rv_prev2)) if _rv_prev2 > 0 else 0.0
+        else:
+            pred_rg = 0.0  # no prior history available for first pair
+
+        # Actual sustainable TG: trailing revenue CAGR blended with GDP prior.
+        # Revenues available at observation close = up to years[i] (realised).
+        _revenues_to_i = [_rev_by_year[y] for y in _sorted_years if y <= year and y in _rev_by_year]
+        actual_tg = _sustainable_tg_proxy(_revenues_to_i, gdp_rate=_DEFAULT_TGR)
+
         obs.append(CalibrationObservation(
             sector=sector,
             industry=industry,
             data_vintage_years=min(vintage, 20),
             market_cap_regime=cap,
             macro_regime=_macro_regime_for_year(year),
-            predicted_revenue_growth=0.0,          # neutral; signal = sector's inherent bias
+            predicted_revenue_growth=float(pred_rg),   # persistence model: prior year growth
             actual_revenue_growth=float(actual_rg),
             predicted_ebit_margin=float(pred_em),  # persistence model
             actual_ebit_margin=float(actual_em),
             predicted_wacc=wacc0,
             # BRAIN_IMPROVEMENT_PLAN.md (BUG-1) — real WACC from beta + rf + erp + size premium
             actual_wacc=_historical_rf(int(year)) + historical_beta * _historical_erp(int(year)) + _size_premium(cap),
-            predicted_terminal_growth=_DEFAULT_TGR,
-            actual_terminal_growth=_DEFAULT_TGR,
+            predicted_terminal_growth=_sector_tg_prior,  # sector-based prior matching live model
+            actual_terminal_growth=actual_tg,            # revenue-CAGR-blended sustainable TG proxy
             predicted_beta=_DEFAULT_BETA,
             actual_beta=historical_beta,
             ticker=ticker,
@@ -356,21 +419,37 @@ def observations_for_ticker(
             pred_em_q = prev_q.get("ebit_margin")
             if actual_em_q is None or pred_em_q is None:
                 continue
+
+            # Persistence revenue growth: prior-quarter annualised as prediction.
+            if i >= 2:
+                prev2_q = qs[i - 2]
+                pv2 = prev2_q.get("revenue_mm") or 0.0
+                pred_rg_q = max(-2.0, min(4.0, ((pv - pv2) / pv2) * 4.0)) if pv2 > 0 else 0.0
+            else:
+                pred_rg_q = 0.0
+
+            # Quarterly TG proxy: use annual snapshot revenue series (smoother signal).
+            _revenues_to_q_year = [
+                _rev_by_year[y] for y in _sorted_years
+                if y <= curr_q["date"].year and y in _rev_by_year
+            ]
+            actual_tg_q = _sustainable_tg_proxy(_revenues_to_q_year, gdp_rate=_DEFAULT_TGR)
+
             obs.append(CalibrationObservation(
                 sector=sector,
                 industry=industry,
                 data_vintage_years=min(vintage, 20),
                 market_cap_regime=cap,
                 macro_regime=_macro_regime_for_year(curr_q["date"].year),
-                predicted_revenue_growth=0.0,
+                predicted_revenue_growth=float(pred_rg_q),
                 actual_revenue_growth=float(actual_rg_q),
                 predicted_ebit_margin=float(pred_em_q),
                 actual_ebit_margin=float(actual_em_q),
                 predicted_wacc=wacc0,
                 # BRAIN_IMPROVEMENT_PLAN.md (BUG-1) — real quarterly WACC estimate
                 actual_wacc=_historical_rf(int(curr_q["date"].year)) + historical_beta * _historical_erp(int(curr_q["date"].year)) + _size_premium(cap),
-                predicted_terminal_growth=_DEFAULT_TGR,
-                actual_terminal_growth=_DEFAULT_TGR,
+                predicted_terminal_growth=_sector_tg_prior,  # sector-based prior
+                actual_terminal_growth=actual_tg_q,          # revenue-CAGR-blended proxy
                 predicted_beta=_DEFAULT_BETA,
                 actual_beta=historical_beta,
                 ticker=ticker,

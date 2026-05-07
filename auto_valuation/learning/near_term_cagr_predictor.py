@@ -153,14 +153,16 @@ class NearTermCagrPredictor:
     def train(
         self,
         postmortem_records: list[Any],
-        alpha: float = 1.0,
+        alpha: float = 0.05,
     ) -> dict[str, int]:
         """Fit one Ridge regression per regime from postmortem records.
 
         Parameters
         ----------
         postmortem_records : list of PostmortemRecord-like objects or dicts
-        alpha : Ridge regularisation strength
+        alpha : Ridge regularisation strength (default 0.05 — much less aggressive
+                than 1.0; features are on 0.01-0.30 scale so alpha=1.0 drives
+                all coefficients to near-zero)
 
         Returns
         -------
@@ -169,6 +171,8 @@ class NearTermCagrPredictor:
         try:
             import numpy as np
             from sklearn.linear_model import Ridge
+            from sklearn.pipeline import make_pipeline
+            from sklearn.preprocessing import StandardScaler
         except ImportError:
             logger.error("scikit-learn is required to train CAGR models. Install sklearn.")
             return {}
@@ -227,7 +231,9 @@ class NearTermCagrPredictor:
                 continue
             x_arr = np.array(xs, dtype=float)
             y_arr = np.array(ys, dtype=float)
-            model = Ridge(alpha=alpha)
+            # Pipeline: StandardScaler normalises features (cagr/margin/g values on
+            # 0.01-0.30 scale) so Ridge penalty is applied uniformly across all features.
+            model = make_pipeline(StandardScaler(), Ridge(alpha=alpha))
             model.fit(x_arr, y_arr)
             models[regime] = model
             logger.info("Trained Ridge CAGR model for %s with %d samples", regime, n)
