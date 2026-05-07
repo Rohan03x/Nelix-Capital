@@ -507,6 +507,8 @@ _LAST_CAGR_TRAIN_TS: float = 0.0
 _LAST_SCENARIO_LABEL_TS: float = 0.0
 # Timestamp of the last scenario prior build.
 _LAST_SCENARIO_PRIOR_TS: float = 0.0
+# Timestamp of the last scenario probability model training run (Layer G).
+_LAST_SCENARIO_PROB_TRAIN_TS: float = 0.0
 
 
 def _should_run_replay(interval_hours: int) -> bool:
@@ -547,6 +549,69 @@ def _should_run_scenario_priors(interval_hours: int) -> bool:
         _LAST_SCENARIO_PRIOR_TS = _time.monotonic()
         return True
     return False
+
+
+def _should_train_scenario_prob_model(interval_hours: int) -> bool:
+    """Return True if scenario probability model hasn't been trained within *interval_hours*."""
+    global _LAST_SCENARIO_PROB_TRAIN_TS  # noqa: PLW0603
+    import time as _time
+    if _time.monotonic() - _LAST_SCENARIO_PROB_TRAIN_TS >= interval_hours * 3600:
+        _LAST_SCENARIO_PROB_TRAIN_TS = _time.monotonic()
+        return True
+    return False
+
+
+def _train_scenario_probability_model() -> dict[str, Any]:
+    """Train the ScenarioProbabilityModel from all labeled scenario_outcomes rows.
+
+    Reads quarterly_winner + annual_winner records from scenario_outcomes.db,
+    extracts feature vectors, and fits a multinomial LogisticRegression.
+    Harmlessly skips when fewer than 30 labeled rows exist.
+
+    Returns a summary dict with status, n_samples, accuracy.
+    """
+    try:
+        import sqlite3
+        from auto_valuation.learning.storage_paths import learning_db_dir
+        from auto_valuation.learning.scenario_probability_model import ScenarioProbabilityModel
+
+        db_path = learning_db_dir() / "scenario_outcomes.db"
+        if not db_path.exists():
+            return {"ran": False, "reason": "no scenario_outcomes.db"}
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT
+                base_iv, bull_iv, bear_iv,
+                base_g, bull_g, bear_g,
+                base_wacc, bull_wacc, bear_wacc,
+                base_rev_growth, bull_rev_growth, bear_rev_growth,
+                base_margin, bull_margin, bear_margin,
+                base_probability, bull_probability, bear_probability,
+                sector, industry, macro_regime, revenue_regime, market_cap_regime,
+                quarterly_winner, annual_winner
+            FROM scenario_outcomes
+            WHERE quarterly_winner IS NOT NULL OR annual_winner IS NOT NULL
+        """).fetchall()
+        conn.close()
+
+        labeled = [dict(row) for row in rows]
+        n_labeled = len(labeled)
+        if n_labeled == 0:
+            return {"ran": True, "status": "no_labels_yet", "n_samples": 0}
+
+        model = ScenarioProbabilityModel()
+        result = model.train(labeled)
+        result["ran"] = True
+        result["n_labeled_rows"] = n_labeled
+        # Invalidate the module singleton so the next prediction picks up the new model
+        import auto_valuation.learning.scenario_probability_model as _spm
+        _spm._model_singleton = None
+        return result
+    except Exception as exc:
+        logger.warning("ScenarioProbabilityModel training failed: %s", exc)
+        return {"ran": False, "reason": str(exc)}
 
 
 def _run_scenario_labeling() -> dict[str, Any]:
@@ -861,6 +926,14 @@ def _run_background_learning_cycle(
     else:
         scenario_prior_result = {"ran": False, "reason": "interval"}
 
+    # Layer G — train scenario probability ML model from labeled outcomes.
+    # Runs every 12 h after labeling has run; harmlessly skips until ≥30 labeled.
+    scenario_prob_train_interval = int(LEARNING_CONFIG.get("scenario_prob_model_train_interval_hours", 12))
+    if _should_train_scenario_prob_model(scenario_prob_train_interval):
+        scenario_prob_train_result = _train_scenario_probability_model()
+    else:
+        scenario_prob_train_result = {"ran": False, "reason": "interval"}
+
     bootstrap_payload = bootstrap.to_dict() if hasattr(bootstrap, "to_dict") else dict(bootstrap)
     maintenance_payload = maintenance.to_dict() if hasattr(maintenance, "to_dict") else dict(maintenance)
     bootstrap_payload.setdefault("requested_tickers", bootstrap_tickers)
@@ -913,6 +986,13 @@ def _run_background_learning_cycle(
             "reason": scenario_prior_result.get("reason"),
             "cohorts_updated": scenario_prior_result.get("cohorts_updated"),
         },
+        "scenario_prob_model": {
+            "ran": bool(scenario_prob_train_result.get("ran")),
+            "reason": scenario_prob_train_result.get("reason"),
+            "status": scenario_prob_train_result.get("status"),
+            "n_samples": scenario_prob_train_result.get("n_samples"),
+            "accuracy": scenario_prob_train_result.get("accuracy"),
+        },
     }
     _write_background_runner_state(state_payload, state_path)
     return {
@@ -924,6 +1004,7 @@ def _run_background_learning_cycle(
         "cagr_train": cagr_train_result,
         "scenario_label": scenario_label_result,
         "scenario_priors": scenario_prior_result,
+        "scenario_prob_model": scenario_prob_train_result,
         "seed_refresh": seed_refresh,
         "state": state_payload,
     }

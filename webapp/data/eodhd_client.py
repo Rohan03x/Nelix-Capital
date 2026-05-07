@@ -3445,6 +3445,60 @@ def build_dashboard_data(
                 bull_probability /= _pt
                 bear_probability /= _pt
                 base_probability /= _pt
+
+        # ── Layer G: ScenarioProbabilityModel ML prediction ──────────────
+        # Multinomial LogisticRegression trained from labeled scenario_outcomes.
+        # Activates when ≥30 labeled rows exist; blends at up to 70% weight
+        # (growing with n_samples).  Below the threshold the heuristic/calibrator
+        # result is used unchanged.  Falls back silently on any error.
+        _ml_prob_weight = 0.0
+        _ml_n_samples = 0
+        try:
+            from auto_valuation.learning.scenario_probability_model import (
+                extract_features_for_prediction,
+                predict_scenario_probabilities,
+                get_model_info,
+            )
+            _sp_revenue_regime = str(
+                (dict((knowledge_model_payload or {}).get("layered_learning") or {}).get("terminal_growth") or {}).get("revenue_regime") or "stable"
+            )
+            _sp_macro_regime = _macro_regime_from_rf(float(rf_rate) / 100)
+            _sp_mkt_cap_regime = str((knowledge_model_payload or {}).get("market_cap_regime") or "mid_cap")
+            _sp_feats = extract_features_for_prediction(
+                bull_wacc=bull_wacc,
+                bear_wacc=bear_wacc,
+                base_wacc=wacc,
+                bull_g=bull_g,
+                bear_g=bear_g,
+                bull_iv=bull_iv,
+                bear_iv=bear_iv,
+                base_iv=iv,
+                bull_rev_growth=bull_growth,
+                bear_rev_growth=bear_growth,
+                bull_margin=bull_margin,
+                bear_margin=bear_margin,
+                heuristic_bull=bull_probability,
+                heuristic_bear=bear_probability,
+                macro_regime=_sp_macro_regime,
+                revenue_regime=_sp_revenue_regime,
+                market_cap_regime=_sp_mkt_cap_regime,
+            )
+            if _sp_feats is not None:
+                _ml_probs = predict_scenario_probabilities(_sp_feats)
+                if _ml_probs is not None:
+                    _model_meta = get_model_info()
+                    _ml_n_samples = int(_model_meta.get("n_samples") or 0)
+                    # Blend weight: starts at 25% at n=30, rises to 70% at n=300
+                    _ml_prob_weight = min(0.70, max(0.0, (_ml_n_samples - 30) / 270.0 * 0.45 + 0.25))
+                    bull_probability = _ml_prob_weight * _ml_probs["bull"] + (1.0 - _ml_prob_weight) * bull_probability
+                    bear_probability = _ml_prob_weight * _ml_probs["bear"] + (1.0 - _ml_prob_weight) * bear_probability
+                    base_probability = max(0.30, 1.0 - bull_probability - bear_probability)
+                    _pt = bull_probability + bear_probability + base_probability
+                    bull_probability /= _pt
+                    bear_probability /= _pt
+                    base_probability /= _pt
+        except Exception:
+            pass  # model not yet trained or unavailable — silently use current values
         learned_expected_upside = round(
             upside * base_probability + bull_up * bull_probability + bear_up * bear_probability,
             1,
@@ -3479,6 +3533,8 @@ def build_dashboard_data(
             "learned_support": round(learned_support, 2),
             "calibrated_probability_blend": round(_cal_blend_weight, 3),
             "calibration_n_observations": _cal_n_obs,
+            "ml_probability_blend": round(_ml_prob_weight, 3),
+            "ml_probability_n_samples": _ml_n_samples,
         }
 
         # ── Financial scores ──────────────────────────────────────────────
