@@ -3435,31 +3435,42 @@ def build_dashboard_data(
         # NearTermCagrPredictor predicts regime-specific revenue CAGR from historical
         # postmortem outcomes. When trained, it constrains how far bull/bear growth can
         # deviate from the learned distributional upper/lower bounds for this regime.
+        # Feature vector must match the format from regime_classifier._build_feature_vector()
+        # since that is what CAGR models are trained on (via postmortem.feature_vector).
         try:
             from auto_valuation.learning.near_term_cagr_predictor import NearTermCagrPredictor as _CAGRPred
+            from auto_valuation.learning.regime_classifier import _build_feature_vector as _bfv
             _cagr_regime = str((knowledge_model_payload or {}).get("revenue_regime") or "stable")
-            _cagr_fv: dict[str, float] = {
-                "cagr_3yr": (
-                    (revenues[-1] / revenues[-4]) ** (1.0 / 3) - 1
-                    if len(revenues) >= 4 and revenues[-4] > 0
-                    else revenue_growth_near / 100
-                ),
-                "cagr_5yr": (
-                    (revenues[-1] / revenues[-6]) ** (1.0 / 5) - 1
-                    if len(revenues) >= 6 and revenues[-6] > 0
-                    else revenue_growth_near / 100
-                ),
-                "ntm_growth": revenue_growth_near / 100,
-                "margin_trend": (ebit_margin_target - ebit_margin_base_pct) / 100,
-                "structural_break_score": float(
+            _cagr_3yr = (
+                (revenues[-1] / revenues[-4]) ** (1.0 / 3) - 1
+                if len(revenues) >= 4 and revenues[-4] > 0
+                else revenue_growth_near / 100
+            )
+            _cagr_5yr = (
+                (revenues[-1] / revenues[-6]) ** (1.0 / 5) - 1
+                if len(revenues) >= 6 and revenues[-6] > 0
+                else revenue_growth_near / 100
+            )
+            _cagr_10yr = (
+                (revenues[-1] / revenues[-11]) ** (1.0 / 10) - 1
+                if len(revenues) >= 11 and revenues[-11] > 0
+                else _cagr_5yr
+            )
+            _cagr_fv = _bfv(
+                cagr_3yr=_cagr_3yr,
+                cagr_5yr=_cagr_5yr,
+                cagr_10yr=_cagr_10yr,
+                ntm_growth=revenue_growth_near / 100,
+                market_implied_g=terminal_growth / 100,
+                structural_break_score=float(
                     (knowledge_model_payload or {}).get("structural_break_score") or 0.0
                 ),
-                "beta": beta,
-                "size_score": max(0.0, min(1.0, (market_cap / 1_000_000) * 0.05)),
-                "capex_reinvestment": capex_pct / 100,
-                "market_implied_g": terminal_growth / 100,
-                "industry_headwind_score": 0.0,
-            }
+                industry_headwind_score=0.0,
+                revenue_volatility=0.0,
+                margin_volatility=0.0,
+                rf_rate=rf_rate / 100,
+                wacc=wacc / 100,
+            )
             _learned_cagr_pct = _CAGRPred().predict(_cagr_regime, _cagr_fv) * 100
             # Guard: cap must leave enough headroom for swm-based differentiation.
             # Use anchor+3pp and learned+8pp as the buffers so narrow/wide scenarios

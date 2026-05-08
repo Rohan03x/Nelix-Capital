@@ -63,6 +63,24 @@ def _get_conn(path: Path | None = None, timeout: float = 10.0) -> Generator[sqli
 
 
 def _migrate_db(path: Path | None = None) -> None:
+    # Incremental column migrations for existing DBs (must run before executescript
+    # which tries to CREATE INDEX on scenario_construction_v).
+    db_path = path or _scenario_db_path()
+    if db_path.exists():
+        import sqlite3 as _sq
+        _raw = _sq.connect(str(db_path))
+        try:
+            _cols = [r[1] for r in _raw.execute("PRAGMA table_info(scenario_outcomes)").fetchall()]
+            if _cols and "scenario_construction_v" not in _cols:
+                _raw.execute(
+                    "ALTER TABLE scenario_outcomes ADD COLUMN scenario_construction_v INTEGER DEFAULT 1"
+                )
+                _raw.commit()
+        except Exception:
+            pass
+        finally:
+            _raw.close()
+
     with _get_conn(path) as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS scenario_outcomes (
@@ -71,6 +89,12 @@ def _migrate_db(path: Path | None = None) -> None:
                 prediction_date     TEXT    NOT NULL,
                 quarterly_label_date TEXT   NOT NULL,
                 annual_label_date   TEXT    NOT NULL,
+
+                -- Scenario construction version:
+                -- v1 = pre-2026-05-08 (broken anchor: raw consensus growth bypassed calibration)
+                -- v2 = post-2026-05-08 fix (calibrated revenue_growth_near + dynamic TV spread)
+                -- Training queries filter to v>=2 to avoid learning from corrupted scenario ranges.
+                scenario_construction_v  INTEGER DEFAULT 1,
 
                 -- Scenario IVs at prediction time
                 base_iv             REAL,
@@ -130,6 +154,7 @@ def _migrate_db(path: Path | None = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_so_sector_industry  ON scenario_outcomes(sector, industry);
             CREATE INDEX IF NOT EXISTS idx_so_q_winner         ON scenario_outcomes(quarterly_winner);
             CREATE INDEX IF NOT EXISTS idx_so_a_winner         ON scenario_outcomes(annual_winner);
+            CREATE INDEX IF NOT EXISTS idx_so_constr_v         ON scenario_outcomes(scenario_construction_v);
 
             CREATE TABLE IF NOT EXISTS scenario_calibration_priors (
                 prior_id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -245,15 +270,27 @@ def record_scenario_prediction(
     macro_regime: str = "neutral",
     revenue_regime: str = "stable",
     market_cap_regime: str = "mid_cap",
+    scenario_construction_v: int = 2,
     db_path: Path | None = None,
 ) -> int | None:
     """
     Store a scenario prediction for future labeling.
 
+    scenario_construction_v marks which version of the scenario construction
+    logic was used. v1 = pre-2026-05-08 (broken anchor), v2 = fixed.
+    Training queries filter to v>=2 to avoid poisoning models with corrupted
+    bull/bear IVs from the raw-consensus-growth anchor bug.
+
     Returns the outcome_id or None on failure.
     """
     try:
         _migrate_db(db_path)
+        # Runtime migration: add column if missing (DB existed before this column was added)
+        try:
+            with _get_conn(db_path) as _mc:
+                _mc.execute("ALTER TABLE scenario_outcomes ADD COLUMN scenario_construction_v INTEGER DEFAULT 1")
+        except Exception:
+            pass  # column already exists or other benign error
         now = datetime.now(timezone.utc)
         q_label = (now + timedelta(days=91)).date().isoformat()
         a_label = (now + timedelta(days=365)).date().isoformat()
@@ -261,6 +298,7 @@ def record_scenario_prediction(
             cur = conn.execute("""
                 INSERT INTO scenario_outcomes (
                     ticker, prediction_date, quarterly_label_date, annual_label_date,
+                    scenario_construction_v,
                     base_iv, bull_iv, bear_iv,
                     base_g, bull_g, bear_g,
                     base_wacc, bull_wacc, bear_wacc,
@@ -270,7 +308,7 @@ def record_scenario_prediction(
                     price_at_prediction,
                     sector, industry, macro_regime, revenue_regime, market_cap_regime
                 ) VALUES (
-                    ?,?,?,?,
+                    ?,?,?,?,?,
                     ?,?,?,
                     ?,?,?,
                     ?,?,?,
@@ -282,6 +320,7 @@ def record_scenario_prediction(
                 )
             """, (
                 ticker.upper(), now.date().isoformat(), q_label, a_label,
+                scenario_construction_v,
                 base_iv, bull_iv, bear_iv,
                 base_g, bull_g, bear_g,
                 base_wacc, bull_wacc, bear_wacc,
@@ -485,6 +524,7 @@ def build_scenario_priors(
                     FROM   scenario_outcomes
                     WHERE  {winner_col} IS NOT NULL
                       AND  {winner_col} != 'none'
+                      AND  COALESCE(scenario_construction_v, 1) >= 2
                 """).fetchall()
         except Exception as exc:
             logger.warning("build_scenario_priors query failed (%s): %s", horizon, exc)

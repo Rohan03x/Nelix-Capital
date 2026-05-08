@@ -592,7 +592,8 @@ def _train_scenario_probability_model() -> dict[str, Any]:
                 sector, industry, macro_regime, revenue_regime, market_cap_regime,
                 quarterly_winner, annual_winner
             FROM scenario_outcomes
-            WHERE quarterly_winner IS NOT NULL OR annual_winner IS NOT NULL
+            WHERE (quarterly_winner IS NOT NULL OR annual_winner IS NOT NULL)
+              AND COALESCE(scenario_construction_v, 1) >= 2
         """).fetchall()
         conn.close()
 
