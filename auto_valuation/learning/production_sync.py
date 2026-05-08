@@ -19,6 +19,7 @@ from .historical_replay import _OBS_DISK_CACHE_PATH
 from .ledger import DEFAULT_DB_PATH, DEFAULT_EXPORT_DIR, LedgerReader
 from .maintenance import MAINTENANCE_STATE_PATH
 from .postmortem import POSTMORTEM_DB_PATH, QuinquennialStore
+from .storage_paths import PACKAGE_ROOT, learning_db_dir
 from .universe import SYMBOL_UNIVERSE_DB_PATH, SymbolUniverseStore
 
 
@@ -741,6 +742,13 @@ def _component_specs() -> dict[str, dict[str, Any]]:
             "tables": ("quinquennial_reports",),
             "ensure": lambda: QuinquennialStore(db_path=POSTMORTEM_DB_PATH),
         },
+        "scenario_outcomes": {
+            "kind": "sqlite",
+            "path": learning_db_dir() / "scenario_outcomes.db",
+            "r2_key": "brain/db/scenario_outcomes.db",
+            "tables": ("scenario_outcomes", "scenario_calibration_priors"),
+            "ensure": lambda: None,
+        },
         "runner_state": {
             "kind": "json",
             "path": BACKGROUND_RUNNER_STATE_PATH,
@@ -763,6 +771,31 @@ def _component_specs() -> dict[str, dict[str, Any]]:
                 "kind": "file",
                 "path": _OBS_DISK_CACHE_PATH,
                 "r2_key": "brain/db/obs_cache.pkl",
+            },
+            "spm_model": {
+                "kind": "file",
+                "path": PACKAGE_ROOT / "data" / "scenario_probability_model.pkl",
+                "r2_key": "brain/models/scenario_probability_model.pkl",
+            },
+            "cagr_models": {
+                "kind": "file",
+                "path": PACKAGE_ROOT / "data" / "near_term_cagr_models.pkl",
+                "r2_key": "brain/models/near_term_cagr_models.pkl",
+            },
+            "regime_classifier": {
+                "kind": "file",
+                "path": PACKAGE_ROOT / "data" / "regime_classifier.pkl",
+                "r2_key": "brain/models/regime_classifier.pkl",
+            },
+            "deployment_seed": {
+                "kind": "file",
+                "path": PACKAGE_ROOT / "data" / "dashboard_learning_seed.json",
+                "r2_key": "brain/data/dashboard_learning_seed.json",
+            },
+            "industry_taxonomy": {
+                "kind": "file",
+                "path": PACKAGE_ROOT / "data" / "industry_taxonomy.json",
+                "r2_key": "brain/data/industry_taxonomy.json",
             },
         }),
     }
