@@ -22,9 +22,16 @@ import pickle
 from pathlib import Path
 from typing import Any
 
+from .storage_paths import PACKAGE_ROOT, learning_models_dir
+
 logger = logging.getLogger(__name__)
 
-_CAGR_MODEL_PATH = Path(__file__).parent / "data" / "near_term_cagr_models.pkl"
+# Primary path: writable directory (R2-hydrated on serverless, or local data/ dir).
+# On serverless: /tmp/nelix-learning/models/near_term_cagr_models.pkl
+# Locally:       auto_valuation/learning/data/near_term_cagr_models.pkl
+_CAGR_MODEL_PATH = learning_models_dir() / "near_term_cagr_models.pkl"
+# Fallback: committed .pkl bundled in the package (always present, even on fresh serverless boot)
+_CAGR_MODEL_FALLBACK_PATH = PACKAGE_ROOT / "data" / "near_term_cagr_models.pkl"
 
 # Features used per regime (subset of the full feature vector)
 # Features used per regime — must exactly match keys produced by
@@ -130,16 +137,19 @@ class NearTermCagrPredictor:
     def _load_models(self) -> dict[str, Any] | None:
         if self._models is not None:
             return self._models
-        if not self._path.exists():
-            return None
-        try:
-            with open(self._path, "rb") as fh:
-                bundle = pickle.load(fh)
-            self._models = bundle.get("models", {})
-            return self._models
-        except Exception as exc:
-            logger.warning("Failed to load near-term CAGR models from %s: %s", self._path, exc)
-            return None
+        # Try primary writable path first (R2-hydrated on serverless, trained locally).
+        # Fall back to committed package .pkl when primary is absent (fresh serverless boot).
+        for path in (self._path, _CAGR_MODEL_FALLBACK_PATH):
+            if not path.exists():
+                continue
+            try:
+                with open(path, "rb") as fh:
+                    bundle = pickle.load(fh)
+                self._models = bundle.get("models", {})
+                return self._models
+            except Exception as exc:
+                logger.warning("Failed to load near-term CAGR models from %s: %s", path, exc)
+        return None
 
     def predict(
         self,

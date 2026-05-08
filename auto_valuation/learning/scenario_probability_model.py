@@ -35,9 +35,14 @@ import pickle
 from pathlib import Path
 from typing import Any
 
+from .storage_paths import PACKAGE_ROOT, learning_models_dir
+
 logger = logging.getLogger(__name__)
 
-_MODEL_PATH = Path(__file__).parent / "data" / "scenario_probability_model.pkl"
+# Primary path: writable directory (R2-hydrated on serverless, or local data/ dir).
+_MODEL_PATH = learning_models_dir() / "scenario_probability_model.pkl"
+# Fallback: committed .pkl bundled in the package (always present, even on fresh serverless boot)
+_MODEL_FALLBACK_PATH = PACKAGE_ROOT / "data" / "scenario_probability_model.pkl"
 
 # Minimum labeled outcomes required before the model replaces the heuristic.
 _MIN_TRAIN_SAMPLES = 30
@@ -274,15 +279,17 @@ class ScenarioProbabilityModel:
     def _load(self) -> dict[str, Any] | None:
         if self._bundle is not None:
             return self._bundle
-        if not self._path.exists():
-            return None
-        try:
-            with self._path.open("rb") as fh:
-                self._bundle = pickle.load(fh)
-            return self._bundle
-        except Exception as exc:
-            logger.warning("Failed to load scenario probability model: %s", exc)
-            return None
+        # Try primary writable path first, then the committed package fallback.
+        for path in (self._path, _MODEL_FALLBACK_PATH):
+            if not path.exists():
+                continue
+            try:
+                with path.open("rb") as fh:
+                    self._bundle = pickle.load(fh)
+                return self._bundle
+            except Exception as exc:
+                logger.warning("Failed to load scenario probability model from %s: %s", path, exc)
+        return None
 
     @property
     def is_trained(self) -> bool:

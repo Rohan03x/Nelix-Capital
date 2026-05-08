@@ -32,11 +32,14 @@ from auto_valuation.assumptions.headwind_table import (
     get_industry_headwind_score,
     terminal_g_prior_range,
 )
+from auto_valuation.learning.storage_paths import PACKAGE_ROOT, learning_models_dir
 
 logger = logging.getLogger(__name__)
 
-# Path where the trained LightGBM model is persisted
-_MODEL_PATH = Path(__file__).parent / "data" / "regime_classifier.pkl"
+# Primary path: writable directory (R2-hydrated on serverless, or local data/ dir).
+_MODEL_PATH = learning_models_dir() / "regime_classifier.pkl"
+# Fallback: committed .pkl bundled in the package (always present, even on fresh serverless boot)
+_MODEL_FALLBACK_PATH = PACKAGE_ROOT / "data" / "regime_classifier.pkl"
 
 # Ordered list of regime labels (used as class indices for the classifier)
 REGIME_LABELS: list[str] = [
@@ -158,10 +161,11 @@ def _lgbm_classify(
         import pickle
         import numpy as np
 
-        if not _MODEL_PATH.exists():
+        model_path = _MODEL_PATH if _MODEL_PATH.exists() else _MODEL_FALLBACK_PATH
+        if not model_path.exists():
             return None
 
-        with open(_MODEL_PATH, "rb") as fh:
+        with open(model_path, "rb") as fh:
             model_bundle = pickle.load(fh)
 
         model = model_bundle["model"]

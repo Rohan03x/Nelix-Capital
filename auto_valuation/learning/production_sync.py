@@ -19,7 +19,7 @@ from .historical_replay import _OBS_DISK_CACHE_PATH
 from .ledger import DEFAULT_DB_PATH, DEFAULT_EXPORT_DIR, LedgerReader
 from .maintenance import MAINTENANCE_STATE_PATH
 from .postmortem import POSTMORTEM_DB_PATH, QuinquennialStore
-from .storage_paths import PACKAGE_ROOT, learning_db_dir
+from .storage_paths import PACKAGE_ROOT, learning_db_dir, learning_models_dir
 from .universe import SYMBOL_UNIVERSE_DB_PATH, SymbolUniverseStore
 
 
@@ -710,8 +710,10 @@ def _restore_r2_raw_component(namespace: str, spec: dict[str, Any], *, force: bo
 
 def _component_specs() -> dict[str, dict[str, Any]]:
     # On serverless runtimes (Vercel) /tmp is limited to ~512 MB.
-    # Skip the two largest components (predictions.db ~235 MB, obs_cache.pkl ~95 MB)
-    # that are only needed for background training — Vercel uses the pre-trained PKL instead.
+    # obs_cache.pkl (~95 MB) is skipped on serverless — Vercel trains from predictions.db instead.
+    # predictions.db (~235 MB) is restored on serverless hydrate so the background runner can
+    # retrain CAGR / ScenarioProbability models from real historical data.
+    # It is NOT re-uploaded from serverless persist (the JSONL delta handles new Vercel records).
     serverless = _serverless_runtime()
     return {
         "calibration": {
@@ -759,33 +761,45 @@ def _component_specs() -> dict[str, dict[str, Any]]:
             "path": MAINTENANCE_STATE_PATH,
             "r2_key": "brain/db/maintenance_state.json",
         },
+        # ledger (predictions.db) is always included:
+        #   - Non-serverless persist: upload full DB to R2
+        #   - Serverless hydrate: restore from R2 so background runner can retrain models
+        #   - Serverless persist: SKIPPED via skip_persist_on_serverless flag — new records
+        #     are handled by the JSONL delta mechanism below to avoid overwriting the main DB
+        "ledger": {
+            "kind": "sqlite",
+            "path": DEFAULT_DB_PATH,
+            "r2_key": "brain/db/predictions.db",
+            "tables": ("prediction_records", "realized_outcomes", "postmortem_records", "maintenance_runs"),
+            "ensure": lambda: LedgerReader(db_path=DEFAULT_DB_PATH, export_dir=DEFAULT_EXPORT_DIR),
+            "skip_persist_on_serverless": True,
+        },
+        # ML models — synced on both serverless and non-serverless.
+        # On serverless hydrate: downloads latest trained models from R2 into the
+        # writable /tmp/nelix-learning/models/ directory.
+        # On serverless persist: uploads freshly retrained models from the same
+        # writable directory back to R2 so the next cold start gets them.
+        # Each predictor also has a committed .pkl fallback when R2 key is absent.
+        "spm_model": {
+            "kind": "file",
+            "path": learning_models_dir() / "scenario_probability_model.pkl",
+            "r2_key": "brain/models/scenario_probability_model.pkl",
+        },
+        "cagr_models": {
+            "kind": "file",
+            "path": learning_models_dir() / "near_term_cagr_models.pkl",
+            "r2_key": "brain/models/near_term_cagr_models.pkl",
+        },
+        "regime_classifier": {
+            "kind": "file",
+            "path": learning_models_dir() / "regime_classifier.pkl",
+            "r2_key": "brain/models/regime_classifier.pkl",
+        },
         **({} if serverless else {
-            "ledger": {
-                "kind": "sqlite",
-                "path": DEFAULT_DB_PATH,
-                "r2_key": "brain/db/predictions.db",
-                "tables": ("prediction_records", "realized_outcomes", "postmortem_records", "maintenance_runs"),
-                "ensure": lambda: LedgerReader(db_path=DEFAULT_DB_PATH, export_dir=DEFAULT_EXPORT_DIR),
-            },
             "historical_observations": {
                 "kind": "file",
                 "path": _OBS_DISK_CACHE_PATH,
                 "r2_key": "brain/db/obs_cache.pkl",
-            },
-            "spm_model": {
-                "kind": "file",
-                "path": PACKAGE_ROOT / "data" / "scenario_probability_model.pkl",
-                "r2_key": "brain/models/scenario_probability_model.pkl",
-            },
-            "cagr_models": {
-                "kind": "file",
-                "path": PACKAGE_ROOT / "data" / "near_term_cagr_models.pkl",
-                "r2_key": "brain/models/near_term_cagr_models.pkl",
-            },
-            "regime_classifier": {
-                "kind": "file",
-                "path": PACKAGE_ROOT / "data" / "regime_classifier.pkl",
-                "r2_key": "brain/models/regime_classifier.pkl",
             },
             "deployment_seed": {
                 "kind": "file",
@@ -860,9 +874,14 @@ def persist_external_learning_state(*, force: bool = False) -> dict[str, Any]:
         return {"enabled": True, "reason": "throttled", **_LAST_PERSIST_RESULT}
 
     persisted: dict[str, bool] = {}
+    _is_serverless = _serverless_runtime()
     with _SYNC_LOCK:
         errors: dict[str, str] = {}
         for namespace, spec in _component_specs().items():
+            # Skip specs flagged as serverless-persist-unsafe (e.g. ledger/predictions.db).
+            # New Vercel prediction records are handled by the JSONL delta mechanism below.
+            if _is_serverless and spec.get("skip_persist_on_serverless"):
+                continue
             try:
                 if _prefer_object_storage() and _r2_raw_component_sync_enabled():
                     if spec["kind"] == "sqlite":
