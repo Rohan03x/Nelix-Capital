@@ -522,12 +522,26 @@ def _should_run_replay(interval_hours: int) -> bool:
 
 
 def _should_train_cagr_models(interval_hours: int) -> bool:
-    """Return True if the CAGR Ridge models haven't been trained within *interval_hours*."""
+    """Return True if the CAGR Ridge models haven't been trained within *interval_hours*,
+    or if the on-disk model file contains unfitted models (coef_ is None on all regimes)."""
     global _LAST_CAGR_TRAIN_TS  # noqa: PLW0603
     import time as _time
     if _time.monotonic() - _LAST_CAGR_TRAIN_TS >= interval_hours * 3600:
         _LAST_CAGR_TRAIN_TS = _time.monotonic()
         return True
+    # Also retrain if the model file exists but all Ridge models are unfitted
+    try:
+        import pickle
+        from auto_valuation.learning.near_term_cagr_predictor import _CAGR_MODEL_PATH
+        if _CAGR_MODEL_PATH.exists():
+            with open(_CAGR_MODEL_PATH, "rb") as _f:
+                _bundle = pickle.load(_f)
+            _models = _bundle.get("models", {})
+            if _models and all(getattr(m, "coef_", None) is None for m in _models.values()):
+                _LAST_CAGR_TRAIN_TS = _time.monotonic()
+                return True
+    except Exception:
+        pass
     return False
 
 
@@ -754,13 +768,53 @@ def _train_cagr_models_from_ledger() -> dict[str, Any]:
             """).fetchall()
             conn.close()
 
-            # Encode sector names as mean growth proxy (used as a continuous feature)
+            # Encode sector names as market_implied_g proxy
             _SECTOR_GROWTH_PROXY = {
                 "technology": 0.12, "consumer cyclical": 0.06, "financial services": 0.05,
                 "healthcare": 0.07, "industrials": 0.05, "consumer defensive": 0.03,
                 "real estate": 0.03, "basic materials": 0.04, "energy": 0.04,
                 "utilities": 0.02, "communication services": 0.08,
             }
+
+            # Group realized_outcomes by ticker to compute multi-year CAGRs.
+            # Only include rows with non-extreme growth values to avoid outliers
+            # (e.g. post-bankruptcy recoveries) corrupting the CAGR averages.
+            from collections import defaultdict
+            ticker_years: dict[str, dict[int, float]] = defaultdict(dict)
+            for row in rows:
+                ag = float(row["actual_growth"])
+                if -0.80 <= ag <= 3.0:
+                    ticker_years[row["ticker"]][int(row["year"])] = ag
+
+            # Build ticker-level CAGR estimates from consecutive years
+            ticker_cagr: dict[str, dict[str, float]] = {}
+            for ticker, year_map in ticker_years.items():
+                sorted_years = sorted(year_map.keys())
+                gs = [year_map[y] for y in sorted_years]
+                if len(gs) >= 3:
+                    cagr_3 = sum(gs[-3:]) / 3.0
+                else:
+                    cagr_3 = sum(gs) / len(gs)
+                if len(gs) >= 5:
+                    cagr_5 = sum(gs[-5:]) / 5.0
+                else:
+                    cagr_5 = cagr_3
+                if len(gs) >= 10:
+                    cagr_10 = sum(gs[-10:]) / 10.0
+                else:
+                    cagr_10 = cagr_5
+                # Revenue volatility = std-like measure of annual growth
+                if len(gs) >= 3:
+                    mean_g = sum(gs) / len(gs)
+                    rev_vol = sum(abs(g - mean_g) for g in gs) / len(gs)
+                else:
+                    rev_vol = 0.05
+                ticker_cagr[ticker] = {
+                    "cagr_3yr": cagr_3, "cagr_5yr": cagr_5, "cagr_10yr": cagr_10,
+                    "revenue_volatility": rev_vol,
+                }
+
+            from auto_valuation.learning.regime_classifier import _build_feature_vector as _bfv_train
 
             for row in rows:
                 actual_g = float(row["actual_growth"])
@@ -777,33 +831,36 @@ def _train_cagr_models_from_ledger() -> dict[str, Any]:
                 else:
                     ntm_g = ntr if ntr != 0.0 else actual_g
 
-                # Enriched feature vector: add margin and sector signals
-                _tgt_margin = float(row["target_ebit_margin"] or 0.0)
-                _base_margin = float(row["predicted_ebit_margin"] or 0.0)
-                _margin_trend = _tgt_margin - _base_margin  # positive = expansion
-                _capex_pct = float(row["capex_pct_revenue"] or 0.045)
-                _da_pct = float(row["da_pct_revenue"] or 0.035)
-                _beta = float(row["beta"] or 1.0)
+                ticker = row["ticker"]
                 _sector_key = str(row["sector"] or "").lower()
-                _sector_growth = _SECTOR_GROWTH_PROXY.get(_sector_key, 0.05)
-                _mcap_regime = str(row["market_cap_regime"] or "large").lower()
-                _size_score = {"small": -0.10, "mid": 0.0, "large": 0.10}.get(_mcap_regime, 0.0)
+                _mig = _SECTOR_GROWTH_PROXY.get(_sector_key, 0.05)
+                # Structural break = normalised surprise: how far actual deviated from NTM
+                _break_score = max(0.0, min(1.0, abs(actual_g - ntm_g)))
+                _cagr_data = ticker_cagr.get(ticker, {})
+                _cagr_3 = _cagr_data.get("cagr_3yr", ntm_g)
+                _cagr_5 = _cagr_data.get("cagr_5yr", ntm_g * 0.85)
+                _cagr_10 = _cagr_data.get("cagr_10yr", ntm_g * 0.70)
+                _rev_vol = _cagr_data.get("revenue_volatility", 0.05)
 
+                # Build feature vector via _build_feature_vector() — identical format
+                # to what is used at inference time in eodhd_client.py, so training
+                # and inference features are on the same distribution.
+                fv = _bfv_train(
+                    cagr_3yr=_cagr_3,
+                    cagr_5yr=_cagr_5,
+                    cagr_10yr=_cagr_10,
+                    ntm_growth=ntm_g,
+                    market_implied_g=_mig,
+                    structural_break_score=_break_score,
+                    industry_headwind_score=max(0.0, 0.05 - _mig),
+                    revenue_volatility=_rev_vol,
+                    margin_volatility=0.0,
+                    rf_rate=0.042,
+                    wacc=0.10,
+                )
                 training_records.append({
                     "actual_revenue_growth": actual_g,
-                    "feature_vector": {
-                        "ntm_growth": ntm_g,
-                        "cagr_3yr": ntm_g,
-                        "cagr_5yr": ntm_g * 0.85,  # slight regression to mean
-                        "margin_trend": _margin_trend,
-                        "gross_margin_trend": _margin_trend,
-                        "industry_headwind_score": max(0.0, -_sector_growth + 0.05),
-                        "structural_break_score": max(0.0, min(1.0, abs(actual_g - ntm_g))),
-                        "market_implied_g": _sector_growth,
-                        "size_score": _size_score,
-                        "beta": _beta,
-                        "capex_reinvestment": _capex_pct - _da_pct,
-                    },
+                    "feature_vector": fv,
                 })
 
         # Fallback: calibration_observations (actual/predicted_revenue_growth)
@@ -811,33 +868,39 @@ def _train_cagr_models_from_ledger() -> dict[str, Any]:
             conn = sqlite3.connect(str(calib_db))
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT actual_revenue_growth, predicted_revenue_growth "
+                "SELECT actual_revenue_growth, predicted_revenue_growth, "
+                "structural_break_score, revenue_volatility, margin_volatility, rf_rate_at_time "
                 "FROM calibration_observations "
                 "WHERE actual_revenue_growth IS NOT NULL "
                 "  AND predicted_revenue_growth IS NOT NULL "
                 "  AND (actual_revenue_growth != 0 OR predicted_revenue_growth != 0)"
             ).fetchall()
             conn.close()
+            from auto_valuation.learning.regime_classifier import _build_feature_vector as _bfv_calib
             for row in rows:
                 actual_g = float(row["actual_revenue_growth"])
                 pred_g = float(row["predicted_revenue_growth"])
                 if actual_g > 3.0 or actual_g < -0.80:
                     continue
+                _break = float(row["structural_break_score"] or max(0.0, min(1.0, abs(actual_g - pred_g))))
+                _rev_vol = float(row["revenue_volatility"] or 0.05)
+                _rf = float(row["rf_rate_at_time"] or 0.042)
+                fv = _bfv_calib(
+                    cagr_3yr=pred_g,
+                    cagr_5yr=pred_g * 0.85,
+                    cagr_10yr=pred_g * 0.70,
+                    ntm_growth=pred_g,
+                    market_implied_g=0.05,
+                    structural_break_score=_break,
+                    industry_headwind_score=0.0,
+                    revenue_volatility=_rev_vol,
+                    margin_volatility=0.0,
+                    rf_rate=_rf,
+                    wacc=0.10,
+                )
                 training_records.append({
                     "actual_revenue_growth": actual_g,
-                    "feature_vector": {
-                        "ntm_growth": pred_g,
-                        "cagr_3yr": pred_g,
-                        "cagr_5yr": pred_g * 0.85,
-                        "margin_trend": 0.0,
-                        "gross_margin_trend": 0.0,
-                        "industry_headwind_score": 0.0,
-                        "structural_break_score": max(0.0, min(1.0, abs(actual_g - pred_g))),
-                        "market_implied_g": 0.05,
-                        "size_score": 0.0,
-                        "beta": 1.0,
-                        "capex_reinvestment": 0.01,
-                    },
+                    "feature_vector": fv,
                 })
 
         if not training_records:

@@ -27,53 +27,66 @@ logger = logging.getLogger(__name__)
 _CAGR_MODEL_PATH = Path(__file__).parent / "data" / "near_term_cagr_models.pkl"
 
 # Features used per regime (subset of the full feature vector)
+# Features used per regime — must exactly match keys produced by
+# regime_classifier._build_feature_vector() so training and inference
+# use an identical feature distribution.
+# Available keys: cagr_3yr, cagr_5yr, cagr_10yr, ntm_growth,
+#   market_implied_g, market_implied_g_available, structural_break_score,
+#   industry_headwind_score, revenue_volatility, margin_volatility, rf_rate,
+#   cagr_3_minus_cagr_10, cagr_trend, ntm_vs_hist, break_x_volatility,
+#   negative_cagr_3, negative_cagr_10, declining_trend, wacc
 _REGIME_FEATURES: dict[str, list[str]] = {
     "structural_decline": [
         "cagr_3yr",
-        "cagr_1yr",
-        "gross_margin_trend",
+        "cagr_5yr",
+        "ntm_growth",
         "industry_headwind_score",
-        "market_implied_g",
-        "beta",
-        "capex_reinvestment",
+        "structural_break_score",
+        "cagr_trend",
+        "ntm_vs_hist",
+        "negative_cagr_3",
+        "break_x_volatility",
     ],
     "mild_decline": [
         "cagr_3yr",
         "cagr_5yr",
         "ntm_growth",
-        "margin_trend",
-        "industry_headwind_score",
-        "beta",
-        "size_score",
+        "cagr_3_minus_cagr_10",
+        "cagr_trend",
+        "ntm_vs_hist",
+        "structural_break_score",
+        "declining_trend",
     ],
     "stable": [
         "cagr_3yr",
         "cagr_5yr",
         "ntm_growth",
-        "margin_trend",
+        "cagr_trend",
+        "ntm_vs_hist",
         "structural_break_score",
-        "beta",
-        "size_score",
+        "revenue_volatility",
+        "wacc",
     ],
     "moderate_growth": [
         "cagr_3yr",
         "cagr_5yr",
         "ntm_growth",
-        "margin_trend",
+        "cagr_3_minus_cagr_10",
+        "cagr_trend",
+        "ntm_vs_hist",
         "structural_break_score",
-        "industry_headwind_score",
-        "capex_reinvestment",
-        "size_score",
+        "revenue_volatility",
+        "wacc",
     ],
     "strong_growth": [
         "cagr_3yr",
         "cagr_5yr",
         "ntm_growth",
-        "margin_trend",
+        "cagr_trend",
+        "ntm_vs_hist",
         "market_implied_g",
         "structural_break_score",
-        "capex_reinvestment",
-        "beta",
+        "break_x_volatility",
     ],
 }
 
@@ -245,6 +258,16 @@ class NearTermCagrPredictor:
             # 0.01-0.30 scale) so Ridge penalty is applied uniformly across all features.
             model = make_pipeline(StandardScaler(), Ridge(alpha=alpha))
             model.fit(x_arr, y_arr)
+            # Guard against near-zero-variance features (e.g. cagr_trend when all
+            # training rows for a regime share the same historical CAGR difference,
+            # or industry_headwind_score when nearly all training tickers are in the
+            # same sector bucket).  A std near 0 causes division by a tiny number in
+            # StandardScaler.transform() at inference, producing ±hundreds of std-units
+            # that wildly distort predictions.  Replace any scale_ < 0.01 with 1.0 so
+            # the feature is effectively mean-centred but left un-scaled.
+            _scaler = model.named_steps["standardscaler"]
+            _scaler.scale_ = np.where(_scaler.scale_ < 0.01, 1.0, _scaler.scale_)
+            _scaler.var_ = np.where(_scaler.var_ < 1e-4, 1.0, _scaler.var_)
             models[regime] = model
             logger.info("Trained Ridge CAGR model for %s with %d samples", regime, n)
 
