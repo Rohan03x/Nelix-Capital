@@ -529,7 +529,9 @@ def _should_train_cagr_models(interval_hours: int) -> bool:
     if _time.monotonic() - _LAST_CAGR_TRAIN_TS >= interval_hours * 3600:
         _LAST_CAGR_TRAIN_TS = _time.monotonic()
         return True
-    # Also retrain if the model file exists but all Ridge models are unfitted
+    # Also retrain if the model file exists but all Ridge models are unfitted.
+    # Models are sklearn Pipelines (StandardScaler + Ridge); coef_ lives on the
+    # Ridge step, NOT on the Pipeline wrapper.  Check named_steps['ridge'].coef_.
     try:
         import pickle
         from auto_valuation.learning.near_term_cagr_predictor import _CAGR_MODEL_PATH
@@ -537,9 +539,17 @@ def _should_train_cagr_models(interval_hours: int) -> bool:
             with open(_CAGR_MODEL_PATH, "rb") as _f:
                 _bundle = pickle.load(_f)
             _models = _bundle.get("models", {})
-            if _models and all(getattr(m, "coef_", None) is None for m in _models.values()):
-                _LAST_CAGR_TRAIN_TS = _time.monotonic()
-                return True
+            if _models:
+                def _is_unfitted(m: Any) -> bool:
+                    # Pipeline: check the final estimator step
+                    steps = getattr(m, "named_steps", None)
+                    if steps:
+                        last = list(steps.values())[-1]
+                        return getattr(last, "coef_", None) is None
+                    return getattr(m, "coef_", None) is None
+                if all(_is_unfitted(m) for m in _models.values()):
+                    _LAST_CAGR_TRAIN_TS = _time.monotonic()
+                    return True
     except Exception:
         pass
     return False
