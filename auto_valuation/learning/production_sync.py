@@ -28,6 +28,75 @@ _SNAPSHOT_TABLE = "learning_state_snapshots"
 _SYNC_LOCK = threading.Lock()
 _LAST_HYDRATE_AT = 0.0
 _HYDRATE_TTL_SEC = 30.0
+
+# Key under which Vercel cron runs upload new prediction records as JSONL lines
+# so that the next local sync can merge them into the main predictions.db.
+_LEDGER_DELTA_R2_KEY = "brain/db/ledger_delta.jsonl"
+# Safety cap: if accumulated delta exceeds this size, skip uploading more
+_LEDGER_DELTA_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
+def _export_ledger_rows_as_jsonl(db_path: Path) -> bytes:
+    """Return all prediction_records in *db_path* serialised as JSONL bytes."""
+    if not db_path.exists():
+        return b""
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM prediction_records").fetchall()
+            if not rows:
+                return b""
+            return b"\n".join(json.dumps(dict(row)).encode("utf-8") for row in rows)
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("Ledger delta export failed: %s", exc)
+        return b""
+
+
+def _import_ledger_rows_from_jsonl(db_path: Path, data: bytes) -> int:
+    """INSERT OR IGNORE JSONL prediction rows into *db_path*. Returns imported count."""
+    if not data or not db_path.exists():
+        return 0
+    lines = [ln for ln in data.decode("utf-8", errors="replace").splitlines() if ln.strip()]
+    if not lines:
+        return 0
+    rows = []
+    for line in lines:
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    if not rows:
+        return 0
+    # Ensure the schema exists
+    try:
+        LedgerReader(db_path=db_path, export_dir=DEFAULT_EXPORT_DIR)
+    except Exception:
+        pass
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            schema_cols = [r[1] for r in conn.execute("PRAGMA table_info(prediction_records)").fetchall()]
+            if not schema_cols:
+                return 0
+            placeholders = ", ".join("?" for _ in schema_cols)
+            sql = f"INSERT OR IGNORE INTO prediction_records ({', '.join(schema_cols)}) VALUES ({placeholders})"
+            count = 0
+            for row in rows:
+                try:
+                    conn.execute(sql, tuple(row.get(col) for col in schema_cols))
+                    count += 1
+                except Exception:
+                    pass
+            conn.commit()
+            return count
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("Ledger delta import failed: %s", exc)
+        return 0
 _LAST_PERSIST_AT = 0.0
 _PERSIST_MIN_INTERVAL_SEC = 300.0  # max 1 push per 5 minutes (unless force=True)
 _LAST_PERSIST_RESULT: dict[str, Any] = {}
@@ -732,6 +801,19 @@ def hydrate_external_learning_state(*, force: bool = False) -> dict[str, Any]:
                     restored[namespace] = _restore_json_file(Path(spec["path"]), snapshot)
             except Exception as exc:
                 errors[namespace] = str(exc)
+        # On non-serverless: merge any pending ledger delta uploaded by Vercel cron runs.
+        if not _serverless_runtime() and _r2_raw_component_sync_enabled():
+            try:
+                from .r2_store import get_object, put_object
+                delta_data = get_object(_LEDGER_DELTA_R2_KEY)
+                if delta_data:
+                    n = _import_ledger_rows_from_jsonl(Path(DEFAULT_DB_PATH), delta_data)
+                    if n > 0:
+                        restored["ledger_delta"] = n
+                        # Clear the delta after a successful merge.
+                        put_object(_LEDGER_DELTA_R2_KEY, b"", content_type="application/x-ndjson")
+            except Exception as exc:
+                errors["ledger_delta"] = str(exc)
         _LAST_HYDRATE_AT = time.monotonic()
     reason = None if not errors else "partial-failure"
     return {"enabled": True, "reason": reason, "restored": restored, "errors": errors}
@@ -766,6 +848,21 @@ def persist_external_learning_state(*, force: bool = False) -> dict[str, Any]:
             except Exception as exc:
                 persisted[namespace] = False
                 errors[namespace] = str(exc)
+        # On serverless: export new prediction records as a JSONL delta so the
+        # next local sync can merge them into the main predictions.db.
+        if _serverless_runtime() and _r2_raw_component_sync_enabled():
+            try:
+                from .r2_store import get_object, put_object
+                new_data = _export_ledger_rows_as_jsonl(Path(DEFAULT_DB_PATH))
+                if new_data:
+                    existing = get_object(_LEDGER_DELTA_R2_KEY) or b""
+                    if len(existing) < _LEDGER_DELTA_MAX_BYTES:
+                        merged = (existing.rstrip(b"\n") + b"\n" + new_data).lstrip(b"\n") if existing else new_data
+                        persisted["ledger_delta"] = bool(
+                            put_object(_LEDGER_DELTA_R2_KEY, merged, content_type="application/x-ndjson")
+                        )
+            except Exception as exc:
+                errors["ledger_delta"] = str(exc)
         _LAST_PERSIST_AT = time.monotonic()
         _LAST_PERSIST_RESULT = {"persisted": persisted, "synced_at": _utcnow_iso(), "errors": errors}
     reason = None if all(persisted.values()) else "partial-failure"
