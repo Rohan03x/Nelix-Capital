@@ -3365,7 +3365,18 @@ def build_dashboard_data(
             1.0,
         )
         bull_wacc_reduction = _bounded(1.0 * scenario_width_multiplier + learned_support * 0.35 - learned_caution * 0.40, 0.4, 1.5)
-        bear_wacc_add = _bounded(1.5 * scenario_width_multiplier + learned_caution * 0.40 + max(0.0, wacc_bias_pp) * 0.50, 0.8, 5.0)
+        # Bear WACC spread: fixed 0.8pp base + incremental swm penalty (max 2.5pp).
+        # Old formula `1.5 * swm` was multiplicative — at swm=1.5 it produced 2.25pp
+        # before any caution term, pushing MSFT bear to 12.0% WACC (base 9.7%).
+        # That inflates the bear TV spread to 1.6× base, creating a -55% bear IV for
+        # stable mega-cap tech.  Incremental formula caps the base contribution at 0.8pp
+        # and adds 0.50pp per unit of swm above 1.0, matching the learned caution signal.
+        bear_wacc_add = _bounded(
+            0.8 + max(0.0, scenario_width_multiplier - 1.0) * 0.50
+            + learned_caution * 0.25
+            + max(0.0, wacc_bias_pp) * 0.35,
+            0.4, 2.5,
+        )
 
         # Cap WACC reduction at 1.5pp in bull case to prevent terminal-value explosion
         bull_wacc = round(max(wacc - 1.5, max(4.0, wacc - bull_wacc_reduction)), 1)
@@ -3377,7 +3388,38 @@ def build_dashboard_data(
         _min_tv_spread = max(3.5, round(bull_wacc * 0.42, 1))
         bull_g = min(bull_g, round(bull_wacc - _min_tv_spread, 1))
         bear_wacc = round(min(25.0, wacc + bear_wacc_add), 1)
-        bear_g = round(max(-1.0, terminal_growth - min(1.8, 1.0 * scenario_width_multiplier + learned_caution * 0.2)), 1)
+        # ── Bear terminal growth and TV spread coherence ─────────────────────────────
+        # Old formula dropped terminal_growth by up to 1.8pp (absolute), compounding
+        # the WACC increase into a TV spread 60% wider than base — the double whammy
+        # that drove extreme bear IVs (e.g. MSFT bear at -55.6% vs market).
+        # Fix (a): cap the drop at 18% of the base TV spread (proportional, not absolute).
+        # Fix (b): hard cap — bear TV spread may never exceed 1.60× the base TV spread.
+        # This keeps bear scenarios realistic while still reflecting genuine downside risk.
+        _base_tv_spread = max(3.0, wacc - terminal_growth)
+        _bear_g_drop = min(
+            _base_tv_spread * 0.18,
+            0.5 + max(0.0, scenario_width_multiplier - 1.0) * 0.40 + learned_caution * 0.12,
+        )
+        bear_g = round(max(-1.0, terminal_growth - _bear_g_drop), 1)
+        # Hard TV spread coherence cap: bear (WACC - g) must not exceed 1.60× base.
+        _max_bear_tv_spread = round(_base_tv_spread * 1.60, 1)
+        if (bear_wacc - bear_g) > _max_bear_tv_spread:
+            bear_g = round(max(-1.0, bear_wacc - _max_bear_tv_spread), 1)
+        # ── ScenarioPrior width adjustment (core learning brain feedback) ───────────
+        # When labeled historical outcomes exist for this cohort, scenario_width_adj
+        # reflects whether scenarios have been too narrow (>1) or too wide (<1):
+        #   >1.0 → bear/bull fired more than expected → widen growth/margin steps
+        #   <1.0 → base won most often → scenarios can be tighter
+        # Blend weight grows from 5% at n=5 to 35% at n=100.  Below n=5, falls back
+        # to _prior_width_adj=1.0 (no adjustment).
+        _scal_early = (knowledge_model_payload or {}).get("scenario_calibration_prior") or {}
+        _sprior_early = _scal_early.get("annual") or _scal_early.get("quarterly") or {}
+        _prior_n_obs_e = int(_sprior_early.get("n_observations") or 0)
+        _prior_width_adj = 1.0
+        if _prior_n_obs_e >= 5:
+            _pw_blend = min(0.35, _prior_n_obs_e / 100.0)
+            _raw_width_adj = float(_sprior_early.get("scenario_width_adj") or 1.0)
+            _prior_width_adj = round(1.0 * (1.0 - _pw_blend) + _raw_width_adj * _pw_blend, 3)
         # Scenarios diverge around the CALIBRATED base-case growth (revenue_growth_near).
         # Previously this used raw _extract_consensus_growth which could return an EODHD
         # "+1y" estimate that is 2+ fiscal years ahead of the annual revenue_base (e.g.
@@ -3403,10 +3445,10 @@ def build_dashboard_data(
             5.0,
         )
         bear_growth_step = _bounded(
-            2.5 + max(0.0, scenario_width_multiplier - 1.0) * 0.40
+            (2.5 + max(0.0, scenario_width_multiplier - 1.0) * 0.40
             + max(0.0, -growth_bias_pp) * 0.80
             + max(0.0, wacc_bias_pp) * 0.50
-            + learned_caution * 0.40,
+            + learned_caution * 0.40) * _prior_width_adj,
             1.0,
             10.0,
         )
@@ -3421,9 +3463,9 @@ def build_dashboard_data(
             4.0,
         )
         bear_margin_drop = _bounded(
-            max(1.0, scenario_width_multiplier)
+            (max(1.0, scenario_width_multiplier)
             + max(0.0, -margin_bias_pp) * 0.70
-            + learned_caution * 0.30,
+            + learned_caution * 0.30) * _prior_width_adj,
             0.8,
             6.0,
         )
