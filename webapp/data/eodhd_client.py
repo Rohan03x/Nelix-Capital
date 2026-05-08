@@ -3370,50 +3370,118 @@ def build_dashboard_data(
         # Cap WACC reduction at 1.5pp in bull case to prevent terminal-value explosion
         bull_wacc = round(max(wacc - 1.5, max(4.0, wacc - bull_wacc_reduction)), 1)
         bull_g = round(min(5.0, terminal_growth + min(1.2, 0.5 * scenario_width_multiplier + learned_support * 0.2)), 1)
-        # Enforce minimum WACC-g spread of 2.0pp; without this, a small spread causes TV to go infinite
-        bull_g = min(bull_g, round(bull_wacc - 2.0, 1))
+        # Enforce minimum WACC-g spread (dynamic: at least 42% of bull WACC or 3.5pp whichever
+        # is larger). The prior 2.0pp fixed floor was too tight: at bull_wacc=8.3% it allowed
+        # a 4.2pp spread yielding TV multiplier 24.8x vs the base case 16.1x — a 1.54x TV
+        # inflation from rates alone. 42% of WACC at 8.3% → min spread = 3.49pp.
+        _min_tv_spread = max(3.5, round(bull_wacc * 0.42, 1))
+        bull_g = min(bull_g, round(bull_wacc - _min_tv_spread, 1))
         bear_wacc = round(min(25.0, wacc + bear_wacc_add), 1)
         bear_g = round(max(-1.0, terminal_growth - min(1.8, 1.0 * scenario_width_multiplier + learned_caution * 0.2)), 1)
-        # Scenarios diverge around the analyst consensus anchor (not the blended
-        # base-case growth) so bull and bear stay grounded in forward expectations.
+        # Scenarios diverge around the CALIBRATED base-case growth (revenue_growth_near).
+        # Previously this used raw _extract_consensus_growth which could return an EODHD
+        # "+1y" estimate that is 2+ fiscal years ahead of the annual revenue_base (e.g.
+        # FY2027 consensus vs FY2024 actual for MSFT), producing 35-51%+ apparent growth.
+        # That bypassed all knowledge-model calibration + analyst-optimism haircuts and
+        # inflated bull IVs to $1,000+ for companies where the calibrated base is ~15%.
+        # Fix: anchor to revenue_growth_near (already blends consensus 60-90% and applies
+        # haircuts), with a narrow ±5pp window to incorporate mild consensus signal.
         _cons_g_scenario = _extract_consensus_growth(earn, revenue_base)
-        _scenario_anchor = _cons_g_scenario if _cons_g_scenario is not None else revenue_growth_near
+        if _cons_g_scenario is not None:
+            _cons_capped = max(revenue_growth_near - 5.0, min(_cons_g_scenario, revenue_growth_near + 5.0))
+            _scenario_anchor = round(0.70 * revenue_growth_near + 0.30 * _cons_capped, 1)
+        else:
+            _scenario_anchor = revenue_growth_near
+        # Growth steps: swm dampened (high model uncertainty ≠ wider bull scenarios).
+        # Cap reduced from 10pp to 5pp for bull (realistic near-term growth premium).
         bull_growth_step = _bounded(
-            2.0 * scenario_width_multiplier
+            1.5 + max(0.0, scenario_width_multiplier - 1.0) * 0.30
             + max(0.0, growth_bias_pp) * 0.50
             - max(0.0, -growth_bias_pp) * 0.35
-            - learned_caution * 0.20,
+            - learned_caution * 0.30,
             0.5,
-            10.0,
+            5.0,
         )
         bear_growth_step = _bounded(
-            3.0 * scenario_width_multiplier
+            2.5 + max(0.0, scenario_width_multiplier - 1.0) * 0.40
             + max(0.0, -growth_bias_pp) * 0.80
             + max(0.0, wacc_bias_pp) * 0.50
             + learned_caution * 0.40,
             1.0,
-            14.0,
+            10.0,
         )
+        # Margin steps: swm dampened (0.30x) to retain scenario width signal without
+        # dominating margin expansions. Cap reduced from 8pp to 4pp for bull.
         bull_margin_lift = _bounded(
-            2.0 * scenario_width_multiplier
+            1.5 + max(0.0, scenario_width_multiplier - 1.0) * 0.30
             + max(0.0, margin_bias_pp) * 0.60
-            - max(0.0, -margin_bias_pp) * 0.25,
+            - max(0.0, -margin_bias_pp) * 0.25
+            - learned_caution * 0.20,
             0.5,
-            8.0,
+            4.0,
         )
         bear_margin_drop = _bounded(
             max(1.0, scenario_width_multiplier)
             + max(0.0, -margin_bias_pp) * 0.70
             + learned_caution * 0.30,
             0.8,
-            8.0,
+            6.0,
         )
-        bull_growth = round(min(60.0, _scenario_anchor + bull_growth_step), 1)
+        bull_growth = round(min(40.0, _scenario_anchor + bull_growth_step), 1)
         bear_growth = round(max(-15.0, _scenario_anchor - bear_growth_step), 1)
         bull_margin = round(max(ebit_margin_target, min(80.0, ebit_margin_target + bull_margin_lift)), 1)
         bear_margin = round(max(-10.0, ebit_margin_base_pct - bear_margin_drop), 1)
+        # ── Learned CAGR model constraint: integrate postmortem-trained predictions ──
+        # NearTermCagrPredictor predicts regime-specific revenue CAGR from historical
+        # postmortem outcomes. When trained, it constrains how far bull/bear growth can
+        # deviate from the learned distributional upper/lower bounds for this regime.
+        try:
+            from auto_valuation.learning.near_term_cagr_predictor import NearTermCagrPredictor as _CAGRPred
+            _cagr_regime = str((knowledge_model_payload or {}).get("revenue_regime") or "stable")
+            _cagr_fv: dict[str, float] = {
+                "cagr_3yr": (
+                    (revenues[-1] / revenues[-4]) ** (1.0 / 3) - 1
+                    if len(revenues) >= 4 and revenues[-4] > 0
+                    else revenue_growth_near / 100
+                ),
+                "cagr_5yr": (
+                    (revenues[-1] / revenues[-6]) ** (1.0 / 5) - 1
+                    if len(revenues) >= 6 and revenues[-6] > 0
+                    else revenue_growth_near / 100
+                ),
+                "ntm_growth": revenue_growth_near / 100,
+                "margin_trend": (ebit_margin_target - ebit_margin_base_pct) / 100,
+                "structural_break_score": float(
+                    (knowledge_model_payload or {}).get("structural_break_score") or 0.0
+                ),
+                "beta": beta,
+                "size_score": max(0.0, min(1.0, (market_cap / 1_000_000) * 0.05)),
+                "capex_reinvestment": capex_pct / 100,
+                "market_implied_g": terminal_growth / 100,
+                "industry_headwind_score": 0.0,
+            }
+            _learned_cagr_pct = _CAGRPred().predict(_cagr_regime, _cagr_fv) * 100
+            # Guard: cap must leave enough headroom for swm-based differentiation.
+            # Use anchor+3pp and learned+8pp as the buffers so narrow/wide scenarios
+            # retain their relative ordering even when the model predicts low CAGR.
+            _bull_cagr_cap = max(_scenario_anchor + 3.0, _learned_cagr_pct + 8.0)
+            bull_growth = round(min(bull_growth, _bull_cagr_cap), 1)
+            # Guard: CAGR floor must never raise bear above anchor-1pp.
+            _bear_cagr_floor = min(_scenario_anchor - 1.0, _learned_cagr_pct - 10.0)
+            bear_growth = round(max(bear_growth, _bear_cagr_floor), 1)
+        except Exception:
+            pass
         bull_iv, bull_up, bull_ev = _quick_iv(bull_wacc, bull_g, bull_growth, bull_margin)
         bear_iv, bear_up, bear_ev = _quick_iv(bear_wacc, bear_g, bear_growth, bear_margin)
+        # ── Post-hoc sanity caps: prevent data-drift from producing extreme IVs ──────
+        # Belt-and-suspenders: after all scenario construction, cap bull at 2.5x current
+        # market price (generous even for deeply undervalued situations). No bear floor:
+        # a bear IV below market is legitimate when the stock is overvalued vs DCF base.
+        if price > 0 and diluted_shares > 0:
+            if bull_iv > price * 2.5:
+                bull_iv = round(price * 2.5, 2)
+                bull_up = round((bull_iv - price) / price * 100, 1)
+                bull_ev = round(bull_iv * diluted_shares + net_debt)
         bull_rec = _learned_recommendation_from_upside(bull_up, expected_error_pct=expected_error_for_rec)[0]
         bear_rec = _learned_recommendation_from_upside(bear_up, expected_error_pct=expected_error_for_rec)[0]
         bull_probability = _bounded(0.25 + learned_support * 0.06 - learned_caution * 0.04, 0.12, 0.38)
