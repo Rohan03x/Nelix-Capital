@@ -290,6 +290,8 @@ LEARNING_CONFIG: dict[str, Any] = {
     "uncertainty_growth_per_year": 0.08,
     "pair_relationship_half_life_days": 45,
     "pair_relationship_decay_floor": 0.2,
+    "regime_classifier_auto_train_enabled": True,
+    "regime_classifier_train_interval_hours": 24,
 }
 
 

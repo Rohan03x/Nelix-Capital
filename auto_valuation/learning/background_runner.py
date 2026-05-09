@@ -509,6 +509,8 @@ _LAST_SCENARIO_LABEL_TS: float = 0.0
 _LAST_SCENARIO_PRIOR_TS: float = 0.0
 # Timestamp of the last scenario probability model training run (Layer G).
 _LAST_SCENARIO_PROB_TRAIN_TS: float = 0.0
+# Timestamp of the last regime classifier model training run.
+_LAST_REGIME_CLASSIFIER_TRAIN_TS: float = 0.0
 
 
 def _should_run_replay(interval_hours: int) -> bool:
@@ -581,6 +583,16 @@ def _should_train_scenario_prob_model(interval_hours: int) -> bool:
     import time as _time
     if _time.monotonic() - _LAST_SCENARIO_PROB_TRAIN_TS >= interval_hours * 3600:
         _LAST_SCENARIO_PROB_TRAIN_TS = _time.monotonic()
+        return True
+    return False
+
+
+def _should_train_regime_classifier_model(interval_hours: int) -> bool:
+    """Return True if the regime classifier hasn't been trained within *interval_hours*."""
+    global _LAST_REGIME_CLASSIFIER_TRAIN_TS  # noqa: PLW0603
+    import time as _time
+    if _time.monotonic() - _LAST_REGIME_CLASSIFIER_TRAIN_TS >= interval_hours * 3600:
+        _LAST_REGIME_CLASSIFIER_TRAIN_TS = _time.monotonic()
         return True
     return False
 
@@ -929,6 +941,39 @@ def _train_cagr_models_from_ledger() -> dict[str, Any]:
         return {"ran": False, "reason": str(exc), "sample_counts": {}}
 
 
+def _train_regime_classifier_model() -> dict[str, Any]:
+    """Train the regime classifier model from prediction_records data."""
+    try:
+        import pickle
+        from auto_valuation.learning.storage_paths import learning_db_dir
+        from auto_valuation.learning.train_regime_classifier import train as _train_regime
+
+        db_path = learning_db_dir() / "predictions.db"
+        if not db_path.exists():
+            return {"ran": False, "reason": "no-predictions-db"}
+
+        _train_regime(db_path)
+
+        # Read back saved model metadata for status reporting.
+        model_path = PACKAGE_ROOT / "data" / "regime_classifier.pkl"
+        if not model_path.exists():
+            return {"ran": False, "reason": "model-not-written"}
+
+        with model_path.open("rb") as fh:
+            bundle = pickle.load(fh)
+
+        return {
+            "ran": True,
+            "reason": None,
+            "n_train": int(bundle.get("n_train") or 0),
+            "val_accuracy": float(bundle.get("val_accuracy") or 0.0),
+            "feature_count": len(list(bundle.get("feature_names") or [])),
+        }
+    except Exception as exc:
+        logger.warning("Regime classifier training failed: %s", exc)
+        return {"ran": False, "reason": str(exc)}
+
+
 def run_background_learning_cycle(
     *,
     fundamentals_provider: Callable[[str], dict[str, Any] | None] | None = None,
@@ -1046,6 +1091,16 @@ def _run_background_learning_cycle(
     else:
         scenario_prob_train_result = {"ran": False, "reason": "interval"}
 
+    # Regime classifier retraining (LightGBM / sklearn fallback).
+    regime_train_enabled = bool(LEARNING_CONFIG.get("regime_classifier_auto_train_enabled", True))
+    regime_train_interval = int(LEARNING_CONFIG.get("regime_classifier_train_interval_hours", 24))
+    if regime_train_enabled and _should_train_regime_classifier_model(regime_train_interval):
+        regime_classifier_train_result = _train_regime_classifier_model()
+    elif not regime_train_enabled:
+        regime_classifier_train_result = {"ran": False, "reason": "disabled"}
+    else:
+        regime_classifier_train_result = {"ran": False, "reason": "interval"}
+
     bootstrap_payload = bootstrap.to_dict() if hasattr(bootstrap, "to_dict") else dict(bootstrap)
     maintenance_payload = maintenance.to_dict() if hasattr(maintenance, "to_dict") else dict(maintenance)
     bootstrap_payload.setdefault("requested_tickers", bootstrap_tickers)
@@ -1105,6 +1160,13 @@ def _run_background_learning_cycle(
             "n_samples": scenario_prob_train_result.get("n_samples"),
             "accuracy": scenario_prob_train_result.get("accuracy"),
         },
+        "regime_classifier_model": {
+            "ran": bool(regime_classifier_train_result.get("ran")),
+            "reason": regime_classifier_train_result.get("reason"),
+            "n_train": regime_classifier_train_result.get("n_train"),
+            "val_accuracy": regime_classifier_train_result.get("val_accuracy"),
+            "feature_count": regime_classifier_train_result.get("feature_count"),
+        },
     }
     _write_background_runner_state(state_payload, state_path)
     return {
@@ -1117,6 +1179,7 @@ def _run_background_learning_cycle(
         "scenario_label": scenario_label_result,
         "scenario_priors": scenario_prior_result,
         "scenario_prob_model": scenario_prob_train_result,
+        "regime_classifier_model": regime_classifier_train_result,
         "seed_refresh": seed_refresh,
         "state": state_payload,
     }
